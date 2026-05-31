@@ -1384,6 +1384,77 @@ class TestWebServerEndpoints:
         # No hardcoded telegram/discord/slack/email when they aren't configured.
         assert "telegram" not in targets
 
+    def test_get_reports_combines_kanban_status_and_report_files(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        kanban_db.init_db(board="default")
+        conn = kanban_db.connect(board="default")
+        try:
+            done_id = kanban_db.create_task(
+                conn,
+                title="Ship dashboard reports page",
+                body="Project: Hermes dashboard",
+                assignee="engineering_lab",
+                created_by="test",
+                tenant="hermes-dashboard",
+                initial_status="running",
+            )
+            review_id = kanban_db.create_task(
+                conn,
+                title="Review reporting copy",
+                assignee="reviewer",
+                created_by="test",
+                tenant="hermes-dashboard",
+                initial_status="blocked",
+            )
+            now = 1_780_000_000
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, result = ? WHERE id = ?",
+                (now, "Executive report landed", done_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (review_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed', ?, ?)",
+                (
+                    done_id,
+                    "engineering_lab",
+                    now - 60,
+                    now,
+                    "Dashboard reports are available",
+                    json.dumps({"tests_run": 3}),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        (reports_dir / "completion-report.md").write_text(
+            "# Completion Report\n\nProject: Hermes dashboard\n\nDeployment status: healthy\n",
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/reports?project=hermes")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["filters"]["project"] == "hermes"
+        assert data["summary"]["completed_tasks"] == 1
+        assert data["summary"]["review_required"] == 1
+        assert data["recent_completed"][0]["id"] == done_id
+        assert data["recent_completed"][0]["summary"] == "Dashboard reports are available"
+        assert data["review_required"][0]["id"] == review_id
+        assert data["completion_reports"][0]["title"] == "Completion Report"
+        assert data["deployment_status"][0]["status"] == "healthy"
+        assert data["active_projects"][0]["project"] == "hermes-dashboard"
+
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200

@@ -278,6 +278,14 @@ export const api = {
   },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getReports: (params: { project?: string; q?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.project) qs.set("project", params.project);
+    if (params.q) qs.set("q", params.q);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return fetchJSON<ReportsResponse>(`/api/reports${suffix ? `?${suffix}` : ""}`);
+  },
   getModelsAnalytics: (days: number) =>
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
@@ -1442,6 +1450,69 @@ export type OAuthStartResponse =
       expires_in: number;
       poll_interval: number;
     };
+
+export interface ReportsTaskSummary {
+  id: string;
+  title: string;
+  project: string;
+  assignee?: string | null;
+  status?: string;
+  completed_at?: number | null;
+  created_at?: number | null;
+  summary: string;
+  metadata?: string | null;
+}
+
+export interface ReportsProjectSummary {
+  project: string;
+  active_tasks: number;
+  blocked_tasks: number;
+  review_required: number;
+  latest_activity_at: number;
+}
+
+export interface ReportFileSummary {
+  id: string;
+  title: string;
+  path: string;
+  project: string;
+  kind: string;
+  updated_at: number;
+  excerpt: string;
+  deployment_status?: string | null;
+  relative_path: string;
+}
+
+export interface DeploymentStatusSummary {
+  title: string;
+  project: string;
+  status: string;
+  updated_at: number;
+  path: string;
+  excerpt: string;
+}
+
+export interface ReportsResponse {
+  filters: { project: string; q: string };
+  summary: {
+    completed_tasks: number;
+    review_required: number;
+    active_projects: number;
+    completion_reports: number;
+    qa_findings: number;
+    deployment_updates: number;
+    github_updates: number;
+    status_counts: Record<string, number>;
+  };
+  recent_completed: ReportsTaskSummary[];
+  review_required: ReportsTaskSummary[];
+  active_projects: ReportsProjectSummary[];
+  completion_reports: ReportFileSummary[];
+  qa_findings: ReportFileSummary[];
+  deployment_status: DeploymentStatusSummary[];
+  github_activity: ReportFileSummary[];
+  generated_at: number;
+}
 
 export interface OAuthSubmitResponse {
   ok: boolean;

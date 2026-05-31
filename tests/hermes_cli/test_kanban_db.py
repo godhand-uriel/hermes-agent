@@ -1481,6 +1481,66 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
     assert reason == "blocker_auth"
 
 
+def test_respawn_guard_blocker_auth_on_invalid_auth_token(kanban_home):
+    """Invalid auth tokens are true auth blockers and still defer as blocker_auth."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="invalid-token", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("Authentication failed: invalid auth token", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_on_401_response(kanban_home):
+    """401 Unauthorized responses are true auth blockers."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="401-auth", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("HTTP 401 Unauthorized: invalid bearer token", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_on_429_rate_limit_response(kanban_home):
+    """429/rate-limit responses are still quota blockers."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="429-rate-limit", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("HTTP 429 Too Many Requests: rate limit exceeded", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_does_not_blocker_auth_bin_permission_denied(kanban_home):
+    """Local executable PermissionError is a spawn/env issue, not auth/quota."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bin-permission", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("[Errno 13] Permission denied: '/usr/local/bin/hermes'", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_does_not_blocker_auth_missing_executable(kanban_home):
+    """Missing hermes executable is a spawn/env issue, not auth/quota."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="missing-executable", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("[Errno 2] No such file or directory: 'hermes'", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_recent_success(kanban_home):
     """A completed run within the guard window triggers recent_success."""
     with kb.connect() as conn:
@@ -1661,6 +1721,50 @@ def test_dispatch_respawn_guard_allows_clean_task(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="clean-task", assignee="alice")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
+
+
+def test_dispatch_retries_after_spawn_permission_fix(
+    kanban_home, all_assignees_spawnable
+):
+    """A prior local spawn PermissionError stays retryable once PATH/perms are fixed."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="retry-permission", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+            ("[Errno 13] Permission denied: '/usr/local/bin/hermes'", t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=3)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
+
+
+def test_dispatch_retries_after_missing_executable_fix(
+    kanban_home, all_assignees_spawnable
+):
+    """A prior missing-executable spawn failure stays retryable after PATH is fixed."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="retry-path", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+            ("FileNotFoundError: [Errno 2] No such file or directory: 'hermes'", t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=3)
 
     assert t in spawned_ids
     assert not res.respawn_guarded

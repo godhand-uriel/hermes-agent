@@ -4707,11 +4707,13 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # ---------------------------------------------------------------------------
 
 # Patterns in last_failure_error that indicate a quota / auth blocker.
-# These errors won't resolve by retrying immediately — auto-block instead.
+# These errors won't resolve by retrying immediately, so defer this tick.
+# Deliberately exclude generic local spawn errors such as "permission denied",
+# "access denied", or "file not found"; those may be fixed by correcting PATH
+# or executable permissions and must remain retryable.
 _RESPAWN_BLOCKER_RE = re.compile(
     r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
     r"unauthorized|forbidden|billing|subscription|"
-    r"access[\s_]denied|permission[\s_]denied|"
     r"invalid[\s_]api[\s_]key)\b",
     re.IGNORECASE,
 )
@@ -4773,7 +4775,7 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    Reasons: ``"blocker_auth"`` (quota/auth error — deferred, not spawned),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
 

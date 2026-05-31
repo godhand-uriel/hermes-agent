@@ -3167,6 +3167,256 @@ async def update_config_raw(body: RawConfigUpdate):
 # ---------------------------------------------------------------------------
 
 
+def _report_project_from_task(row: dict[str, Any]) -> str:
+    """Best-effort project label for executive reports."""
+    for key in ("tenant", "session_id", "assignee"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return "default"
+
+
+def _safe_report_excerpt(text: str, limit: int = 360) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _extract_report_file(path: Path, root: Path) -> dict[str, Any]:
+    import re
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    first_heading = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+    if first_heading:
+        title = first_heading.group(1).strip()
+    project_match = re.search(r"^\s*Project\s*:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+    status_match = re.search(
+        r"^\s*(?:Deployment\s+status|Status)\s*:\s*(healthy|degraded|failed|blocked|unknown)\b.*$",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    mtime = int(path.stat().st_mtime)
+    kind = "completion"
+    lower_name = path.name.lower()
+    lower_text = text.lower()
+    if "qa" in lower_name or "qa finding" in lower_text:
+        kind = "qa"
+    elif "deploy" in lower_name:
+        kind = "deployment"
+    elif "github" in lower_name or "pull request" in lower_text or "commit" in lower_text:
+        kind = "github"
+    return {
+        "id": str(path),
+        "title": title,
+        "path": str(path),
+        "project": project_match.group(1).strip() if project_match else "default",
+        "kind": kind,
+        "updated_at": mtime,
+        "excerpt": _safe_report_excerpt(text),
+        "deployment_status": status_match.group(1).lower() if status_match else None,
+        "relative_path": str(path.relative_to(root)) if path.is_relative_to(root) else path.name,
+    }
+
+
+def _iter_report_roots() -> list[Path]:
+    """Return report directories searched by the executive reports API."""
+    from hermes_cli import kanban_db
+
+    roots: list[Path] = []
+    for candidate in (
+        Path(os.environ.get("HERMES_REPORTS_DIR", "")) if os.environ.get("HERMES_REPORTS_DIR") else None,
+        kanban_db.kanban_home() / "reports",
+        kanban_db.kanban_home() / "kanban" / "reports",
+        get_hermes_home() / "reports",
+    ):
+        if candidate and candidate.exists() and candidate.is_dir():
+            roots.append(candidate)
+    boards = kanban_db.boards_root()
+    if boards.exists():
+        for report_dir in boards.glob("*/reports"):
+            if report_dir.is_dir():
+                roots.append(report_dir)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        resolved = str(root.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            deduped.append(root)
+    return deduped
+
+
+def _collect_report_files(limit: int = 80) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for root in _iter_report_roots():
+        for path in root.rglob("*"):
+            if len(reports) >= limit:
+                break
+            if not path.is_file() or path.suffix.lower() not in {".md", ".txt", ".json"}:
+                continue
+            name = path.name.lower()
+            if "report" not in name and "qa" not in name and "deploy" not in name and "github" not in name:
+                continue
+            try:
+                reports.append(_extract_report_file(path, root))
+            except OSError:
+                continue
+    reports.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
+    return reports
+
+
+def _matches_project(item: dict[str, Any], project: str) -> bool:
+    if not project:
+        return True
+    needle = project.casefold()
+    haystack = " ".join(
+        str(item.get(key) or "")
+        for key in ("project", "tenant", "session_id", "assignee", "title", "body", "summary", "result")
+    ).casefold()
+    return needle in haystack
+
+
+@app.get("/api/reports")
+async def get_reports(project: str = "", q: str = "", limit: int = 50):
+    """Executive dashboard roll-up from kanban task state and report files."""
+    from hermes_cli import kanban_db
+
+    limit = max(1, min(int(limit or 50), 200))
+    tasks: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    try:
+        kanban_db.init_db()
+        conn = kanban_db.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT t.*,
+                       (SELECT summary FROM task_runs r
+                        WHERE r.task_id = t.id AND r.summary IS NOT NULL
+                        ORDER BY COALESCE(r.ended_at, r.started_at) DESC, r.id DESC LIMIT 1) AS latest_summary,
+                       (SELECT metadata FROM task_runs r
+                        WHERE r.task_id = t.id AND r.metadata IS NOT NULL
+                        ORDER BY COALESCE(r.ended_at, r.started_at) DESC, r.id DESC LIMIT 1) AS latest_metadata
+                FROM tasks t
+                WHERE t.status != 'archived'
+                ORDER BY COALESCE(t.completed_at, t.started_at, t.created_at) DESC
+                LIMIT ?
+                """,
+                (limit * 4,),
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["project"] = _report_project_from_task(item)
+                item["summary"] = item.get("latest_summary") or item.get("result") or ""
+                tasks.append(item)
+            status_counts = {
+                str(row["status"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM tasks WHERE status != 'archived' GROUP BY status"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log.debug("reports kanban collection failed: %s", exc)
+
+    report_files = _collect_report_files(limit=limit)
+    filters = {"project": project, "q": q}
+    if project:
+        tasks = [item for item in tasks if _matches_project(item, project)]
+        report_files = [item for item in report_files if _matches_project(item, project)]
+    if q:
+        tasks = [item for item in tasks if _matches_project(item, q)]
+        report_files = [item for item in report_files if _matches_project(item, q)]
+
+    recent_completed = [
+        {
+            "id": item["id"],
+            "title": item["title"],
+            "project": item["project"],
+            "assignee": item.get("assignee"),
+            "completed_at": item.get("completed_at"),
+            "summary": item.get("summary") or item.get("result") or "",
+            "metadata": item.get("latest_metadata"),
+        }
+        for item in tasks
+        if item.get("status") == "done"
+    ][:limit]
+    review_required = [
+        {
+            "id": item["id"],
+            "title": item["title"],
+            "project": item["project"],
+            "assignee": item.get("assignee"),
+            "status": item.get("status"),
+            "created_at": item.get("created_at"),
+            "summary": item.get("summary") or item.get("last_failure_error") or "Needs review",
+        }
+        for item in tasks
+        if item.get("status") in {"review", "blocked"}
+        or "review-required" in str(item.get("summary") or item.get("result") or "").lower()
+    ][:limit]
+    active_statuses = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
+    projects: dict[str, dict[str, Any]] = {}
+    for item in tasks:
+        if item.get("status") not in active_statuses:
+            continue
+        entry = projects.setdefault(
+            item["project"],
+            {"project": item["project"], "active_tasks": 0, "blocked_tasks": 0, "review_required": 0, "latest_activity_at": 0},
+        )
+        entry["active_tasks"] += 1
+        if item.get("status") == "blocked":
+            entry["blocked_tasks"] += 1
+        if item.get("status") == "review":
+            entry["review_required"] += 1
+        entry["latest_activity_at"] = max(
+            int(entry["latest_activity_at"] or 0),
+            int(item.get("started_at") or item.get("created_at") or 0),
+        )
+    active_projects = sorted(projects.values(), key=lambda item: item["latest_activity_at"], reverse=True)
+
+    completion_reports = [item for item in report_files if item["kind"] == "completion"][:limit]
+    qa_findings = [item for item in report_files if item["kind"] == "qa"][:limit]
+    deployment_status = [
+        {
+            "title": item["title"],
+            "project": item["project"],
+            "status": item.get("deployment_status") or "unknown",
+            "updated_at": item["updated_at"],
+            "path": item["path"],
+            "excerpt": item["excerpt"],
+        }
+        for item in report_files
+        if item["kind"] == "deployment" or item.get("deployment_status")
+    ][:limit]
+    github_activity = [item for item in report_files if item["kind"] == "github"][:limit]
+
+    return {
+        "filters": filters,
+        "summary": {
+            "completed_tasks": len(recent_completed),
+            "review_required": len(review_required),
+            "active_projects": len(active_projects),
+            "completion_reports": len(completion_reports),
+            "qa_findings": len(qa_findings),
+            "deployment_updates": len(deployment_status),
+            "github_updates": len(github_activity),
+            "status_counts": status_counts,
+        },
+        "recent_completed": recent_completed,
+        "review_required": review_required,
+        "active_projects": active_projects,
+        "completion_reports": completion_reports,
+        "qa_findings": qa_findings,
+        "deployment_status": deployment_status,
+        "github_activity": github_activity,
+        "generated_at": int(time.time()),
+    }
+
+
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB

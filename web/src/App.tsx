@@ -138,6 +138,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/reports": ReportsPage,
+  "/reports/generated/:type": ReportsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
   "/cron": CronPage,

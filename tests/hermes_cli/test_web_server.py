@@ -223,6 +223,14 @@ class TestSessionTokenInjection:
 class TestWebServerEndpoints:
     """Test the FastAPI REST endpoints using Starlette TestClient."""
 
+    def _assert_json_response_is_not_spa_html(self, resp):
+        assert resp.headers["content-type"].startswith("application/json")
+        data = resp.json()
+        body = resp.text.lstrip().lower()
+        assert not body.startswith("<!doctype html")
+        assert "<body" not in body
+        return data
+
     @pytest.fixture(autouse=True)
     def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
         """Create a TestClient and isolate the state DB under the test HERMES_HOME."""
@@ -604,6 +612,7 @@ class TestWebServerEndpoints:
         config = load_config()
         assert config["dashboard"]["theme"] == "ember"
         assert config["dashboard"]["font"] == "jetbrains-mono"
+
 
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
@@ -1289,6 +1298,19 @@ class TestWebServerEndpoints:
             "pid": 99,
         }
 
+    def test_unknown_api_path_returns_json_not_spa_fallback(self):
+        resp = self.client.get("/api/definitely-not-a-real-route")
+        assert resp.status_code == 404
+        assert self._assert_json_response_is_not_spa_html(resp) == {"detail": "API route not found"}
+
+    def test_dashboard_v2_api_route_returns_json_not_spa_html_fallback(self):
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["version"] == 2
+        assert "executive_briefing" in data
+
 
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config
@@ -1384,6 +1406,174 @@ class TestWebServerEndpoints:
         # No hardcoded telegram/discord/slack/email when they aren't configured.
         assert "telegram" not in targets
 
+    def test_dashboard_v2_summary_contract_combines_kanban_reports_and_usage(self, tmp_path, monkeypatch):
+        import time
+        import hermes_cli.kanban_db as kanban_db
+        import hermes_state
+        from hermes_constants import get_hermes_home
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        kanban_db.init_db(board="default")
+        conn = kanban_db.connect(board="default")
+        try:
+            now = int(time.time())
+            priority_id = kanban_db.create_task(
+                conn,
+                title="Ship dashboard v2 frontend",
+                body="Project: Hermes dashboard",
+                assignee="engineering_lab",
+                created_by="test",
+                tenant="hermes-dashboard",
+                priority=9,
+                initial_status="running",
+            )
+            blocked_id = kanban_db.create_task(
+                conn,
+                title="Unblock provider health source",
+                assignee="ops",
+                created_by="test",
+                tenant="hermes-dashboard",
+                priority=7,
+                initial_status="blocked",
+            )
+            review_id = kanban_db.create_task(
+                conn,
+                title="Review Dashboard v2 summary backend API",
+                assignee="reviewer",
+                created_by="test",
+                tenant="hermes-dashboard",
+                initial_status="blocked",
+            )
+            done_id = kanban_db.create_task(
+                conn,
+                title="Complete data contract",
+                assignee="engineering_lab",
+                created_by="test",
+                tenant="hermes-dashboard",
+                initial_status="running",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, result = ? WHERE id = ?",
+                (now, "Contract delivered", done_id),
+            )
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed', ?, ?)",
+                (done_id, "engineering_lab", now - 60, now, "Dashboard v2 contract complete", json.dumps({"tests_run": 5})),
+            )
+            kanban_db.add_comment(conn, blocked_id, "ops", "Waiting on provider status source")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        (reports_dir / "weekly-report.md").write_text(
+            "# Weekly Report\n\nProject: Hermes dashboard\n\nDeployment status: healthy\n",
+            encoding="utf-8",
+        )
+
+        hermes_state.DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            db._conn.execute(
+                "INSERT INTO sessions (id, title, source, started_at, ended_at, model, billing_provider, "
+                "input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd, "
+                "api_call_count, tool_call_count, message_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "s_dashboard_v2",
+                    "Dashboard v2 build",
+                    "cli",
+                    now,
+                    now,
+                    "gpt-5.5",
+                    "openai-codex",
+                    100,
+                    50,
+                    25,
+                    10,
+                    0.42,
+                    0.40,
+                    3,
+                    4,
+                    7,
+                ),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/dashboard/v2?days=7&project=hermes")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["filters"]["project"] == "hermes"
+        assert data["executive_briefing"]["top_priorities"][0]["id"] == priority_id
+        assert data["executive_briefing"]["blocked_tasks"][0]["id"] == blocked_id
+        assert data["executive_briefing"]["review_required_tasks"][0]["id"] == review_id
+        assert data["executive_briefing"]["completed_tasks"][0]["id"] == done_id
+        assert data["board_health"]["status_counts"]["done"] == 1
+        assert data["board_health"]["total_tasks"] == 4
+        assert data["provider_model_health"]["models"][0]["model"] == "gpt-5.5"
+        assert data["agent_metrics"]["sessions"] == 1
+        assert data["engineering_metrics"]["completed_tasks"] == 1
+        assert data["financial_metrics"]["ai_usage_cost_usd"]["estimated"] == 0.42
+        assert data["weekly_reports"]["latest"][0]["title"] == "Weekly Report"
+        assert data["career_progress"] == {"status": "unconfigured", "items": [], "summary": None}
+        assert data["portfolio_ventures"][0]["project"] == "hermes-dashboard"
+
+        empty_resp = self.client.get("/api/dashboard/v2?days=7&project=no-such-project")
+        assert empty_resp.status_code == 200
+        empty_data = empty_resp.json()
+        assert empty_data["board_health"] == {
+            "status_counts": {},
+            "total_tasks": 0,
+            "active_tasks": 0,
+            "blocked_tasks": 0,
+            "review_required": 0,
+        }
+        assert empty_data["executive_briefing"] == {
+            "top_priorities": [],
+            "blocked_tasks": [],
+            "review_required_tasks": [],
+            "completed_tasks": [],
+        }
+
+    def test_dashboard_v2_summary_returns_safe_empty_sections_when_sources_fail(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def fail_reports(*_args, **_kwargs):
+            raise OSError("reports unavailable")
+
+        monkeypatch.setattr(web_server, "_collect_report_files", fail_reports)
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["executive_briefing"] == {
+            "top_priorities": [],
+            "blocked_tasks": [],
+            "review_required_tasks": [],
+            "completed_tasks": [],
+        }
+        assert data["board_health"]["status_counts"] == {}
+        assert data["weekly_reports"]["latest"] == []
+        assert data["provider_model_health"]["models"] == []
+        assert data["errors"]
+
+    def test_unknown_api_paths_return_json_404_not_spa_fallback(self):
+        resp = self.client.get("/api/dashboard/no-such-v2")
+
+        assert resp.status_code == 404
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json() == {"detail": "API route not found"}
+        assert "<!doctype html" not in resp.text.lower()
+
     def test_get_reports_combines_kanban_status_and_report_files(self, tmp_path, monkeypatch):
         import hermes_cli.kanban_db as kanban_db
 
@@ -1444,7 +1634,7 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/reports?project=hermes")
 
         assert resp.status_code == 200
-        data = resp.json()
+        data = self._assert_json_response_is_not_spa_html(resp)
         assert data["filters"]["project"] == "hermes"
         assert data["summary"]["completed_tasks"] == 1
         assert data["summary"]["review_required"] == 1
@@ -1454,6 +1644,148 @@ class TestWebServerEndpoints:
         assert data["completion_reports"][0]["title"] == "Completion Report"
         assert data["deployment_status"][0]["status"] == "healthy"
         assert data["active_projects"][0]["project"] == "hermes-dashboard"
+
+    def test_generated_reports_api_exposes_latest_history_and_status(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "generated-reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+
+        (reports_dir / "2026-06-01-morning-brief.md").write_text(
+            "# Daily Morning Brief\n\nStatus: healthy\nProject: command-center\n\nTop priorities for today.",
+            encoding="utf-8",
+        )
+        (reports_dir / "2026-06-02-morning-brief.md").write_text(
+            "# Daily Morning Brief\n\nStatus: healthy\nProject: command-center\n\nLatest priorities for today.",
+            encoding="utf-8",
+        )
+        (reports_dir / "2026-06-02-evening-report.json").write_text(
+            json.dumps(
+                {
+                    "title": "Daily Evening Report",
+                    "status": "failed",
+                    "generated_at": 1780351200,
+                    "error": "cron timed out",
+                    "content": "Evening report could not be generated.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (reports_dir / "weekly-executive-review.md").write_text(
+            "# Weekly Executive Review\n\nStatus: healthy\n\nWeekly summary.",
+            encoding="utf-8",
+        )
+        (reports_dir / "monthly-executive-review.md").write_text(
+            "# Monthly Executive Review\n\nStatus: healthy\n\nMonthly summary.",
+            encoding="utf-8",
+        )
+        (reports_dir / "venture-portfolio-rank.md").write_text(
+            "# Venture Portfolio Rank\n\nStatus: healthy\n\n1. Hermes Agent\n",
+            encoding="utf-8",
+        )
+        (reports_dir / "blocked-tasks-review.md").write_text(
+            "# Blocked Tasks Review\n\nStatus: healthy\n\nNo blockers.\n",
+            encoding="utf-8",
+        )
+
+        latest_resp = self.client.get("/api/reports/generated/latest/morning_brief")
+        assert latest_resp.status_code == 200
+        latest = self._assert_json_response_is_not_spa_html(latest_resp)
+        assert latest["type"] == "morning_brief"
+        assert latest["status"] == "available"
+        assert latest["report"]["title"] == "Daily Morning Brief"
+        assert "Latest priorities" in latest["report"]["content"]
+
+        history_resp = self.client.get("/api/reports/generated/history/morning_brief")
+        assert history_resp.status_code == 200
+        history = history_resp.json()
+        assert history["type"] == "morning_brief"
+        assert history["count"] == 2
+        assert [item["status"] for item in history["reports"]] == ["available", "available"]
+
+        status_resp = self.client.get("/api/reports/generated/status")
+        assert status_resp.status_code == 200
+        statuses = status_resp.json()["reports"]
+        assert statuses["morning_brief"]["status"] == "available"
+        assert statuses["evening_report"]["status"] == "failed"
+        assert statuses["evening_report"]["error"] == "cron timed out"
+        assert statuses["weekly_executive_review"]["status"] == "available"
+        assert statuses["monthly_executive_review"]["status"] == "available"
+        assert statuses["venture_portfolio_rank"]["status"] == "available"
+        assert statuses["blocked_tasks_review"]["status"] == "available"
+
+        missing_resp = self.client.get("/api/reports/generated/latest/not-a-type")
+        assert missing_resp.status_code == 404
+        assert missing_resp.json()["detail"] == "Unknown generated report type: not-a-type"
+
+    def test_generated_reports_api_returns_missing_status_for_absent_report(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "generated-reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+
+        resp = self.client.get("/api/reports/generated/latest/morning_brief")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["type"] == "morning_brief"
+        assert data["status"] == "missing"
+        assert data["report"] is None
+        assert "No Daily Morning Brief report found" in data["error"]
+
+    def test_generated_json_reports_are_normalized_into_readable_sections(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "generated-reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        (reports_dir / "2026-06-02-weekly-executive-review.json").write_text(
+            json.dumps(
+                {
+                    "type": "weekly_executive_review",
+                    "title": "Weekly Executive Review",
+                    "date_range": "May 26 – Jun 2, 2026",
+                    "summary": "Portfolio momentum is improving while review queues remain elevated.",
+                    "key_wins": ["Dashboard v2 API shipped", "Report cron suite stabilized"],
+                    "risks": ["Two reviewer lanes are blocked"],
+                    "recommendations": ["Assign one reviewer to blocked dashboard work"],
+                    "next_actions": ["Review dashboard report cards"],
+                    "related_tasks": [
+                        {"id": "t_abc12345", "title": "Review dashboard report cards", "status": "blocked"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/reports/generated/latest/weekly_executive_review")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        report = data["report"]
+        assert report["content_type"] == "application/json"
+        assert not report["content"].lstrip().startswith("{")
+        assert not report["excerpt"].lstrip().startswith("{")
+        assert "## Executive summary" in report["content"]
+        assert "Portfolio momentum is improving" in report["content"]
+        assert "## Key wins" in report["content"]
+        assert "Dashboard v2 API shipped" in report["content"]
+        assert "## Risks / blockers" in report["content"]
+        assert "## Related missions / tasks" in report["content"]
+        assert report["metadata"]["raw_payload"]["date_range"] == "May 26 – Jun 2, 2026"
+
+    def test_get_reports_includes_generated_report_contract(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "generated-reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        (reports_dir / "2026-06-02-morning-brief.md").write_text(
+            "# Daily Morning Brief\n\nStatus: healthy\n\nLatest priorities for today.",
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/reports")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["generated_reports"]["latest"]["morning_brief"]["status"] == "available"
+        assert data["generated_reports"]["latest"]["morning_brief"]["report"]["title"] == "Daily Morning Brief"
+        assert data["generated_reports"]["history"]["morning_brief"][0]["type"] == "morning_brief"
 
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")

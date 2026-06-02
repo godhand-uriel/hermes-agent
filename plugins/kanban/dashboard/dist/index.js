@@ -207,6 +207,19 @@
   // from under a terminal they left open.
   const LS_BOARD_KEY = "hermes.kanban.selectedBoard";
 
+
+  function readDeepLinkParams() {
+    try {
+      const params = new URLSearchParams(window.location.search || "");
+      return {
+        taskParam: params.get("task") || params.get("task_id"),
+        boardParam: params.get("board"),
+      };
+    } catch (_e) {
+      return { taskParam: null, boardParam: null };
+    }
+  }
+
   function readSelectedBoard() {
     try {
       const v = window.localStorage.getItem(LS_BOARD_KEY);
@@ -506,7 +519,7 @@
 
   function KanbanPage() {
     const { t } = useI18n();
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    const [board, setBoard] = useState(() => readDeepLinkParams().boardParam || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
 
@@ -530,7 +543,7 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedTaskId, setSelectedTaskId] = useState(() => readDeepLinkParams().taskParam || null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -542,6 +555,15 @@
     // own task's counter so it reloads itself on live events instead of
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
+
+    useEffect(function () {
+      const { taskParam, boardParam } = readDeepLinkParams();
+      if (boardParam && boardParam !== board) {
+        setBoard(boardParam);
+        writeSelectedBoard(boardParam);
+      }
+      if (taskParam) setSelectedTaskId(taskParam);
+    }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);

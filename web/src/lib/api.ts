@@ -256,6 +256,33 @@ export const api = {
     const suffix = qs.toString();
     return fetchJSON<ReportsResponse>(`/api/reports${suffix ? `?${suffix}` : ""}`);
   },
+  getGeneratedReports: (params: { limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return fetchJSON<GeneratedReportsResponse>(`/api/reports/generated${suffix ? `?${suffix}` : ""}`);
+  },
+  getGeneratedReportStatus: () => fetchJSON<GeneratedReportsStatusResponse>("/api/reports/generated/status"),
+  getLatestGeneratedReport: (type: GeneratedReportType | string) =>
+    fetchJSON<GeneratedReportLatestEnvelope>(`/api/reports/generated/latest/${encodeURIComponent(type)}`),
+  getGeneratedReportHistory: (type: GeneratedReportType | string, params: { limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return fetchJSON<GeneratedReportHistoryResponse>(
+      `/api/reports/generated/history/${encodeURIComponent(type)}${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  getDashboardV2: (params: { days?: number; board?: string; profile?: string; project?: string; q?: string } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.days) qs.set("days", String(params.days));
+    if (params.board) qs.set("board", params.board);
+    if (params.profile) qs.set("profile", params.profile);
+    if (params.project) qs.set("project", params.project);
+    if (params.q) qs.set("q", params.q);
+    const suffix = qs.toString();
+    return fetchJSON<DashboardV2Response>(`/api/dashboard/v2${suffix ? `?${suffix}` : ""}`);
+  },
   getModelsAnalytics: (days: number) =>
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
@@ -957,6 +984,64 @@ export interface DeploymentStatusSummary {
   excerpt: string;
 }
 
+export type GeneratedReportType =
+  | "morning_brief"
+  | "evening_report"
+  | "weekly_executive_review"
+  | "monthly_executive_review"
+  | "venture_portfolio_rank"
+  | "blocked_tasks_review";
+
+export type GeneratedReportStatus = "available" | "degraded" | "failed" | "missing";
+
+export interface GeneratedReportItem {
+  id: string;
+  type: GeneratedReportType | string;
+  type_label: string;
+  title: string;
+  status: GeneratedReportStatus | string;
+  error?: string | null;
+  path: string;
+  relative_path: string;
+  project: string;
+  updated_at: number;
+  generated_at: number;
+  content_type: string;
+  content: string;
+  excerpt: string;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface GeneratedReportLatestEnvelope {
+  type: GeneratedReportType | string;
+  type_label: string;
+  status: GeneratedReportStatus | string;
+  report: GeneratedReportItem | null;
+  error?: string | null;
+}
+
+export interface GeneratedReportsResponse {
+  version: number;
+  generated_at: number;
+  report_types: Record<string, { label: string; aliases: string[] }>;
+  latest: Record<string, GeneratedReportLatestEnvelope>;
+  history: Record<string, GeneratedReportItem[]>;
+  errors: GeneratedReportLatestEnvelope[];
+}
+
+export interface GeneratedReportsStatusResponse {
+  version: number;
+  generated_at: number;
+  reports: Record<string, GeneratedReportLatestEnvelope>;
+}
+
+export interface GeneratedReportHistoryResponse {
+  type: GeneratedReportType | string;
+  type_label: string;
+  count: number;
+  reports: GeneratedReportItem[];
+}
+
 export interface ReportsResponse {
   filters: { project: string; q: string };
   summary: {
@@ -976,7 +1061,130 @@ export interface ReportsResponse {
   qa_findings: ReportFileSummary[];
   deployment_status: DeploymentStatusSummary[];
   github_activity: ReportFileSummary[];
+  generated_reports?: GeneratedReportsResponse;
   generated_at: number;
+}
+
+export interface DashboardV2Metric {
+  label: string;
+  value: string | number | null;
+  detail?: string | null;
+  tone?: string | null;
+}
+
+export interface DashboardV2BoardSummary {
+  board: string;
+  active_tasks?: number | null;
+  blocked_tasks?: number | null;
+  review_required?: number | null;
+  completed_tasks?: number | null;
+  latest_activity_at?: number | null;
+  status_counts?: Record<string, number> | null;
+}
+
+export interface DashboardV2PortfolioItem {
+  project: string;
+  active_tasks?: number | null;
+  blocked_tasks?: number | null;
+  review_required?: number | null;
+  completed_tasks?: number | null;
+  latest_activity_at?: number | null;
+  status?: string | null;
+  summary?: string | null;
+}
+
+export interface DashboardV2ModelHealthItem {
+  model?: string | null;
+  provider?: string | null;
+  sessions?: number | null;
+  api_calls?: number | null;
+  tool_calls?: number | null;
+  messages?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  estimated_cost?: number | null;
+  actual_cost?: number | null;
+  last_used_at?: number | null;
+}
+
+export interface DashboardV2Response {
+  generated_at?: number | null;
+  filters?: { days?: number; board?: string; profile?: string; project?: string; q?: string };
+  executive_briefing?: {
+    headline?: string | null;
+    status?: string | null;
+    summary?: string | null;
+    highlights?: string[] | null;
+    risks?: string[] | null;
+    next_actions?: string[] | null;
+    top_priorities?: ReportsTaskSummary[] | null;
+    blocked_tasks?: ReportsTaskSummary[] | null;
+    review_required_tasks?: ReportsTaskSummary[] | null;
+    completed_tasks?: ReportsTaskSummary[] | null;
+  } | null;
+  provider_model_health?: {
+    models?: DashboardV2ModelHealthItem[] | null;
+    providers?: DashboardV2ModelHealthItem[] | null;
+    totals?: Record<string, number> | null;
+  } | null;
+  board_health?: {
+    active_tasks?: number | null;
+    blocked_tasks?: number | null;
+    review_required?: number | null;
+    completed_tasks?: number | null;
+    total_tasks?: number | null;
+    status_counts?: Record<string, number> | null;
+    boards?: DashboardV2BoardSummary[] | null;
+  } | null;
+  portfolio_ventures?: DashboardV2PortfolioItem[] | null;
+  portfolio_health?: {
+    active_projects?: number | null;
+    total_projects?: number | null;
+    projects?: DashboardV2PortfolioItem[] | null;
+  } | null;
+  career_progress?: {
+    status?: string | null;
+    summary?: string | null;
+    items?: DashboardV2Metric[] | null;
+    milestones?: DashboardV2Metric[] | null;
+  } | null;
+  engineering_metrics?: {
+    metrics?: DashboardV2Metric[] | null;
+    completed_tasks?: number | null;
+    review_required?: number | null;
+    blocked_tasks?: number | null;
+    active_tasks?: number | null;
+    tests_reported?: number | null;
+    recent_completed?: ReportsTaskSummary[] | null;
+    deployment_status?: DeploymentStatusSummary[] | null;
+    github_activity?: ReportFileSummary[] | null;
+  } | null;
+  agent_metrics?: {
+    metrics?: DashboardV2Metric[] | null;
+    sessions?: number | null;
+    api_calls?: number | null;
+    tool_calls?: number | null;
+    messages?: number | null;
+    model_breakdown?: DashboardV2Metric[] | null;
+    notes?: string[] | null;
+  } | null;
+  financial_metrics?: {
+    metrics?: DashboardV2Metric[] | null;
+    ai_usage_cost_usd?: { estimated?: number | null; actual?: number | null } | null;
+    revenue_usd?: number | null;
+    burn_usd?: number | null;
+    notes?: string[] | string | null;
+  } | null;
+  weekly_reports?: {
+    completion_reports?: ReportFileSummary[] | null;
+    qa_findings?: ReportFileSummary[] | null;
+    latest_reports?: ReportFileSummary[] | null;
+    latest?: ReportFileSummary[] | null;
+    count?: number | null;
+  } | null;
+  generated_reports?: GeneratedReportsResponse | null;
+  errors?: Array<{ source?: string; message?: string }> | null;
+  legacy_reports?: ReportsResponse | null;
 }
 
 export interface OAuthSubmitResponse {

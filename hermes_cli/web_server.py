@@ -3278,6 +3278,704 @@ def _matches_project(item: dict[str, Any], project: str) -> bool:
     return needle in haystack
 
 
+_GENERATED_REPORT_TYPES: dict[str, dict[str, Any]] = {
+    "morning_brief": {
+        "label": "Daily Morning Brief",
+        "aliases": ("morning brief", "daily morning brief", "morning-brief", "morning_brief"),
+    },
+    "evening_report": {
+        "label": "Daily Evening Report",
+        "aliases": ("evening report", "daily evening report", "evening-report", "evening_report"),
+    },
+    "weekly_executive_review": {
+        "label": "Weekly Executive Review",
+        "aliases": ("weekly executive review", "weekly-executive-review", "weekly_executive_review"),
+    },
+    "monthly_executive_review": {
+        "label": "Monthly Executive Review",
+        "aliases": ("monthly executive review", "monthly-executive-review", "monthly_executive_review"),
+    },
+    "venture_portfolio_rank": {
+        "label": "Venture Portfolio Rank",
+        "aliases": (
+            "venture portfolio rank",
+            "venture portfolio ranking",
+            "venture-portfolio-rank",
+            "venture_portfolio_rank",
+        ),
+    },
+    "blocked_tasks_review": {
+        "label": "Blocked Tasks Review",
+        "aliases": (
+            "blocked tasks review",
+            "blocked task review",
+            "blocker watch",
+            "blocked-tasks-review",
+            "blocked_tasks_review",
+        ),
+    },
+}
+
+
+def _normalize_generated_report_type(report_type: str) -> str:
+    normalized = (report_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in _GENERATED_REPORT_TYPES:
+        return normalized
+    for key, spec in _GENERATED_REPORT_TYPES.items():
+        aliases = {str(alias).lower().replace("-", "_").replace(" ", "_") for alias in spec["aliases"]}
+        if normalized in aliases:
+            return key
+    raise HTTPException(status_code=404, detail=f"Unknown generated report type: {report_type}")
+
+
+def _detect_generated_report_type(*, path: Path, title: str, text: str, payload: Optional[dict[str, Any]] = None) -> Optional[str]:
+    explicit = None
+    if payload:
+        explicit = payload.get("type") or payload.get("report_type") or payload.get("slug")
+    if explicit:
+        try:
+            return _normalize_generated_report_type(str(explicit))
+        except HTTPException:
+            pass
+    haystack = " ".join([path.stem, path.name, title or "", text[:1000] or ""]).casefold()
+    compact = haystack.replace("_", " ").replace("-", " ")
+    for key, spec in _GENERATED_REPORT_TYPES.items():
+        for alias in spec["aliases"]:
+            alias_text = str(alias).casefold().replace("_", " ").replace("-", " ")
+            if alias_text in compact:
+                return key
+    return None
+
+
+def _generated_report_status(raw_status: str | None, error: str | None) -> str:
+    status = (raw_status or "").strip().casefold()
+    if error or status in {"failed", "failure", "error", "errored"}:
+        return "failed"
+    if status in {"blocked", "degraded", "partial", "warning"}:
+        return "degraded"
+    return "available"
+
+
+def _coerce_report_lines(value: Any) -> list[str]:
+    """Return readable bullet/body lines for heterogeneous report JSON fields."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, dict):
+        parts = []
+        title = value.get("title") or value.get("name") or value.get("id") or value.get("mission") or value.get("task")
+        if title:
+            parts.append(str(title).strip())
+        status = value.get("status") or value.get("state")
+        owner = value.get("assignee") or value.get("owner")
+        detail = value.get("summary") or value.get("detail") or value.get("description")
+        suffix_parts = [str(item).strip() for item in (status, owner) if item]
+        line = " — ".join([p for p in [" · ".join(parts), ", ".join(suffix_parts), str(detail).strip() if detail else ""] if p])
+        if line:
+            return [line]
+        return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+    if isinstance(value, (list, tuple, set)):
+        lines: list[str] = []
+        for item in value:
+            lines.extend(_coerce_report_lines(item))
+        return lines
+    return [str(value).strip()] if str(value).strip() else []
+
+
+_GENERATED_REPORT_READABLE_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("summary", "Executive summary", ("summary", "executive_summary", "overview", "brief", "abstract")),
+    ("key_wins", "Key wins", ("key_wins", "wins", "highlights", "accomplishments", "successes")),
+    ("risks", "Risks / blockers", ("risks", "blockers", "risks_blockers", "risk_blockers", "issues", "concerns")),
+    ("recommendations", "Recommendations", ("recommendations", "recommendation", "suggestions", "guidance")),
+    ("next_actions", "Next actions", ("next_actions", "actions", "action_items", "todos", "next_steps")),
+    (
+        "related_items",
+        "Related missions / tasks",
+        ("related_missions", "missions", "related_tasks", "tasks", "task_ids", "mission_ids", "linked_items"),
+    ),
+)
+
+
+def _first_payload_value(payload: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    for key in aliases:
+        if key in payload and payload[key] not in (None, "", []):
+            return payload[key]
+    return None
+
+
+def _build_readable_generated_report_content(payload: dict[str, Any], title: str) -> str:
+    """Convert report JSON into executive-readable markdown instead of raw JSON."""
+    lines: list[str] = [f"# {title}"]
+    date_value = _first_payload_value(payload, ("date_range", "range", "period", "reporting_period", "date"))
+    if date_value:
+        lines.extend(["", f"**Date / range:** {date_value}"])
+
+    emitted = False
+    for _, heading, aliases in _GENERATED_REPORT_READABLE_SECTIONS:
+        section_lines = _coerce_report_lines(_first_payload_value(payload, aliases))
+        if not section_lines:
+            continue
+        emitted = True
+        lines.extend(["", f"## {heading}"])
+        if len(section_lines) == 1 and heading == "Executive summary":
+            lines.append(section_lines[0])
+        else:
+            lines.extend(f"- {line}" for line in section_lines)
+
+    if not emitted:
+        fallback = _coerce_report_lines(payload.get("content") or payload.get("markdown") or payload.get("body"))
+        if fallback:
+            lines.extend(["", "## Report"])
+            lines.extend(fallback)
+        else:
+            lines.extend(["", "No structured report fields were provided."])
+    return "\n".join(lines).strip()
+
+
+def _extract_generated_report_file(path: Path, root: Path) -> Optional[dict[str, Any]]:
+    import re
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    payload: Optional[dict[str, Any]] = None
+    if path.suffix.lower() == ".json":
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = None
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    content = text
+    raw_status: str | None = None
+    error: str | None = None
+    generated_at: int | None = None
+    metadata: dict[str, Any] = {}
+    if payload:
+        title = str(payload.get("title") or payload.get("name") or title)
+        content_value = payload.get("content") or payload.get("markdown") or payload.get("body")
+        if content_value is not None and not any(
+            _first_payload_value(payload, aliases) for _, _, aliases in _GENERATED_REPORT_READABLE_SECTIONS
+        ):
+            content = str(content_value)
+        else:
+            content = _build_readable_generated_report_content(payload, title)
+        raw_status = str(payload.get("status") or "") or None
+        error_value = payload.get("error") or payload.get("error_message")
+        error = str(error_value) if error_value else None
+        generated_value = payload.get("generated_at") or payload.get("created_at") or payload.get("updated_at")
+        if isinstance(generated_value, (int, float)):
+            generated_at = int(generated_value)
+        metadata = {k: v for k, v in payload.items() if k not in {"content", "markdown", "body"}}
+        metadata["raw_payload"] = payload
+    else:
+        first_heading = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+        if first_heading:
+            title = first_heading.group(1).strip()
+        status_match = re.search(r"^\s*Status\s*:\s*([^\n]+)$", text, re.IGNORECASE | re.MULTILINE)
+        if status_match:
+            raw_status = status_match.group(1).strip()
+        error_match = re.search(r"^\s*(?:Error|Failure)\s*:\s*([^\n]+)$", text, re.IGNORECASE | re.MULTILINE)
+        if error_match:
+            error = error_match.group(1).strip()
+    report_type = _detect_generated_report_type(path=path, title=title, text=text, payload=payload)
+    if not report_type:
+        return None
+    project_match = re.search(r"^\s*Project\s*:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+    updated_at = int(path.stat().st_mtime)
+    if generated_at is None:
+        date_match = re.search(r"(20\d{2})[-_](\d{2})[-_](\d{2})", path.name)
+        if date_match:
+            try:
+                generated_at = int(time.mktime(time.strptime("-".join(date_match.groups()), "%Y-%m-%d")))
+            except (OverflowError, ValueError):
+                generated_at = None
+    generated_at = generated_at or updated_at
+    status = _generated_report_status(raw_status, error)
+    return {
+        "id": str(path),
+        "type": report_type,
+        "type_label": _GENERATED_REPORT_TYPES[report_type]["label"],
+        "title": title,
+        "status": status,
+        "error": error,
+        "path": str(path),
+        "relative_path": str(path.relative_to(root)) if path.is_relative_to(root) else path.name,
+        "project": project_match.group(1).strip() if project_match else "default",
+        "updated_at": updated_at,
+        "generated_at": generated_at,
+        "content_type": "application/json" if path.suffix.lower() == ".json" else "text/markdown",
+        "content": content,
+        "excerpt": _safe_report_excerpt(content),
+        "metadata": metadata,
+    }
+
+
+def _collect_generated_report_files(limit_per_type: int = 20) -> dict[str, list[dict[str, Any]]]:
+    reports: dict[str, list[dict[str, Any]]] = {key: [] for key in _GENERATED_REPORT_TYPES}
+    for root in _iter_report_roots():
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".md", ".txt", ".json"}:
+                continue
+            try:
+                item = _extract_generated_report_file(path, root)
+            except OSError:
+                continue
+            if not item:
+                continue
+            bucket = reports[item["type"]]
+            bucket.append(item)
+    for items in reports.values():
+        items.sort(key=lambda item: (item.get("generated_at") or 0, item.get("updated_at") or 0), reverse=True)
+        del items[limit_per_type:]
+    return reports
+
+
+def _generated_report_missing_envelope(report_type: str) -> dict[str, Any]:
+    label = _GENERATED_REPORT_TYPES[report_type]["label"]
+    return {
+        "type": report_type,
+        "type_label": label,
+        "status": "missing",
+        "report": None,
+        "error": f"No {label} report found in configured report directories.",
+    }
+
+
+def _generated_report_latest_envelope(report_type: str, reports_by_type: Optional[dict[str, list[dict[str, Any]]]] = None) -> dict[str, Any]:
+    reports_by_type = reports_by_type if reports_by_type is not None else _collect_generated_report_files()
+    reports = reports_by_type.get(report_type, [])
+    if not reports:
+        return _generated_report_missing_envelope(report_type)
+    latest = reports[0]
+    return {
+        "type": report_type,
+        "type_label": _GENERATED_REPORT_TYPES[report_type]["label"],
+        "status": latest.get("status") or "available",
+        "report": latest,
+        "error": latest.get("error"),
+    }
+
+
+def _generated_reports_contract(limit_per_type: int = 20) -> dict[str, Any]:
+    reports_by_type = _collect_generated_report_files(limit_per_type=limit_per_type)
+    latest = {key: _generated_report_latest_envelope(key, reports_by_type) for key in _GENERATED_REPORT_TYPES}
+    return {
+        "version": 1,
+        "generated_at": int(time.time()),
+        "report_types": {key: {"label": spec["label"], "aliases": list(spec["aliases"])} for key, spec in _GENERATED_REPORT_TYPES.items()},
+        "latest": latest,
+        "history": reports_by_type,
+        "errors": [item for item in latest.values() if item.get("status") in {"missing", "failed", "degraded"}],
+    }
+
+
+@app.get("/api/reports/generated")
+async def get_generated_reports(limit: int = 20):
+    limit = max(1, min(int(limit or 20), 100))
+    return _generated_reports_contract(limit_per_type=limit)
+
+
+@app.get("/api/reports/generated/status")
+async def get_generated_reports_status():
+    contract = _generated_reports_contract(limit_per_type=1)
+    return {"version": contract["version"], "generated_at": contract["generated_at"], "reports": contract["latest"]}
+
+
+@app.get("/api/reports/generated/latest/{report_type}")
+async def get_latest_generated_report(report_type: str):
+    normalized = _normalize_generated_report_type(report_type)
+    return _generated_report_latest_envelope(normalized)
+
+
+@app.get("/api/reports/generated/history/{report_type}")
+async def get_generated_report_history(report_type: str, limit: int = 20):
+    normalized = _normalize_generated_report_type(report_type)
+    limit = max(1, min(int(limit or 20), 100))
+    reports_by_type = _collect_generated_report_files(limit_per_type=limit)
+    reports = reports_by_type.get(normalized, [])
+    return {
+        "type": normalized,
+        "type_label": _GENERATED_REPORT_TYPES[normalized]["label"],
+        "count": len(reports),
+        "reports": reports,
+    }
+
+
+def _dashboard_empty_contract(
+    *,
+    days: int,
+    board: str,
+    profile: str,
+    project: str,
+    q: str,
+    errors: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "generated_at": int(time.time()),
+        "filters": {"days": days, "board": board, "profile": profile, "project": project, "q": q},
+        "executive_briefing": {
+            "top_priorities": [],
+            "blocked_tasks": [],
+            "review_required_tasks": [],
+            "completed_tasks": [],
+        },
+        "provider_model_health": {
+            "models": [],
+            "providers": [],
+            "totals": {
+                "distinct_models": 0,
+                "sessions": 0,
+                "api_calls": 0,
+                "tool_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+        "board_health": {"status_counts": {}, "total_tasks": 0, "active_tasks": 0, "blocked_tasks": 0, "review_required": 0},
+        "portfolio_ventures": [],
+        "career_progress": {"status": "unconfigured", "items": [], "summary": None},
+        "engineering_metrics": {
+            "completed_tasks": 0,
+            "review_required": 0,
+            "blocked_tasks": 0,
+            "active_tasks": 0,
+            "tests_reported": 0,
+        },
+        "agent_metrics": {"sessions": 0, "api_calls": 0, "tool_calls": 0, "messages": 0},
+        "financial_metrics": {
+            "ai_usage_cost_usd": {"estimated": 0, "actual": 0},
+            "revenue_usd": None,
+            "burn_usd": None,
+            "notes": "Business financial sources are not configured.",
+        },
+        "weekly_reports": {"latest": [], "count": 0},
+        "generated_reports": _generated_reports_contract(limit_per_type=1),
+        "errors": errors or [],
+    }
+
+
+def _dashboard_task_summary(row: dict[str, Any]) -> str:
+    return str(row.get("latest_summary") or row.get("result") or row.get("last_failure_error") or "")
+
+
+def _dashboard_task_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "project": row.get("project"),
+        "assignee": row.get("assignee"),
+        "status": row.get("status"),
+        "priority": row.get("priority") or 0,
+        "created_at": row.get("created_at"),
+        "started_at": row.get("started_at"),
+        "completed_at": row.get("completed_at"),
+        "summary": _dashboard_task_summary(row),
+        "metadata": row.get("latest_metadata"),
+    }
+
+
+def _dashboard_is_review_required(row: dict[str, Any]) -> bool:
+    if row.get("status") == "review":
+        return True
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("title", "body", "result", "latest_summary", "last_failure_error", "latest_comment")
+    ).casefold()
+    return "review-required" in text
+
+
+def _dashboard_collect_kanban(
+    *,
+    board: str,
+    profile: str,
+    project: str,
+    q: str,
+    cutoff: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, str]]]:
+    from hermes_cli import kanban_db
+
+    errors: list[dict[str, str]] = []
+    tasks: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    try:
+        resolved_board = board.strip() or None
+        kanban_db.init_db(board=resolved_board)
+        conn = kanban_db.connect(board=resolved_board)
+        try:
+            rows = conn.execute(
+                """
+                SELECT t.*,
+                       (SELECT summary FROM task_runs r
+                        WHERE r.task_id = t.id AND r.summary IS NOT NULL
+                        ORDER BY COALESCE(r.ended_at, r.started_at) DESC, r.id DESC LIMIT 1) AS latest_summary,
+                       (SELECT metadata FROM task_runs r
+                        WHERE r.task_id = t.id AND r.metadata IS NOT NULL
+                        ORDER BY COALESCE(r.ended_at, r.started_at) DESC, r.id DESC LIMIT 1) AS latest_metadata,
+                       (SELECT body FROM task_comments c
+                        WHERE c.task_id = t.id
+                        ORDER BY c.created_at DESC, c.id DESC LIMIT 1) AS latest_comment
+                FROM tasks t
+                WHERE t.status != 'archived'
+                ORDER BY COALESCE(t.completed_at, t.started_at, t.created_at) DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 200),),
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["project"] = _report_project_from_task(item)
+                item["summary"] = _dashboard_task_summary(item)
+                if profile and str(item.get("assignee") or "") != profile:
+                    continue
+                if project and not _matches_project(item, project):
+                    continue
+                if q and not _matches_project(item, q):
+                    continue
+                tasks.append(item)
+            # Keep board-health counts scoped to the same filtered task set used
+            # by the dashboard cards. Returning global counts for a project/q
+            # filter makes empty states look populated and can regress the
+            # Reports page's filtered semantics.
+            status_counts = {}
+            for item in tasks:
+                status = str(item.get("status") or "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log.debug("dashboard v2 kanban collection failed: %s", exc)
+        errors.append({"source": "kanban", "message": str(exc)})
+    return tasks, status_counts, errors
+
+
+def _dashboard_collect_session_metrics(days: int) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    errors: list[dict[str, str]] = []
+    empty = {
+        "models": [],
+        "providers": [],
+        "totals": {
+            "distinct_models": 0,
+            "sessions": 0,
+            "api_calls": 0,
+            "tool_calls": 0,
+            "messages": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost": 0,
+            "actual_cost": 0,
+        },
+    }
+    try:
+        from hermes_state import SessionDB
+
+        cutoff = time.time() - (days * 86400)
+        db = SessionDB()
+        try:
+            rows = [dict(r) for r in db._conn.execute(
+                """
+                SELECT model,
+                       billing_provider,
+                       COUNT(*) as sessions,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls,
+                       SUM(COALESCE(tool_call_count, 0)) as tool_calls,
+                       SUM(COALESCE(message_count, 0)) as messages,
+                       SUM(COALESCE(input_tokens, 0)) as input_tokens,
+                       SUM(COALESCE(output_tokens, 0)) as output_tokens,
+                       SUM(COALESCE(cache_read_tokens, 0)) as cache_read_tokens,
+                       SUM(COALESCE(reasoning_tokens, 0)) as reasoning_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                       MAX(started_at) as last_used_at
+                FROM sessions
+                WHERE started_at > ? AND model IS NOT NULL AND model != ''
+                GROUP BY model, billing_provider
+                ORDER BY sessions DESC, last_used_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()]
+            models: list[dict[str, Any]] = []
+            provider_map: dict[str, dict[str, Any]] = {}
+            totals = dict(empty["totals"])
+            totals["distinct_models"] = len({row.get("model") for row in rows if row.get("model")})
+            for row in rows:
+                provider = row.get("billing_provider") or "unknown"
+                model_item = {
+                    "model": row.get("model"),
+                    "provider": provider,
+                    "sessions": int(row.get("sessions") or 0),
+                    "api_calls": int(row.get("api_calls") or 0),
+                    "tool_calls": int(row.get("tool_calls") or 0),
+                    "messages": int(row.get("messages") or 0),
+                    "input_tokens": int(row.get("input_tokens") or 0),
+                    "output_tokens": int(row.get("output_tokens") or 0),
+                    "cache_read_tokens": int(row.get("cache_read_tokens") or 0),
+                    "reasoning_tokens": int(row.get("reasoning_tokens") or 0),
+                    "estimated_cost": float(row.get("estimated_cost") or 0),
+                    "actual_cost": float(row.get("actual_cost") or 0),
+                    "last_used_at": row.get("last_used_at"),
+                }
+                models.append(model_item)
+                for key in ("sessions", "api_calls", "tool_calls", "messages", "input_tokens", "output_tokens"):
+                    totals[key] += int(model_item[key] or 0)
+                totals["estimated_cost"] += model_item["estimated_cost"]
+                totals["actual_cost"] += model_item["actual_cost"]
+                provider_item = provider_map.setdefault(
+                    provider,
+                    {"provider": provider, "models": 0, "sessions": 0, "api_calls": 0, "estimated_cost": 0.0, "actual_cost": 0.0},
+                )
+                provider_item["models"] += 1
+                provider_item["sessions"] += model_item["sessions"]
+                provider_item["api_calls"] += model_item["api_calls"]
+                provider_item["estimated_cost"] += model_item["estimated_cost"]
+                provider_item["actual_cost"] += model_item["actual_cost"]
+            return {"models": models, "providers": list(provider_map.values()), "totals": totals}, errors
+        finally:
+            db.close()
+    except Exception as exc:
+        _log.debug("dashboard v2 session metrics failed: %s", exc)
+        errors.append({"source": "sessions", "message": str(exc)})
+        return empty, errors
+
+
+@app.get("/api/dashboard/v2")
+async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", project: str = "", q: str = "", limit: int = 20):
+    """Executive Dashboard v2 summary API.
+
+    This endpoint intentionally composes existing Reports/Kanban/session data
+    without changing the legacy ``/api/reports`` response shape. Sections whose
+    source is not configured return explicit empty/null structures so the
+    frontend can render safe setup states.
+    """
+    days = max(1, min(int(days or 7), 365))
+    limit = max(1, min(int(limit or 20), 100))
+    errors: list[dict[str, str]] = []
+    response = _dashboard_empty_contract(days=days, board=board, profile=profile, project=project, q=q)
+    cutoff = int(time.time() - days * 86400)
+
+    tasks, status_counts, kanban_errors = _dashboard_collect_kanban(
+        board=board,
+        profile=profile,
+        project=project,
+        q=q,
+        cutoff=cutoff,
+        limit=limit,
+    )
+    errors.extend(kanban_errors)
+
+    active_statuses = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
+    top_priorities = [
+        _dashboard_task_item(item)
+        for item in sorted(
+            [item for item in tasks if item.get("status") in active_statuses],
+            key=lambda item: (int(item.get("priority") or 0), int(item.get("started_at") or item.get("created_at") or 0)),
+            reverse=True,
+        )
+    ][:limit]
+    blocked_tasks = [_dashboard_task_item(item) for item in tasks if item.get("status") == "blocked"][:limit]
+    review_required = [_dashboard_task_item(item) for item in tasks if _dashboard_is_review_required(item)][:limit]
+    completed_tasks = [
+        _dashboard_task_item(item)
+        for item in tasks
+        if item.get("status") == "done" and int(item.get("completed_at") or 0) >= cutoff
+    ][:limit]
+    response["executive_briefing"] = {
+        "top_priorities": top_priorities,
+        "blocked_tasks": blocked_tasks,
+        "review_required_tasks": review_required,
+        "completed_tasks": completed_tasks,
+    }
+    response["board_health"] = {
+        "status_counts": status_counts,
+        "total_tasks": sum(status_counts.values()),
+        "active_tasks": sum(status_counts.get(status, 0) for status in active_statuses),
+        "blocked_tasks": status_counts.get("blocked", 0),
+        "review_required": status_counts.get("review", 0) + sum(1 for item in tasks if item.get("status") != "review" and _dashboard_is_review_required(item)),
+    }
+
+    portfolios: dict[str, dict[str, Any]] = {}
+    tests_reported = 0
+    for item in tasks:
+        project_key = item.get("project") or "default"
+        entry = portfolios.setdefault(
+            project_key,
+            {
+                "project": project_key,
+                "active_tasks": 0,
+                "blocked_tasks": 0,
+                "review_required": 0,
+                "completed_tasks": 0,
+                "latest_activity_at": 0,
+                "summary": None,
+            },
+        )
+        status = item.get("status")
+        if status in active_statuses:
+            entry["active_tasks"] += 1
+        if status == "blocked":
+            entry["blocked_tasks"] += 1
+        if _dashboard_is_review_required(item):
+            entry["review_required"] += 1
+        if status == "done":
+            entry["completed_tasks"] += 1
+        entry["latest_activity_at"] = max(
+            int(entry["latest_activity_at"] or 0),
+            int(item.get("completed_at") or item.get("started_at") or item.get("created_at") or 0),
+        )
+        if item.get("summary") and not entry["summary"]:
+            entry["summary"] = item.get("summary")
+        try:
+            metadata = json.loads(item.get("latest_metadata") or "{}")
+            tests_reported += int(metadata.get("tests_run") or 0)
+        except Exception:
+            pass
+    response["portfolio_ventures"] = sorted(portfolios.values(), key=lambda item: item["latest_activity_at"], reverse=True)[:limit]
+    response["engineering_metrics"] = {
+        "completed_tasks": len(completed_tasks),
+        "review_required": len(review_required),
+        "blocked_tasks": len(blocked_tasks),
+        "active_tasks": len([item for item in tasks if item.get("status") in active_statuses]),
+        "tests_reported": tests_reported,
+    }
+
+    session_metrics, session_errors = _dashboard_collect_session_metrics(days)
+    errors.extend(session_errors)
+    response["provider_model_health"] = session_metrics
+    response["agent_metrics"] = {
+        "sessions": int(session_metrics["totals"].get("sessions") or 0),
+        "api_calls": int(session_metrics["totals"].get("api_calls") or 0),
+        "tool_calls": int(session_metrics["totals"].get("tool_calls") or 0),
+        "messages": int(session_metrics["totals"].get("messages") or 0),
+    }
+    response["financial_metrics"] = {
+        "ai_usage_cost_usd": {
+            "estimated": session_metrics["totals"].get("estimated_cost") or 0,
+            "actual": session_metrics["totals"].get("actual_cost") or 0,
+        },
+        "revenue_usd": None,
+        "burn_usd": None,
+        "notes": "Business financial sources are not configured; AI usage costs come from session analytics.",
+    }
+
+    try:
+        report_files = _collect_report_files(limit=limit)
+        if project:
+            report_files = [item for item in report_files if _matches_project(item, project)]
+        if q:
+            report_files = [item for item in report_files if _matches_project(item, q)]
+    except Exception as exc:
+        _log.debug("dashboard v2 report collection failed: %s", exc)
+        errors.append({"source": "reports", "message": str(exc)})
+        report_files = []
+    response["weekly_reports"] = {"latest": report_files[:limit], "count": len(report_files)}
+    response["generated_reports"] = _generated_reports_contract(limit_per_type=limit)
+    response["errors"] = errors
+    return response
+
+
 @app.get("/api/reports")
 async def get_reports(project: str = "", q: str = "", limit: int = 50):
     """Executive dashboard roll-up from kanban task state and report files."""
@@ -3394,6 +4092,8 @@ async def get_reports(project: str = "", q: str = "", limit: int = 50):
     ][:limit]
     github_activity = [item for item in report_files if item["kind"] == "github"][:limit]
 
+    generated_reports = _generated_reports_contract(limit_per_type=limit)
+
     return {
         "filters": filters,
         "summary": {
@@ -3413,6 +4113,7 @@ async def get_reports(project: str = "", q: str = "", limit: int = 50):
         "qa_findings": qa_findings,
         "deployment_status": deployment_status,
         "github_activity": github_activity,
+        "generated_reports": generated_reports,
         "generated_at": int(time.time()),
     }
 
@@ -4176,6 +4877,12 @@ def mount_spa(application: FastAPI):
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
+        # Never let unknown API URLs fall through to the SPA shell. A missing
+        # or stale backend route should surface as a JSON API miss, not as
+        # ``<!doctype html>``, so callers and dev-server proxies can detect it.
+        if full_path == "api" or full_path.startswith("api/"):
+            return JSONResponse({"detail": "API route not found"}, status_code=404)
+
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)

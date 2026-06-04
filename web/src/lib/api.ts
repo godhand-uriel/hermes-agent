@@ -2425,6 +2425,33 @@ export interface DashboardV2ModelHealthItem {
   last_used_at?: number | null;
 }
 
+export interface DashboardV2WatchdogAlert {
+  channel: string;
+  severity: string;
+  title: string;
+  message: string;
+  status?: string | null;
+  created_at?: number | null;
+  details?: Record<string, unknown> | null;
+}
+
+export interface DashboardV2WatchdogStatus {
+  status?: string | null;
+  run_id?: string | null;
+  mode?: string | null;
+  coverage_percent?: number | null;
+  last_audit_at?: number | null;
+  active_task_count?: number | null;
+  covered_task_count?: number | null;
+  active_issues?: number | null;
+  remediation_count?: number | null;
+  remediations_succeeded?: number | null;
+  remediations_failed?: number | null;
+  alerts?: DashboardV2WatchdogAlert[] | null;
+  audit_db_path?: string | null;
+  error?: string | null;
+}
+
 export interface DashboardV2Response {
   generated_at?: number | null;
   filters?: { days?: number; board?: string; profile?: string; project?: string; q?: string };
@@ -2454,6 +2481,7 @@ export interface DashboardV2Response {
     status_counts?: Record<string, number> | null;
     boards?: DashboardV2BoardSummary[] | null;
   } | null;
+  notification_watchdog?: DashboardV2WatchdogStatus | null;
   portfolio_ventures?: DashboardV2PortfolioItem[] | null;
   portfolio_health?: {
     active_projects?: number | null;

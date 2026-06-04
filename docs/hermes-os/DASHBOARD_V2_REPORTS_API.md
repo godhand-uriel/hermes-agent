@@ -21,6 +21,8 @@ The backend also accepts common dash/space aliases such as `morning-brief` and `
 
 Command Center report crons use script-only jobs that write JSON into the generated reports directory before delivering the rendered Markdown summary. The monthly executive review schedule is explicit: `0 20 1 * *` (20:00 on the first day of each month) via `executive_reports/monthly_executive_review.sh`.
 
+Daily Executive Brief (`morning_brief` and `evening_report`), Weekly Executive Review, and Monthly Executive Review JSON payloads should embed the latest notification watchdog run under one of these equivalent keys: `notification_watchdog`, `watchdog_status`, `watchdog_results`, or `subscription_watchdog`. The expected source is `hermes kanban watchdog run --mode repair-safe --json`, which writes the same data to the watchdog audit DB at the Kanban home under `notification_watchdog/remediations.db`. The dashboard renderer turns that object into a `Notification watchdog status` section with coverage percentage, total active tasks, tasks missing subscriptions, remediations performed, unresolved issues, remediation history, and risk/recommendation items. If coverage is below 100% or any subscriptions are missing, the rendered report includes an explicit `COVERAGE FAILURE` line.
+
 ## Endpoints
 
 ### `GET /api/reports/generated`

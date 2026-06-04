@@ -1745,6 +1745,28 @@ class TestWebServerEndpoints:
                     "key_wins": ["Dashboard v2 API shipped", "Report cron suite stabilized"],
                     "risks": ["Two reviewer lanes are blocked"],
                     "recommendations": ["Assign one reviewer to blocked dashboard work"],
+                    "notification_watchdog": {
+                        "status": "uncovered",
+                        "coverage_percent": 75.0,
+                        "total_active_tasks": 4,
+                        "covered_tasks": 3,
+                        "tasks_missing_subscriptions": 1,
+                        "remediations_performed": 2,
+                        "unresolved_issues": 1,
+                        "findings": [
+                            {
+                                "board_slug": "command-center-board",
+                                "task_id": "t_missing123",
+                                "severity": "high",
+                                "finding_type": "missing_subscription",
+                                "status": "open",
+                            }
+                        ],
+                        "remediations": [
+                            {"action": "add_missing_subscription", "success": True},
+                            {"action": "reset_stale_cursor", "success": True},
+                        ],
+                    },
                     "next_actions": ["Review dashboard report cards"],
                     "related_tasks": [
                         {"id": "t_abc12345", "title": "Review dashboard report cards", "status": "blocked"}
@@ -1767,6 +1789,11 @@ class TestWebServerEndpoints:
         assert "## Key wins" in report["content"]
         assert "Dashboard v2 API shipped" in report["content"]
         assert "## Risks / blockers" in report["content"]
+        assert "## Notification watchdog status" in report["content"]
+        assert "3/4 active tasks (75.0% coverage)" in report["content"]
+        assert "COVERAGE FAILURE" in report["content"]
+        assert "Remediation history: add_missing_subscription=1, reset_stale_cursor=1" in report["content"]
+        assert "command-center-board task=t_missing123" in report["content"]
         assert "## Related missions / tasks" in report["content"]
         assert report["metadata"]["raw_payload"]["date_range"] == "May 26 – Jun 2, 2026"
 

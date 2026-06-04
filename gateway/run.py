@@ -4743,6 +4743,11 @@ class GatewayRunner:
         # so human-in-the-loop workflows hear back without polling.
         asyncio.create_task(self._kanban_notifier_watcher())
 
+        # Start background notification coverage watchdog — audits Command
+        # Center Kanban subscription coverage on a configurable cadence and
+        # records state/history for dashboards.
+        asyncio.create_task(self._kanban_notification_watchdog_watcher())
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -5683,6 +5688,67 @@ class GatewayRunner:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _kanban_notification_watchdog_watcher(self) -> None:
+        """Run the Kanban notification watchdog on its configured cadence.
+
+        The watchdog is deterministic (no model calls) and writes a compact
+        current-state row plus append-only run history to the Kanban home.  It
+        runs in a worker thread so slow board scans never block gateway message
+        handling.  Overlap prevention is enforced by the watchdog audit DB lock,
+        so manual CLI runs and this scheduled watcher cannot mutate/read the
+        audit trail concurrently.
+        """
+        try:
+            from hermes_cli import kanban_notification_watchdog as _wd
+        except Exception as exc:
+            logger.warning("kanban notification watchdog: import failed; disabled (%s)", exc)
+            return
+
+        try:
+            scheduled = _wd.load_scheduled_config()
+        except Exception as exc:
+            logger.warning("kanban notification watchdog: config load failed; disabled (%s)", exc)
+            return
+        if not scheduled.enabled:
+            logger.info("kanban notification watchdog: disabled via config")
+            return
+
+        logger.info(
+            "kanban notification watchdog: scheduled (interval=%ss, mode=%s)",
+            scheduled.interval_seconds,
+            scheduled.watchdog.mode,
+        )
+        await asyncio.sleep(10)
+        while self._running:
+            try:
+                report = await asyncio.to_thread(_wd.run_scheduled_watchdog_once, scheduled)
+                if report is not None:
+                    logger.info(
+                        "kanban notification watchdog: run %s status=%s coverage=%.1f%% "
+                        "active=%d issues=%d remediations=%d error=%s",
+                        report.run_id,
+                        report.status,
+                        report.coverage_percent,
+                        report.active_task_count,
+                        report.unresolved_issues_count,
+                        sum(1 for r in report.remediations if r.success),
+                        report.error,
+                    )
+            except asyncio.CancelledError:
+                logger.debug("kanban notification watchdog: cancelled")
+                raise
+            except Exception:
+                logger.exception("kanban notification watchdog: scheduled run failed")
+
+            # Check at least once per minute while keeping shutdown responsive.
+            # The DB state row carries next_run_after, so short sleeps do not
+            # create extra runs.
+            slept = 0.0
+            wake_after = min(max(float(scheduled.interval_seconds), 1.0), 60.0)
+            while slept < wake_after and self._running:
+                await asyncio.sleep(min(1.0, wake_after - slept))
+                slept += 1.0
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

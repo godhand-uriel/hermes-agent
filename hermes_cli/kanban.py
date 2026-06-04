@@ -488,6 +488,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     wd_run.add_argument("--no-audit", action="store_true",
                         help="Do not write remediation audit records")
     wd_run.add_argument("--json", action="store_true", help="Emit JSON output")
+    wd_state = watchdog_sub.add_parser("state", help="Show current scheduled watchdog state")
+    wd_state.add_argument("--json", action="store_true", help="Emit JSON output")
+    wd_history = watchdog_sub.add_parser("history", help="Show recent watchdog run history")
+    wd_history.add_argument("--limit", type=int, default=20)
+    wd_history.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
@@ -1238,6 +1243,39 @@ def _cmd_watchdog(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_notification_watchdog as wd
 
     sub = getattr(args, "watchdog_action", None) or "run"
+    if sub == "state":
+        state = wd.get_current_state()
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2, ensure_ascii=False))
+        else:
+            print("NOTIFICATION WATCHDOG STATE")
+            for key in (
+                "status",
+                "current_run_id",
+                "last_audit_at",
+                "last_finished_at",
+                "next_run_after",
+                "coverage_percent",
+                "active_task_count",
+                "active_issues_count",
+                "remediation_count",
+                "execution_errors",
+            ):
+                print(f"{key}: {state.get(key)}")
+        return 0
+    if sub == "history":
+        history = wd.get_run_history(limit=getattr(args, "limit", 20))
+        if getattr(args, "json", False):
+            print(json.dumps(history, indent=2, ensure_ascii=False))
+        else:
+            print("NOTIFICATION WATCHDOG RUN HISTORY")
+            for row in history:
+                print(
+                    f"{row['run_id']} status={row['status']} coverage={row['coverage_percent']}% "
+                    f"active={row['active_task_count']} issues={row['findings_count']} "
+                    f"remediations={row['remediations_succeeded']} error={row['error']}"
+                )
+        return 0
     if sub != "run":
         print(f"kanban watchdog: unknown action {sub!r}", file=sys.stderr)
         return 2

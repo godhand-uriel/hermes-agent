@@ -275,6 +275,90 @@ def test_repair_cleanup_removes_obvious_orphans_and_noncanonical_duplicates(kanb
     assert orphan_subs == []
 
 
+def test_scheduled_watchdog_records_state_history_and_skips_until_next_due(kanban_home):
+    from hermes_cli import kanban_notification_watchdog as wd
+
+    kb.create_board("command-center-board")
+    with kb.connect_closing(board="command-center-board") as conn:
+        kb.create_task(conn, title="covered by scheduler", assignee="a")
+    scheduled = wd.ScheduledWatchdogConfig(
+        enabled=True,
+        interval_seconds=60,
+        watchdog=_config(scoped_boards=["command-center-board"], mode="repair-safe"),
+    )
+
+    first = wd.run_scheduled_watchdog_once(scheduled, now=1000)
+    second = wd.run_scheduled_watchdog_once(scheduled, now=1001)
+
+    assert first is not None
+    assert first.status == "repaired"
+    assert second is None
+    state = wd.get_current_state(scheduled.watchdog)
+    assert state["current_run_id"] == first.run_id
+    assert state["last_audit_at"] == first.started_at
+    assert state["status"] == "repaired"
+    assert state["coverage_percent"] == 100.0
+    assert state["active_task_count"] == 1
+    assert state["active_issues_count"] == 0
+    assert state["remediation_count"] == 1
+    assert state["execution_errors"] is None
+    assert state["next_run_after"] >= first.finished_at + 60
+    history = wd.get_run_history(scheduled.watchdog, limit=5)
+    assert [row["run_id"] for row in history] == [first.run_id]
+
+
+def test_watchdog_overlap_lock_records_skipped_run_without_scanning(kanban_home):
+    from hermes_cli import kanban_notification_watchdog as wd
+
+    kb.create_board("command-center-board")
+    cfg = _config(scoped_boards=["command-center-board"], mode="repair-safe")
+    audit_conn = wd._init_audit_db(wd._audit_db_path(cfg))
+    try:
+        assert wd._acquire_lock(audit_conn, "already-running", now=10**12)
+    finally:
+        audit_conn.close()
+
+    report = wd.run_watchdog(cfg, audit=True, interval_seconds=60)
+
+    assert report.status == "skipped_overlap"
+    assert report.error == "another notification watchdog run is already active"
+    state = wd.get_current_state(cfg)
+    assert state["status"] == "skipped_overlap"
+    assert state["execution_errors"] == report.error
+    history = wd.get_run_history(cfg, limit=1)
+    assert history[0]["status"] == "skipped_overlap"
+
+
+def test_load_scheduled_config_defaults_daily_and_accepts_overrides(tmp_path):
+    from hermes_cli import kanban_notification_watchdog as wd
+
+    default = wd.load_scheduled_config({})
+    assert default.enabled is True
+    assert default.interval_seconds == 24 * 60 * 60
+    assert default.watchdog.mode == "detect"
+
+    audit_db = tmp_path / "watchdog.db"
+    custom = wd.load_scheduled_config({
+        "notification_watchdog": {
+            "enabled": "false",
+            "interval_seconds": 120,
+            "mode": "repair-safe",
+            "boards": "a,b",
+            "command_center_profile": "cc",
+            "audit_db_path": str(audit_db),
+            "telegram_target": {"chat_id": "-100", "thread_id": "7"},
+        }
+    })
+    assert custom.enabled is False
+    assert custom.interval_seconds == 120
+    assert custom.watchdog.mode == "repair-safe"
+    assert custom.watchdog.scoped_boards == ["a", "b"]
+    assert custom.watchdog.command_center_profile == "cc"
+    assert custom.watchdog.audit_db_path == audit_db
+    assert custom.watchdog.target.chat_id == "-100"
+    assert custom.watchdog.target.thread_id == "7"
+
+
 def test_run_slash_watchdog_accepts_negative_chat_id_and_ignores_global_board(kanban_home, monkeypatch):
     from hermes_cli import kanban as kc
 

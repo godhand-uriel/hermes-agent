@@ -33,6 +33,10 @@ DEFAULT_SCOPED_BOARDS = [
 ACTIVE_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
 FINAL_STATUSES = {"done", "archived"}
 VALID_MODES = {"detect", "dry-run", "repair-safe", "repair-cleanup"}
+DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60
+MIN_INTERVAL_SECONDS = 60
+LOCK_NAME = "notification_watchdog"
+LOCK_TTL_SECONDS = 60 * 60
 REQUIRED_TABLES = {
     "tasks": {"id", "title", "assignee", "status", "current_run_id", "created_at", "started_at", "completed_at"},
     "task_events": {"id", "task_id", "kind", "created_at"},
@@ -67,6 +71,13 @@ class WatchdogConfig:
     allow_inferred_target_for_writes: bool = False
     global_orphan_scan: bool = False
     audit_db_path: Optional[Path] = None
+
+
+@dataclass
+class ScheduledWatchdogConfig:
+    enabled: bool = True
+    interval_seconds: int = DEFAULT_INTERVAL_SECONDS
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
 
 
 @dataclass
@@ -351,6 +362,7 @@ def _audit_db_path(config: WatchdogConfig) -> Path:
 def _init_audit_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
         """
@@ -400,13 +412,168 @@ def _init_audit_db(path: Path) -> sqlite3.Connection:
           error TEXT,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS notification_watchdog_state (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          current_run_id TEXT,
+          last_audit_at INTEGER,
+          last_finished_at INTEGER,
+          next_run_after INTEGER,
+          status TEXT NOT NULL DEFAULT 'never_run',
+          coverage_percent REAL NOT NULL DEFAULT 0,
+          active_task_count INTEGER NOT NULL DEFAULT 0,
+          active_issues_count INTEGER NOT NULL DEFAULT 0,
+          remediation_count INTEGER NOT NULL DEFAULT 0,
+          execution_errors TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notification_watchdog_locks (
+          name TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          owner_pid INTEGER,
+          acquired_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
         """
     )
     conn.commit()
     return conn
 
 
-def _write_audit(conn: sqlite3.Connection, run: WatchdogRun, scoped_boards: list[str]) -> None:
+def _acquire_lock(conn: sqlite3.Connection, run_id: str, *, now: Optional[int] = None) -> bool:
+    now = int(time.time()) if now is None else int(now)
+    expires_at = now + LOCK_TTL_SECONDS
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO notification_watchdog_locks
+                (name, run_id, owner_pid, acquired_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (LOCK_NAME, run_id, os.getpid(), now, expires_at),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT expires_at FROM notification_watchdog_locks WHERE name = ?",
+            (LOCK_NAME,),
+        ).fetchone()
+        if row and int(row["expires_at"] or 0) > now:
+            return False
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE notification_watchdog_locks
+                SET run_id = ?, owner_pid = ?, acquired_at = ?, expires_at = ?
+                WHERE name = ? AND expires_at <= ?
+                """,
+                (run_id, os.getpid(), now, expires_at, LOCK_NAME, now),
+            )
+        return bool(cur.rowcount)
+
+
+def _release_lock(conn: sqlite3.Connection, run_id: str) -> None:
+    with conn:
+        conn.execute(
+            "DELETE FROM notification_watchdog_locks WHERE name = ? AND run_id = ?",
+            (LOCK_NAME, run_id),
+        )
+
+
+def _state_from_row(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            "status": "never_run",
+            "current_run_id": None,
+            "last_audit_at": None,
+            "last_finished_at": None,
+            "next_run_after": None,
+            "coverage_percent": 0.0,
+            "active_task_count": 0,
+            "active_issues_count": 0,
+            "remediation_count": 0,
+            "execution_errors": None,
+            "updated_at": None,
+        }
+    return {key: row[key] for key in row.keys()}
+
+
+def get_current_state(config: Optional[WatchdogConfig] = None) -> dict[str, Any]:
+    conn = _init_audit_db(_audit_db_path(config or WatchdogConfig()))
+    try:
+        row = conn.execute(
+            "SELECT * FROM notification_watchdog_state WHERE singleton_id = 1"
+        ).fetchone()
+        return _state_from_row(row)
+    finally:
+        conn.close()
+
+
+def get_run_history(config: Optional[WatchdogConfig] = None, *, limit: int = 20) -> list[dict[str, Any]]:
+    conn = _init_audit_db(_audit_db_path(config or WatchdogConfig()))
+    try:
+        rows = conn.execute(
+            """
+            SELECT run_id, started_at, finished_at, mode, status, coverage_percent,
+                   active_task_count, covered_task_count, findings_count,
+                   remediations_attempted, remediations_succeeded,
+                   remediations_failed, error
+            FROM notification_watchdog_runs
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [{key: row[key] for key in row.keys()} for row in rows]
+    finally:
+        conn.close()
+
+
+def _write_state(conn: sqlite3.Connection, run: WatchdogRun, scoped_boards: list[str], *, interval_seconds: Optional[int] = None) -> None:
+    finished = run.finished_at or int(time.time())
+    if run.status == "skipped_overlap":
+        next_run_after = finished + MIN_INTERVAL_SECONDS
+    else:
+        next_run_after = finished + int(interval_seconds or DEFAULT_INTERVAL_SECONDS)
+    active_issues = run.unresolved_issues_count
+    remediations = sum(1 for r in run.remediations if r.success)
+    conn.execute(
+        """
+        INSERT INTO notification_watchdog_state
+        (singleton_id, current_run_id, last_audit_at, last_finished_at,
+         next_run_after, status, coverage_percent, active_task_count,
+         active_issues_count, remediation_count, execution_errors, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton_id) DO UPDATE SET
+          current_run_id = excluded.current_run_id,
+          last_audit_at = excluded.last_audit_at,
+          last_finished_at = excluded.last_finished_at,
+          next_run_after = excluded.next_run_after,
+          status = excluded.status,
+          coverage_percent = excluded.coverage_percent,
+          active_task_count = excluded.active_task_count,
+          active_issues_count = excluded.active_issues_count,
+          remediation_count = excluded.remediation_count,
+          execution_errors = excluded.execution_errors,
+          updated_at = excluded.updated_at
+        """,
+        (
+            run.run_id,
+            run.started_at,
+            run.finished_at,
+            next_run_after,
+            run.status,
+            run.coverage_percent,
+            run.active_task_count,
+            active_issues,
+            remediations,
+            run.error,
+            int(time.time()),
+        ),
+    )
+
+
+def _write_audit(conn: sqlite3.Connection, run: WatchdogRun, scoped_boards: list[str], *, interval_seconds: Optional[int] = None) -> None:
     target = run.target or CommandCenterTarget()
     now = int(time.time())
     conn.execute(
@@ -469,6 +636,7 @@ def _write_audit(conn: sqlite3.Connection, run: WatchdogRun, scoped_boards: list
                 now,
             ),
         )
+    _write_state(conn, run, scoped_boards, interval_seconds=interval_seconds)
     conn.commit()
 
 
@@ -769,7 +937,100 @@ def _matches_target(sub: dict, target: CommandCenterTarget) -> bool:
     )
 
 
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
+def _positive_interval(value: Any, default: int = DEFAULT_INTERVAL_SECONDS) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        interval = default
+    return max(interval, MIN_INTERVAL_SECONDS)
+
+
+def load_scheduled_config(raw_config: Optional[dict[str, Any]] = None) -> ScheduledWatchdogConfig:
+    if raw_config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            raw_config = load_config()
+        except Exception:
+            raw_config = {}
+    raw = (raw_config or {}).get("notification_watchdog", {}) or {}
+    boards = raw.get("boards") or raw.get("scoped_boards") or DEFAULT_SCOPED_BOARDS
+    if isinstance(boards, str):
+        boards = [part.strip() for part in boards.split(",") if part.strip()]
+    target = None
+    t = raw.get("telegram_target") or {}
+    if isinstance(t, dict) and t.get("chat_id"):
+        target = CommandCenterTarget(
+            platform=str(t.get("platform") or "telegram"),
+            chat_id=str(t.get("chat_id") or ""),
+            thread_id=str(t.get("thread_id") or ""),
+            user_id=t.get("user_id"),
+            source="config",
+        )
+    watchdog = WatchdogConfig(
+        scoped_boards=list(boards or DEFAULT_SCOPED_BOARDS),
+        command_center_profile=str(raw.get("command_center_profile") or "command_center"),
+        target=target,
+        mode=str(raw.get("mode") or "detect"),
+        allow_inferred_target_for_writes=_coerce_bool(raw.get("allow_inferred_target_for_writes"), False),
+        global_orphan_scan=_coerce_bool(raw.get("global_orphan_scan"), False),
+        audit_db_path=Path(raw["audit_db_path"]) if raw.get("audit_db_path") else None,
+    )
+    return ScheduledWatchdogConfig(
+        enabled=_coerce_bool(raw.get("enabled"), True),
+        interval_seconds=_positive_interval(
+            raw.get("interval_seconds", raw.get("run_interval_seconds", DEFAULT_INTERVAL_SECONDS))
+        ),
+        watchdog=watchdog,
+    )
+
+
+def run_scheduled_watchdog_once(
+    scheduled: Optional[ScheduledWatchdogConfig] = None,
+    *,
+    force: bool = False,
+    now: Optional[int] = None,
+) -> Optional[WatchdogRun]:
+    scheduled = scheduled or load_scheduled_config()
+    if not scheduled.enabled:
+        return None
+    now = int(time.time()) if now is None else int(now)
+    conn = _init_audit_db(_audit_db_path(scheduled.watchdog))
+    try:
+        state = _state_from_row(
+            conn.execute("SELECT * FROM notification_watchdog_state WHERE singleton_id = 1").fetchone()
+        )
+        next_run_after = state.get("next_run_after")
+        if not force and next_run_after is not None and int(next_run_after) > now:
+            return None
+    finally:
+        conn.close()
+    return run_watchdog(
+        scheduled.watchdog,
+        audit=True,
+        interval_seconds=scheduled.interval_seconds,
+    )
+
+
 def _overall_status(run: WatchdogRun) -> str:
+    if run.status == "skipped_overlap":
+        return "skipped_overlap"
     if run.error:
         return "failed"
     if run.target is None:
@@ -792,7 +1053,12 @@ def _overall_status(run: WatchdogRun) -> str:
     return "healthy"
 
 
-def run_watchdog(config: Optional[WatchdogConfig] = None, *, audit: bool = True) -> WatchdogRun:
+def run_watchdog(
+    config: Optional[WatchdogConfig] = None,
+    *,
+    audit: bool = True,
+    interval_seconds: Optional[int] = None,
+) -> WatchdogRun:
     config = config or WatchdogConfig()
     if config.mode not in VALID_MODES:
         raise ValueError(f"invalid watchdog mode {config.mode!r}: expected one of {sorted(VALID_MODES)}")
@@ -811,8 +1077,17 @@ def run_watchdog(config: Optional[WatchdogConfig] = None, *, audit: bool = True)
     )
 
     audit_conn: Optional[sqlite3.Connection] = None
+    lock_acquired = False
     if audit:
         audit_conn = _init_audit_db(_audit_db_path(config))
+        lock_acquired = _acquire_lock(audit_conn, run.run_id, now=started)
+        if not lock_acquired:
+            run.status = "skipped_overlap"
+            run.error = "another notification watchdog run is already active"
+            run.finished_at = int(time.time())
+            _write_audit(audit_conn, run, config.scoped_boards, interval_seconds=interval_seconds)
+            audit_conn.close()
+            return run
 
     try:
         if run.target is None:
@@ -841,7 +1116,9 @@ def run_watchdog(config: Optional[WatchdogConfig] = None, *, audit: bool = True)
         run.status = _overall_status(run)
         if audit_conn is not None:
             try:
-                _write_audit(audit_conn, run, config.scoped_boards)
+                _write_audit(audit_conn, run, config.scoped_boards, interval_seconds=interval_seconds)
+                if lock_acquired:
+                    _release_lock(audit_conn, run.run_id)
             finally:
                 audit_conn.close()
     return run
@@ -859,6 +1136,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--command-center-profile", default="command_center")
     run.add_argument("--no-audit", action="store_true", help="Do not write remediation audit records")
     run.add_argument("--json", action="store_true", help="Emit machine-readable report JSON")
+    state = sub.add_parser("state", help="Show current scheduled watchdog state")
+    state.add_argument("--json", action="store_true", help="Emit machine-readable state JSON")
+    history = sub.add_parser("history", help="Show recent watchdog run history")
+    history.add_argument("--limit", type=int, default=20)
+    history.add_argument("--json", action="store_true", help="Emit machine-readable history JSON")
     return parser
 
 
@@ -910,6 +1192,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             print(report.format_text(), end="")
         return 0 if report.status != "failed" else 1
+    if args.action == "state":
+        state = get_current_state()
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2, ensure_ascii=False))
+        else:
+            print("NOTIFICATION WATCHDOG STATE")
+            for key in (
+                "status",
+                "current_run_id",
+                "last_audit_at",
+                "last_finished_at",
+                "next_run_after",
+                "coverage_percent",
+                "active_task_count",
+                "active_issues_count",
+                "remediation_count",
+                "execution_errors",
+            ):
+                print(f"{key}: {state.get(key)}")
+        return 0
+    if args.action == "history":
+        history = get_run_history(limit=getattr(args, "limit", 20))
+        if getattr(args, "json", False):
+            print(json.dumps(history, indent=2, ensure_ascii=False))
+        else:
+            print("NOTIFICATION WATCHDOG RUN HISTORY")
+            for row in history:
+                print(
+                    f"{row['run_id']} status={row['status']} coverage={row['coverage_percent']}% "
+                    f"active={row['active_task_count']} issues={row['findings_count']} "
+                    f"remediations={row['remediations_succeeded']} error={row['error']}"
+                )
+        return 0
     parser.print_help()
     return 2
 

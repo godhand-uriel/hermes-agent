@@ -11985,6 +11985,117 @@ def _first_payload_value(payload: dict[str, Any], aliases: tuple[str, ...]) -> A
     return None
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _watchdog_status_value(watchdog: dict[str, Any], *aliases: str) -> Any:
+    for key in aliases:
+        if key in watchdog and watchdog[key] not in (None, ""):
+            return watchdog[key]
+    return None
+
+
+def _coerce_watchdog_report_lines(value: Any) -> list[str]:
+    """Format notification-watchdog JSON into an executive report entry.
+
+    The watchdog CLI emits ``WatchdogRun.to_report_dict()``.  Report crons can
+    embed that payload under ``notification_watchdog``/``watchdog_status`` and
+    this formatter keeps the daily/weekly/monthly generated reports readable
+    while preserving the raw payload in metadata.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        lines: list[str] = []
+        for item in value:
+            lines.extend(_coerce_watchdog_report_lines(item))
+        return lines
+    if not isinstance(value, dict):
+        return _coerce_report_lines(value)
+
+    watchdog = dict(value)
+    status = str(_watchdog_status_value(watchdog, "status") or "unknown")
+    coverage = _coerce_float(_watchdog_status_value(watchdog, "coverage_percent", "coverage"))
+    total_active = _coerce_int(_watchdog_status_value(watchdog, "total_active_tasks", "active_task_count"))
+    covered = _coerce_int(_watchdog_status_value(watchdog, "covered_tasks", "covered_task_count"))
+    missing = _coerce_int(_watchdog_status_value(watchdog, "tasks_missing_subscriptions", "missing_subscription_count")) or 0
+    remediations = _coerce_int(_watchdog_status_value(watchdog, "remediations_performed", "remediations_succeeded")) or 0
+    unresolved = _coerce_int(_watchdog_status_value(watchdog, "unresolved_issues", "unresolved_issues_count")) or 0
+
+    coverage_text = "unknown coverage"
+    if coverage is not None:
+        coverage_text = f"{coverage:.1f}% coverage"
+    if total_active is not None:
+        active_prefix = f"{covered}/{total_active}" if covered is not None else str(total_active)
+        coverage_text = f"{active_prefix} active tasks ({coverage_text})"
+
+    lines = [
+        f"Status: {status} — {coverage_text}; missing subscriptions: {missing}; remediations performed: {remediations}; unresolved issues: {unresolved}"
+    ]
+
+    if missing > 0 or (coverage is not None and coverage < 100.0):
+        lines.append(
+            f"COVERAGE FAILURE: {missing} active task(s) are missing Command Center notification subscriptions."
+        )
+
+    remediation_rows = watchdog.get("remediations")
+    if isinstance(remediation_rows, list) and remediation_rows:
+        action_counts: dict[str, int] = {}
+        failures = 0
+        for row in remediation_rows:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action") or row.get("finding_type") or "unknown")
+            action_counts[action] = action_counts.get(action, 0) + 1
+            if row.get("success") is False:
+                failures += 1
+        history = ", ".join(f"{action}={count}" for action, count in sorted(action_counts.items()))
+        if history:
+            suffix = f"; failed remediations={failures}" if failures else ""
+            lines.append(f"Remediation history: {history}{suffix}")
+
+    findings = watchdog.get("findings")
+    risk_lines: list[str] = []
+    if isinstance(findings, list):
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            severity = str(finding.get("severity") or "").lower()
+            finding_status = str(finding.get("status") or "").lower()
+            if severity not in {"critical", "high"} and finding_status in {"resolved", "closed"}:
+                continue
+            finding_type = finding.get("finding_type") or finding.get("type") or "watchdog finding"
+            board = finding.get("board_slug") or finding.get("board") or "unknown-board"
+            task_id = finding.get("task_id")
+            target = f"{board} task={task_id}" if task_id else str(board)
+            risk_lines.append(f"{severity or 'notice'} {target}: {finding_type} ({finding_status or 'open'})")
+            if len(risk_lines) >= 5:
+                break
+    for risk in risk_lines:
+        lines.append(f"Risk/recommendation item: {risk}")
+
+    recommendations = watchdog.get("recommendations") or watchdog.get("risks") or watchdog.get("notable_risks")
+    for recommendation in _coerce_report_lines(recommendations)[:5]:
+        lines.append(f"Risk/recommendation item: {recommendation}")
+
+    return lines
+
+
 def _build_readable_generated_report_content(payload: dict[str, Any], title: str) -> str:
     """Convert report JSON into executive-readable markdown instead of raw JSON."""
     lines: list[str] = [f"# {title}"]
@@ -11993,6 +12104,10 @@ def _build_readable_generated_report_content(payload: dict[str, Any], title: str
         lines.extend(["", f"**Date / range:** {date_value}"])
 
     emitted = False
+    watchdog_value = _first_payload_value(
+        payload,
+        ("notification_watchdog", "watchdog_status", "watchdog_results", "subscription_watchdog"),
+    )
     for _, heading, aliases in _GENERATED_REPORT_READABLE_SECTIONS:
         section_lines = _coerce_report_lines(_first_payload_value(payload, aliases))
         if not section_lines:
@@ -12003,6 +12118,20 @@ def _build_readable_generated_report_content(payload: dict[str, Any], title: str
             lines.append(section_lines[0])
         else:
             lines.extend(f"- {line}" for line in section_lines)
+        if heading == "Risks / blockers" and watchdog_value:
+            watchdog_lines = _coerce_watchdog_report_lines(watchdog_value)
+            if watchdog_lines:
+                lines.extend(["", "## Notification watchdog status"])
+                lines.extend(f"- {line}" for line in watchdog_lines)
+                emitted = True
+                watchdog_value = None
+
+    if watchdog_value:
+        watchdog_lines = _coerce_watchdog_report_lines(watchdog_value)
+        if watchdog_lines:
+            lines.extend(["", "## Notification watchdog status"])
+            lines.extend(f"- {line}" for line in watchdog_lines)
+            emitted = True
 
     if not emitted:
         fallback = _coerce_report_lines(payload.get("content") or payload.get("markdown") or payload.get("body"))

@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,9 @@ def test_repair_safe_adds_missing_command_center_subscriptions_and_ignores_worke
     assert report.coverage_percent == 100.0
     assert {r.action for r in report.remediations} == {"add_missing_subscription"}
     assert len(report.remediations) == 2
+    assert len(report.alerts) == 4
+    assert {alert.channel for alert in report.alerts} == {"telegram", "dashboard"}
+    assert {alert.details["remediation_status"] for alert in report.alerts} == {"succeeded"}
     assert not pinned.exists(), "multi-board watchdog must not follow worker-pinned HERMES_KANBAN_DB"
 
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
@@ -194,7 +198,7 @@ def test_watchdog_json_report_contains_required_subscription_coverage_fields(kan
 
     kb.create_board("command-center-board")
     with kb.connect_closing(board="command-center-board") as conn:
-        kb.create_task(conn, title="missing", assignee="a")
+        task_id = kb.create_task(conn, title="missing", assignee="a")
 
     exit_code = wd.main([
         "run",
@@ -215,6 +219,48 @@ def test_watchdog_json_report_contains_required_subscription_coverage_fields(kan
     assert payload["tasks_missing_subscriptions"] == 1
     assert payload["remediations_performed"] == 0
     assert payload["unresolved_issues"] >= 1
+    assert payload["alerts_generated"] == 2
+    assert {alert["channel"] for alert in payload["alerts"]} == {"telegram", "dashboard"}
+    for alert in payload["alerts"]:
+        assert "command-center-board" in alert["message"]
+        assert task_id in alert["message"]
+        assert "missing_subscription=telegram:-100command:42" in alert["message"]
+        assert "remediation=not_attempted" in alert["message"]
+        assert alert["details"]["affected_board"] == "command-center-board"
+        assert alert["details"]["affected_task"] == task_id
+        assert alert["details"]["remediation_status"] == "not_attempted"
+        assert alert["details"]["missing_subscriptions"][0]["chat_id"] == "-100command"
+
+
+def test_watchdog_alerts_are_persisted_and_exposed_for_dashboard_status(kanban_home):
+    from hermes_cli import kanban_notification_watchdog as wd
+
+    kb.create_board("command-center-board")
+    with kb.connect_closing(board="command-center-board") as conn:
+        task_id = kb.create_task(conn, title="missing", assignee="a")
+
+    report = wd.run_watchdog(_config(mode="detect"), audit=True)
+
+    assert report.status == "uncovered"
+    assert len(report.alerts) == 2
+    text_report = report.format_text()
+    assert "missing_subscription=telegram:-100command:42" in text_report
+    assert f"task={task_id}" in text_report
+    audit_db = kanban_home / "notification_watchdog" / "remediations.db"
+    with sqlite3.connect(audit_db) as conn:
+        rows = conn.execute("SELECT channel, message, details_json FROM notification_watchdog_alerts ORDER BY channel").fetchall()
+    assert [row[0] for row in rows] == ["dashboard", "telegram"]
+    assert all(task_id in row[1] for row in rows)
+
+    status = wd.latest_watchdog_status(limit=10)
+    assert status["status"] == "uncovered"
+    assert status["coverage_percent"] == 0.0
+    assert status["last_audit_at"] == report.finished_at
+    assert status["active_issues"] >= 1
+    assert status["remediation_count"] == 0
+    assert {alert["channel"] for alert in status["alerts"]} == {"telegram", "dashboard"}
+    dashboard_alert = next(alert for alert in status["alerts"] if alert["channel"] == "dashboard")
+    assert dashboard_alert["details"]["affected_task"] == task_id
 
 
 def test_repair_cleanup_removes_obvious_orphans_and_noncanonical_duplicates(kanban_home):

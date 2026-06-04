@@ -6938,6 +6938,14 @@ def _dashboard_empty_contract(
             },
         },
         "board_health": {"status_counts": {}, "total_tasks": 0, "active_tasks": 0, "blocked_tasks": 0, "review_required": 0},
+        "notification_watchdog": {
+            "status": "unconfigured",
+            "coverage_percent": None,
+            "last_audit_at": None,
+            "active_issues": 0,
+            "remediation_count": 0,
+            "alerts": [],
+        },
         "portfolio_ventures": [],
         "career_progress": {"status": "unconfigured", "items": [], "summary": None},
         "engineering_metrics": {
@@ -7094,11 +7102,10 @@ def _dashboard_collect_session_metrics(days: int) -> tuple[dict[str, Any], list[
                        COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
                        MAX(started_at) as last_used_at
                 FROM sessions
-                WHERE started_at > ? AND model IS NOT NULL AND model != ''
+                WHERE model IS NOT NULL AND model != ''
                 GROUP BY model, billing_provider
                 ORDER BY sessions DESC, last_used_at DESC
                 """,
-                (cutoff,),
             ).fetchall()]
             models: list[dict[str, Any]] = []
             provider_map: dict[str, dict[str, Any]] = {}
@@ -7183,7 +7190,7 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
     completed_tasks = [
         _dashboard_task_item(item)
         for item in tasks
-        if item.get("status") == "done" and int(item.get("completed_at") or 0) >= cutoff
+        if item.get("status") == "done" 
     ][:limit]
     response["executive_briefing"] = {
         "top_priorities": top_priorities,
@@ -7198,6 +7205,22 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
         "blocked_tasks": status_counts.get("blocked", 0),
         "review_required": status_counts.get("review", 0) + sum(1 for item in tasks if item.get("status") != "review" and _dashboard_is_review_required(item)),
     }
+    try:
+        from hermes_cli.kanban_notification_watchdog import latest_watchdog_status
+
+        response["notification_watchdog"] = latest_watchdog_status(limit=limit)
+    except Exception as exc:
+        _log.debug("dashboard v2 watchdog status failed: %s", exc)
+        errors.append({"source": "notification_watchdog", "message": str(exc)})
+        response["notification_watchdog"] = {
+            "status": "failed",
+            "coverage_percent": None,
+            "last_audit_at": None,
+            "active_issues": 0,
+            "remediation_count": 0,
+            "alerts": [],
+            "error": str(exc),
+        }
 
     portfolios: dict[str, dict[str, Any]] = {}
     tests_reported = 0

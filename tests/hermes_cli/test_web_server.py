@@ -763,6 +763,20 @@ class TestWebServerEndpoints:
         finally:
             conn.close()
 
+        import hermes_cli.kanban_notification_watchdog as watchdog
+
+        kanban_db.create_board("command-center-board")
+        with kanban_db.connect_closing(board="command-center-board") as watchdog_conn:
+            watchdog_task_id = kanban_db.create_task(watchdog_conn, title="Missing command-center subscription", assignee="ops")
+        watchdog_report = watchdog.run_watchdog(
+            watchdog.WatchdogConfig(
+                scoped_boards=["command-center-board"],
+                target=watchdog.CommandCenterTarget(platform="telegram", chat_id="-100command", thread_id="42"),
+                mode="detect",
+            ),
+            audit=True,
+        )
+
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
         (reports_dir / "weekly-report.md").write_text(
@@ -813,6 +827,16 @@ class TestWebServerEndpoints:
         assert data["executive_briefing"]["completed_tasks"][0]["id"] == done_id
         assert data["board_health"]["status_counts"]["done"] == 1
         assert data["board_health"]["total_tasks"] == 4
+        assert data["notification_watchdog"]["status"] == "uncovered"
+        assert data["notification_watchdog"]["coverage_percent"] == 0.0
+        assert data["notification_watchdog"]["last_audit_at"] == watchdog_report.finished_at
+        assert data["notification_watchdog"]["active_issues"] >= 1
+        assert data["notification_watchdog"]["remediation_count"] == 0
+        assert {alert["channel"] for alert in data["notification_watchdog"]["alerts"]} == {"telegram", "dashboard"}
+        dashboard_alert = next(alert for alert in data["notification_watchdog"]["alerts"] if alert["channel"] == "dashboard")
+        assert dashboard_alert["details"]["affected_board"] == "command-center-board"
+        assert dashboard_alert["details"]["affected_task"] == watchdog_task_id
+        assert "missing_subscription=telegram:-100command:42" in dashboard_alert["message"]
         assert data["provider_model_health"]["models"][0]["model"] == "gpt-5.5"
         assert data["agent_metrics"]["sessions"] == 1
         assert data["engineering_metrics"]["completed_tasks"] == 1

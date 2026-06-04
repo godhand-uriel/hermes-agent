@@ -23,6 +23,7 @@ import { api } from "@/lib/api";
 import type {
   DashboardV2Metric,
   DashboardV2Response,
+  DashboardV2WatchdogStatus,
   DeploymentStatusSummary,
   GeneratedReportItem,
   GeneratedReportLatestEnvelope,
@@ -57,6 +58,7 @@ interface DashboardViewModel {
     metrics: DashboardV2Metric[];
     statusCounts: Record<string, number>;
   };
+  notificationWatchdog: DashboardV2WatchdogStatus;
   portfolioHealth: {
     metrics: DashboardV2Metric[];
     projects: ReportsProjectSummary[];
@@ -289,6 +291,14 @@ function buildFallbackDashboard(reports: ReportsResponse): DashboardViewModel {
       ],
       statusCounts: reports.summary.status_counts,
     },
+    notificationWatchdog: {
+      status: "unconfigured",
+      coverage_percent: null,
+      last_audit_at: null,
+      active_issues: 0,
+      remediation_count: 0,
+      alerts: [],
+    },
     portfolioHealth: {
       metrics: [
         metric("Active projects", reports.summary.active_projects),
@@ -337,6 +347,7 @@ function buildDashboardV2(data: DashboardV2Response, project: string, q: string)
   const fallback = buildFallbackDashboard(reports);
   const briefing = data.executive_briefing ?? {};
   const board = data.board_health ?? {};
+  const watchdog = data.notification_watchdog ?? {};
   const portfolio = data.portfolio_health ?? {};
   const engineering = data.engineering_metrics ?? {};
   const agent = data.agent_metrics ?? {};
@@ -391,6 +402,10 @@ function buildDashboardV2(data: DashboardV2Response, project: string, q: string)
         metric("Review", board.review_required ?? reports.summary.review_required),
       ],
       statusCounts: board.status_counts ?? reports.summary.status_counts,
+    },
+    notificationWatchdog: {
+      ...watchdog,
+      alerts: asArray(watchdog.alerts),
     },
     portfolioHealth: {
       metrics: [
@@ -1149,6 +1164,43 @@ export default function ReportsPage() {
                   </Badge>
                 </div>
                 <Stats items={statItems} />
+              </div>
+              <div className="mb-4 rounded-lg border border-border/60 bg-card/70 p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-foreground">Notification watchdog</h3>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Coverage {dashboard.notificationWatchdog.coverage_percent == null ? "—" : `${dashboard.notificationWatchdog.coverage_percent}%`} · last audit {formatDate(dashboard.notificationWatchdog.last_audit_at)}
+                    </p>
+                  </div>
+                  <Badge className={statusTone(dashboard.notificationWatchdog.status || "unconfigured")}>
+                    {dashboard.notificationWatchdog.status || "unconfigured"}
+                  </Badge>
+                </div>
+                <MetricGrid
+                  metrics={[
+                    metric("Coverage", dashboard.notificationWatchdog.coverage_percent == null ? "—" : `${dashboard.notificationWatchdog.coverage_percent}%`),
+                    metric("Active issues", dashboard.notificationWatchdog.active_issues ?? 0),
+                    metric("Remediations", dashboard.notificationWatchdog.remediation_count ?? 0),
+                    metric("Alerts", dashboard.notificationWatchdog.alerts?.length ?? 0),
+                  ]}
+                  emptyLabel="No watchdog status"
+                  emptyDetail="Run the notification watchdog to populate coverage and alert status."
+                />
+                <div className="mt-4 space-y-2">
+                  {(dashboard.notificationWatchdog.alerts ?? []).slice(0, 3).map((alert, index) => (
+                    <div key={`${alert.channel}-${alert.created_at ?? index}-${index}`} className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge className={statusTone(alert.severity)}>{alert.channel}</Badge>
+                        <span className="text-sm font-medium text-foreground">{alert.title}</span>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">{alert.message}</p>
+                    </div>
+                  ))}
+                  {(dashboard.notificationWatchdog.alerts ?? []).length === 0 && (
+                    <p className="text-xs text-text-tertiary">No active watchdog alerts.</p>
+                  )}
+                </div>
               </div>
               <MetricGrid metrics={dashboard.agentMetrics.metrics} emptyLabel="No agent metrics" emptyDetail="Session/model analytics are unavailable for the current filters." />
               <div className="mt-4">

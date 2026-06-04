@@ -105,6 +105,18 @@ class Remediation:
 
 
 @dataclass
+class WatchdogAlert:
+    channel: str
+    severity: str
+    title: str
+    message: str
+    created_at: int
+    status: str = "generated"
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+
+@dataclass
 class BoardReport:
     slug: str
     db_path: Optional[str]
@@ -130,6 +142,7 @@ class WatchdogRun:
     covered_task_count: int
     findings: list[Finding] = field(default_factory=list)
     remediations: list[Remediation] = field(default_factory=list)
+    alerts: list[WatchdogAlert] = field(default_factory=list)
     boards: dict[str, BoardReport] = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -153,6 +166,7 @@ class WatchdogRun:
             "tasks_missing_subscriptions": self.missing_subscription_count,
             "remediations_performed": sum(1 for r in self.remediations if r.success),
             "unresolved_issues": self.unresolved_issues_count,
+            "alerts_generated": len(self.alerts),
             "command_center_profile": self.command_center_profile,
             "canonical_target": asdict(self.target) if self.target else None,
             "boards": {slug: asdict(report) for slug, report in self.boards.items()},
@@ -169,6 +183,7 @@ class WatchdogRun:
                 for f in self.findings
             ],
             "remediations": [asdict(r) for r in self.remediations],
+            "alerts": [asdict(a) for a in self.alerts],
         }
 
     def format_text(self) -> str:
@@ -180,6 +195,7 @@ class WatchdogRun:
             f"Tasks missing subscriptions: {self.missing_subscription_count}",
             f"Remediations performed: {sum(1 for r in self.remediations if r.success)}",
             f"Unresolved issues: {self.unresolved_issues_count}",
+            f"Alerts generated: {len(self.alerts)}",
         ]
         if self.target:
             lines.append(f"Target: {self.target.platform}:{self.target.chat_id}:{self.target.thread_id}")
@@ -199,6 +215,14 @@ class WatchdogRun:
                 lines.append(f"- {f.severity} {f.board_slug}{task}: {f.finding_type} ({f.status})")
             if len(self.findings) > 50:
                 lines.append(f"... {len(self.findings) - 50} more findings omitted")
+        if self.alerts:
+            lines.append("")
+            lines.append("Alerts:")
+            for alert in self.alerts[:50]:
+                lines.append(f"- {alert.channel} {alert.severity}: {alert.title} ({alert.status})")
+                lines.append(f"  {alert.message}")
+            if len(self.alerts) > 50:
+                lines.append(f"... {len(self.alerts) - 50} more alerts omitted")
         return "\n".join(lines) + "\n"
 
 
@@ -412,6 +436,7 @@ def _init_audit_db(path: Path) -> sqlite3.Connection:
           error TEXT,
           created_at INTEGER NOT NULL
         );
+
         CREATE TABLE IF NOT EXISTS notification_watchdog_state (
           singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
           current_run_id TEXT,
@@ -432,6 +457,17 @@ def _init_audit_db(path: Path) -> sqlite3.Connection:
           owner_pid INTEGER,
           acquired_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL
+	);
+        CREATE TABLE IF NOT EXISTS notification_watchdog_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          title TEXT NOT NULL,
+          message TEXT NOT NULL,
+          status TEXT NOT NULL,
+          details_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL
         );
         """
     )
@@ -636,7 +672,26 @@ def _write_audit(conn: sqlite3.Connection, run: WatchdogRun, scoped_boards: list
                 now,
             ),
         )
+
     _write_state(conn, run, scoped_boards, interval_seconds=interval_seconds)
+    for alert in run.alerts:
+        conn.execute(
+            """
+            INSERT INTO notification_watchdog_alerts
+            (run_id, channel, severity, title, message, status, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.run_id,
+                alert.channel,
+                alert.severity,
+                alert.title,
+                alert.message,
+                alert.status,
+                json.dumps(alert.details, sort_keys=True),
+                alert.created_at,
+            ),
+        )
     conn.commit()
 
 
@@ -1053,6 +1108,162 @@ def _overall_status(run: WatchdogRun) -> str:
     return "healthy"
 
 
+
+def _remediation_status_for_finding(run: WatchdogRun, finding: Finding) -> str:
+    relevant = [
+        r
+        for r in run.remediations
+        if r.board_slug == finding.board_slug
+        and r.task_id == finding.task_id
+        and r.finding_type == finding.finding_type
+    ]
+    if relevant:
+        if any(r.mode == "dry-run" for r in relevant):
+            return "would_remediate"
+        if any(r.success for r in relevant):
+            return "succeeded"
+        return "failed"
+    if run.mode == "dry-run":
+        return "would_remediate"
+    if run.mode == "detect":
+        return "not_attempted"
+    return "not_attempted"
+
+
+def _alert_message(run: WatchdogRun, finding: Finding, remediation_status: str) -> str:
+    target = run.target or CommandCenterTarget()
+    missing_destination = f"{target.platform}:{target.chat_id}:{target.thread_id}" if target.chat_id else target.platform
+    return (
+        "Kanban notification watchdog detected missing Command Center coverage. "
+        f"Board={finding.board_slug}; task={finding.task_id or 'n/a'}; "
+        f"missing_subscription={missing_destination}; remediation={remediation_status}; "
+        f"coverage={run.covered_task_count}/{run.active_task_count} ({run.coverage_percent:.1f}%)."
+    )
+
+
+def _generate_alerts(run: WatchdogRun) -> list[WatchdogAlert]:
+    missing = [f for f in run.findings if f.finding_type == "missing_subscription"]
+    if not missing and (not run.active_task_count or run.covered_task_count >= run.active_task_count):
+        return []
+    now = run.finished_at or int(time.time())
+    alerts: list[WatchdogAlert] = []
+    for finding in missing:
+        remediation_status = _remediation_status_for_finding(run, finding)
+        details = {
+            "run_id": run.run_id,
+            "affected_board": finding.board_slug,
+            "affected_task": finding.task_id,
+            "missing_subscriptions": [asdict(run.target)] if run.target else [],
+            "remediation_status": remediation_status,
+            "coverage_percent": run.coverage_percent,
+            "active_task_count": run.active_task_count,
+            "covered_task_count": run.covered_task_count,
+            "finding": asdict(finding),
+        }
+        title = f"Kanban notification coverage gap: {finding.board_slug} {finding.task_id or ''}".strip()
+        message = _alert_message(run, finding, remediation_status)
+        for channel in ("telegram", "dashboard"):
+            alerts.append(
+                WatchdogAlert(
+                    channel=channel,
+                    severity=finding.severity,
+                    title=title,
+                    message=message,
+                    created_at=now,
+                    status="generated",
+                    details=details,
+                )
+            )
+    return alerts
+
+
+def latest_watchdog_status(config: Optional[WatchdogConfig] = None, *, limit: int = 20) -> dict[str, Any]:
+    """Return the most recent watchdog health payload for dashboards.
+
+    This is intentionally read-only from the dashboard's point of view: it reads
+    the persisted watchdog audit database and summarizes the latest completed
+    run plus recent generated alerts. If the audit database is absent or empty,
+    callers get an explicit unconfigured/unknown payload rather than an error.
+    """
+    cfg = config or WatchdogConfig()
+    path = _audit_db_path(cfg)
+    empty = {
+        "status": "unconfigured",
+        "coverage_percent": None,
+        "last_audit_at": None,
+        "active_issues": 0,
+        "remediation_count": 0,
+        "alerts": [],
+        "audit_db_path": str(path),
+    }
+    if not path.exists():
+        return empty
+    try:
+        conn = _init_audit_db(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            run_row = conn.execute(
+                """
+                SELECT * FROM notification_watchdog_runs
+                ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not run_row:
+                return empty
+            run_id = str(run_row["run_id"])
+            alerts = [
+                {
+                    "channel": row["channel"],
+                    "severity": row["severity"],
+                    "title": row["title"],
+                    "message": row["message"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "details": json.loads(row["details_json"] or "{}"),
+                }
+                for row in conn.execute(
+                    """
+                    SELECT channel, severity, title, message, status, details_json, created_at
+                    FROM notification_watchdog_alerts
+                    WHERE run_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, max(1, min(int(limit or 20), 100))),
+                ).fetchall()
+            ]
+            unresolved_findings = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM notification_watchdog_findings WHERE run_id = ? AND status != 'resolved'",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            failed_remediations = int(run_row["remediations_failed"] or 0)
+            remediation_count = int(run_row["remediations_attempted"] or 0)
+            return {
+                "status": run_row["status"],
+                "run_id": run_id,
+                "mode": run_row["mode"],
+                "coverage_percent": float(run_row["coverage_percent"] or 0),
+                "last_audit_at": run_row["finished_at"] or run_row["started_at"],
+                "active_task_count": int(run_row["active_task_count"] or 0),
+                "covered_task_count": int(run_row["covered_task_count"] or 0),
+                "active_issues": unresolved_findings + failed_remediations,
+                "remediation_count": remediation_count,
+                "remediations_succeeded": int(run_row["remediations_succeeded"] or 0),
+                "remediations_failed": int(run_row["remediations_failed"] or 0),
+                "alerts": alerts,
+                "audit_db_path": str(path),
+                "error": run_row["error"],
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {**empty, "status": "failed", "error": str(exc)}
+
+
 def run_watchdog(
     config: Optional[WatchdogConfig] = None,
     *,
@@ -1114,6 +1325,7 @@ def run_watchdog(
         run.finished_at = int(time.time())
         run.coverage_percent = round((run.covered_task_count / run.active_task_count * 100.0), 1) if run.active_task_count else 100.0
         run.status = _overall_status(run)
+        run.alerts = _generate_alerts(run)
         if audit_conn is not None:
             try:
                 _write_audit(audit_conn, run, config.scoped_boards, interval_seconds=interval_seconds)

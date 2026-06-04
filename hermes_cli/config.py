@@ -2600,6 +2600,30 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
     },
 
+    # Command Center notification subscription coverage watchdog. The gateway
+    # runs it automatically on this cadence (default: daily) and stores state
+    # in the Kanban home so dashboards/executive reports can read the latest
+    # audit and run history. Default mode is detect-only; set mode to
+    # repair-safe or repair-cleanup to allow automatic remediations.
+    "notification_watchdog": {
+        "enabled": True,
+        "interval_seconds": 24 * 60 * 60,
+        "mode": "detect",
+        "boards": [
+            "command-center-board",
+            "career-development-board",
+            "engineering-brand-board",
+            "artist-management-board",
+            "venture-portfolio-board",
+            "research-office-board",
+        ],
+        "command_center_profile": "command_center",
+        "telegram_target": {},
+        "allow_inferred_target_for_writes": False,
+        "global_orphan_scan": False,
+        "audit_db_path": "",
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:

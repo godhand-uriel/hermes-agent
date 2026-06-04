@@ -15270,6 +15270,10 @@ Examples:
         sys.exit(1)
 
     _processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    if "kanban" in _processed_argv and "watchdog" in _processed_argv and "run" in _processed_argv:
+        from hermes_cli import kanban_notification_watchdog as _kanban_watchdog
+
+        _processed_argv = _kanban_watchdog._normalize_negative_option_values(_processed_argv) or _processed_argv
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
     # On some Python versions (notably <3.11), argparse fails to route

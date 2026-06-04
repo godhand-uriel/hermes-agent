@@ -468,6 +468,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    # --- watchdog (multi-board notification coverage audit) ---
+    p_watchdog = sub.add_parser(
+        "watchdog",
+        help="Audit/remediate Command Center notification subscription coverage",
+    )
+    watchdog_sub = p_watchdog.add_subparsers(dest="watchdog_action")
+    wd_run = watchdog_sub.add_parser("run", help="Run a subscription coverage audit")
+    wd_run.add_argument("--mode", choices=["detect", "dry-run", "repair-cleanup", "repair-safe"], default="detect")
+    wd_run.add_argument("--watchdog-board", action="append", dest="watchdog_boards", default=None,
+                        help="Scoped board slug; repeatable. Defaults to the six Command Center policy boards.")
+    wd_run.add_argument("--target-chat-id", default=None,
+                        help="Canonical Command Center Telegram chat id")
+    wd_run.add_argument("--target-thread-id", default="",
+                        help="Canonical Command Center Telegram topic/thread id")
+    wd_run.add_argument("--target-user-id", default=None,
+                        help="Optional Telegram user id to store on restored rows")
+    wd_run.add_argument("--command-center-profile", default="command_center")
+    wd_run.add_argument("--no-audit", action="store_true",
+                        help="Do not write remediation audit records")
+    wd_run.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
         "diagnostics",
@@ -878,6 +899,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    # Watchdog scans multiple policy boards and must explicitly ignore any
+    # worker-pinned HERMES_KANBAN_DB/HERMES_KANBAN_BOARD inherited from the
+    # dispatcher, so do not apply the normal single-board env override or
+    # auto-init path before dispatching it.
+    if action == "watchdog":
+        return _cmd_watchdog(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -939,6 +967,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "assign":   _cmd_assign,
         "reclaim":  _cmd_reclaim,
         "reassign": _cmd_reassign,
+        "watchdog": _cmd_watchdog,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
         "link":     _cmd_link,
@@ -1202,6 +1231,37 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     else:
         print(f"Board {normed!r} default workdir cleared.")
     return 0
+
+
+def _cmd_watchdog(args: argparse.Namespace) -> int:
+    """Run the multi-board notification coverage watchdog."""
+    from hermes_cli import kanban_notification_watchdog as wd
+
+    sub = getattr(args, "watchdog_action", None) or "run"
+    if sub != "run":
+        print(f"kanban watchdog: unknown action {sub!r}", file=sys.stderr)
+        return 2
+    target = None
+    if getattr(args, "target_chat_id", None):
+        target = wd.CommandCenterTarget(
+            platform="telegram",
+            chat_id=args.target_chat_id,
+            thread_id=getattr(args, "target_thread_id", "") or "",
+            user_id=getattr(args, "target_user_id", None),
+            source="cli",
+        )
+    cfg = wd.WatchdogConfig(
+        scoped_boards=list(getattr(args, "watchdog_boards", None) or wd.DEFAULT_SCOPED_BOARDS),
+        command_center_profile=getattr(args, "command_center_profile", "command_center") or "command_center",
+        target=target,
+        mode=getattr(args, "mode", "detect") or "detect",
+    )
+    report = wd.run_watchdog(cfg, audit=not bool(getattr(args, "no_audit", False)))
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_report_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(report.format_text(), end="")
+    return 0 if report.status != "failed" else 1
 
 
 # ---------------------------------------------------------------------------
@@ -2776,6 +2836,10 @@ def run_slash(rest: str) -> str:
     import contextlib
 
     tokens = shlex.split(rest) if rest and rest.strip() else []
+    if "watchdog" in tokens and "run" in tokens:
+        from hermes_cli import kanban_notification_watchdog as wd
+
+        tokens = wd._normalize_negative_option_values(tokens) or tokens
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

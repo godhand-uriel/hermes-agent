@@ -23,6 +23,10 @@ Includes:
 * Review-required tasks
 * Today's deadlines
 * Recommended focus order
+* Notification watchdog status: coverage percentage, total active tasks,
+  tasks missing Command Center subscriptions, remediations performed,
+  unresolved issues, and any notable risk/recommendation items. Coverage below
+  100% must be called out as `COVERAGE FAILURE`.
 
 Owner:
 command_center
@@ -38,6 +42,10 @@ Includes:
 * Tasks needing review
 * Progress by profile
 * Tomorrow's recommended priorities
+* Notification watchdog status with coverage percentage, total active tasks,
+  tasks missing subscriptions, remediation history, unresolved issues, and any
+  notable risk/recommendation items. Coverage below 100% must be called out as
+  `COVERAGE FAILURE`.
 
 Owner:
 command_center
@@ -70,11 +78,14 @@ Includes:
 * Venture pipeline movement
 * Top risks
 * Next week's priorities
+* Notification watchdog status: latest coverage percentage, total active tasks,
+  tasks missing subscriptions, remediations performed during the period,
+  unresolved issues, and high/critical risk or recommendation items.
 
 Owner:
 command_center
 
-## Monthly Portfolio Review
+## Monthly Executive Review
 
 Time: first Sunday of each month.
 
@@ -85,9 +96,12 @@ Includes:
 * Revenue opportunities
 * Resource allocation
 * Strategic recommendations
+* Notification watchdog trend/status: latest coverage percentage, total active
+  tasks, tasks missing subscriptions, remediation history for the month,
+  unresolved issues, and recurring risk/recommendation items.
 
 Owner:
-venture_portfolio with command_center review.
+command_center with venture_portfolio input for portfolio decisions.
 
 ## Default Escalation Rules
 

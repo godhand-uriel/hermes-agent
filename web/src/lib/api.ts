@@ -1669,6 +1669,28 @@ export interface DashboardV2WatchdogStatus {
   error?: string | null;
 }
 
+export interface DashboardOperatingNote {
+  status?: string | null;
+  summary?: string | null;
+  phase?: string | null;
+  objectives?: string[] | null;
+  roadmap?: string[] | null;
+  priorities?: string[] | null;
+  completed?: string[] | null;
+  blockers?: string[] | null;
+  risks?: string[] | null;
+  next_actions?: string[] | null;
+  kpis?: string[] | null;
+  items?: DashboardV2Metric[] | null;
+  milestones?: DashboardV2Metric[] | null;
+  source?: {
+    type?: string | null;
+    path?: string | null;
+    relative_path?: string | null;
+    frontmatter?: Record<string, unknown> | null;
+  } | null;
+}
+
 export interface DashboardV2Response {
   generated_at?: number | null;
   filters?: { days?: number; board?: string; profile?: string; project?: string; q?: string };
@@ -1705,12 +1727,8 @@ export interface DashboardV2Response {
     total_projects?: number | null;
     projects?: DashboardV2PortfolioItem[] | null;
   } | null;
-  career_progress?: {
-    status?: string | null;
-    summary?: string | null;
-    items?: DashboardV2Metric[] | null;
-    milestones?: DashboardV2Metric[] | null;
-  } | null;
+  career_progress?: DashboardOperatingNote | null;
+  artist_management?: DashboardOperatingNote | null;
   engineering_metrics?: {
     metrics?: DashboardV2Metric[] | null;
     completed_tasks?: number | null;

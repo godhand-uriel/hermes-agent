@@ -19,6 +19,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -6422,6 +6423,21 @@ def _iter_report_roots() -> list[Path]:
     return deduped
 
 
+def _is_generated_report_library_path(path: Path, root: Path) -> bool:
+    """Return true when ``path`` is a generated-report payload, not a library report.
+
+    Generated report JSON files are exposed through the dedicated
+    ``/api/reports/generated`` contract.  The generic weekly Report Library should
+    not recurse into ``reports/generated/**`` and present those JSON payloads as
+    plain-text excerpts.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    return any(part.casefold() == "generated" for part in relative.parts[:-1])
+
+
 def _collect_report_files(limit: int = 80) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
     for root in _iter_report_roots():
@@ -6429,6 +6445,8 @@ def _collect_report_files(limit: int = 80) -> list[dict[str, Any]]:
             if len(reports) >= limit:
                 break
             if not path.is_file() or path.suffix.lower() not in {".md", ".txt", ".json"}:
+                continue
+            if _is_generated_report_library_path(path, root):
                 continue
             name = path.name.lower()
             if "report" not in name and "qa" not in name and "deploy" not in name and "github" not in name:
@@ -6906,6 +6924,157 @@ async def get_generated_report_history(report_type: str, limit: int = 20):
     }
 
 
+_DEFAULT_OBSIDIAN_VAULT = Path(os.environ.get("HERMES_DASHBOARD_OBSIDIAN_VAULT") or "/home/yuu/Sync/ObsidianVault")
+
+_DASHBOARD_OBSIDIAN_OPERATING_NOTES: dict[str, dict[str, str]] = {
+    "career_progress": {
+        "area": "career_development",
+        "label": "Career Development",
+        "relative_path": "Career Development/Career Development.md",
+    },
+    "artist_management": {
+        "area": "artist_management",
+        "label": "Artist Management",
+        "relative_path": "Business Ventures/Artist Management/Artist Management.md",
+    },
+}
+
+_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "vision": ("vision", "summary", "overview"),
+    "phase": ("current phase", "phase"),
+    "objectives": ("objectives", "goals"),
+    "roadmap": ("roadmap",),
+    "priorities": ("current priorities", "priorities", "top priorities"),
+    "completed": ("completed", "done"),
+    "blockers": ("blockers", "blocked"),
+    "risks": ("risks",),
+    "next_actions": ("next actions", "next steps", "actions"),
+    "kpis": ("kpis", "metrics", "success metrics"),
+}
+
+
+def _dashboard_obsidian_vault() -> Path:
+    return Path(os.environ.get("HERMES_DASHBOARD_OBSIDIAN_VAULT") or _DEFAULT_OBSIDIAN_VAULT).expanduser()
+
+
+def _strip_obsidian_links(text: str) -> str:
+    text = text.strip()
+    # Keep display text from [[target|label]], otherwise the target.
+    return re.sub(r"\[\[([^\]|]+\|)?([^\]]+)\]\]", r"\2", text)
+
+
+def _split_frontmatter(markdown: str) -> tuple[dict[str, Any], str]:
+    if not markdown.startswith("---\n"):
+        return {}, markdown
+    end = markdown.find("\n---", 4)
+    if end == -1:
+        return {}, markdown
+    raw = markdown[4:end]
+    body = markdown[end + len("\n---"):].lstrip("\r\n")
+    try:
+        parsed = yaml.safe_load(raw) or {}
+        return parsed if isinstance(parsed, dict) else {}, body
+    except Exception:
+        return {}, body
+
+
+def _parse_markdown_sections(markdown: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current: Optional[str] = None
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        # Artist Management currently appends a long supply/reference section
+        # after an hr marker. Stop there so operating KPIs remain mission data.
+        if line == "---" and current is not None:
+            break
+        heading = re.match(r"^#{1,3}\s+(.+?)\s*$", line)
+        if heading:
+            title = heading.group(1).strip()
+            if title.startswith("🎨 SECTION") or "SECTION " in title.upper():
+                break
+            current = title.casefold()
+            sections.setdefault(current, [])
+            continue
+        if current is None or not line:
+            continue
+        bullet = re.match(r"^[-*]\s+(.+)$", line)
+        value = bullet.group(1) if bullet else line
+        if value and not set(value) <= {"-", "—"}:
+            sections[current].append(_strip_obsidian_links(value))
+    return sections
+
+
+def _section_lines(sections: dict[str, list[str]], key: str) -> list[str]:
+    for alias in _SECTION_ALIASES[key]:
+        lines = sections.get(alias.casefold())
+        if lines:
+            return lines
+    return []
+
+
+def _dashboard_empty_operating_note() -> dict[str, Any]:
+    return {"status": "unconfigured", "items": [], "summary": None}
+
+
+def _dashboard_operating_note_metrics(note: dict[str, Any]) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    if note.get("phase"):
+        metrics.append({"label": "Current phase", "value": note["phase"]})
+    for label, key in (("Priorities", "priorities"), ("Blockers", "blockers"), ("Risks", "risks"), ("Next actions", "next_actions"), ("KPIs", "kpis")):
+        values = note.get(key) or []
+        metrics.append({"label": label, "value": len(values), "detail": "; ".join(values[:2]) if values else None})
+    return metrics
+
+
+def _read_dashboard_operating_note(field: str, mapping: dict[str, str]) -> tuple[dict[str, Any], Optional[dict[str, str]]]:
+    vault = _dashboard_obsidian_vault()
+    path = vault / mapping["relative_path"]
+    if not path.exists():
+        return _dashboard_empty_operating_note(), None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {**_dashboard_empty_operating_note(), "status": "failed", "error": str(exc)}, {"source": field, "message": str(exc)}
+
+    frontmatter, body = _split_frontmatter(raw)
+    sections = _parse_markdown_sections(body)
+    note = {
+        "status": "available",
+        "area": frontmatter.get("dashboard_area") or mapping["area"],
+        "title": mapping["label"],
+        "summary": (_section_lines(sections, "vision") or [None])[0],
+        "phase": (_section_lines(sections, "phase") or [None])[0],
+        "objectives": _section_lines(sections, "objectives"),
+        "roadmap": _section_lines(sections, "roadmap"),
+        "priorities": _section_lines(sections, "priorities"),
+        "completed": _section_lines(sections, "completed"),
+        "blockers": _section_lines(sections, "blockers"),
+        "risks": _section_lines(sections, "risks"),
+        "next_actions": _section_lines(sections, "next_actions"),
+        "kpis": _section_lines(sections, "kpis"),
+        "source": {
+            "type": frontmatter.get("source_type") or "obsidian_operating_note",
+            "path": str(path),
+            "relative_path": str(path.relative_to(vault)) if path.is_relative_to(vault) else str(path),
+            "frontmatter": frontmatter,
+        },
+    }
+    note["items"] = _dashboard_operating_note_metrics(note)
+    note["milestones"] = note["items"]
+    return note, None
+
+
+def _dashboard_collect_obsidian_operating_notes() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    notes: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, str]] = []
+    for field, mapping in _DASHBOARD_OBSIDIAN_OPERATING_NOTES.items():
+        note, error = _read_dashboard_operating_note(field, mapping)
+        notes[field] = note
+        if error:
+            errors.append(error)
+    return notes, errors
+
+
 def _dashboard_empty_contract(
     *,
     days: int,
@@ -6948,6 +7117,7 @@ def _dashboard_empty_contract(
         },
         "portfolio_ventures": [],
         "career_progress": {"status": "unconfigured", "items": [], "summary": None},
+        "artist_management": {"status": "unconfigured", "items": [], "summary": None},
         "engineering_metrics": {
             "completed_tasks": 0,
             "review_required": 0,
@@ -7164,6 +7334,9 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
     limit = max(1, min(int(limit or 20), 100))
     errors: list[dict[str, str]] = []
     response = _dashboard_empty_contract(days=days, board=board, profile=profile, project=project, q=q)
+    operating_notes, operating_note_errors = _dashboard_collect_obsidian_operating_notes()
+    response.update(operating_notes)
+    errors.extend(operating_note_errors)
     cutoff = int(time.time() - days * 86400)
 
     tasks, status_counts, kanban_errors = _dashboard_collect_kanban(

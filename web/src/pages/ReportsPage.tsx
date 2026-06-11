@@ -22,6 +22,7 @@ import {
 import { api } from "@/lib/api";
 import type {
   DashboardV2Metric,
+  DashboardOperatingNote,
   DashboardV2Response,
   DashboardV2WatchdogStatus,
   DeploymentStatusSummary,
@@ -41,6 +42,18 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 
 type DataSource = "dashboard-v2" | "reports-fallback";
+
+interface OperatingNoteViewModel {
+  status?: string | null;
+  summary?: string | null;
+  phase?: string | null;
+  priorities: string[];
+  blockers: string[];
+  risks: string[];
+  nextActions: string[];
+  kpis: string[];
+  milestones: DashboardV2Metric[];
+}
 
 interface DashboardViewModel {
   source: DataSource;
@@ -63,11 +76,8 @@ interface DashboardViewModel {
     metrics: DashboardV2Metric[];
     projects: ReportsProjectSummary[];
   };
-  careerProgress: {
-    status?: string | null;
-    summary?: string | null;
-    milestones: DashboardV2Metric[];
-  };
+  careerProgress: OperatingNoteViewModel;
+  artistManagement: OperatingNoteViewModel;
   engineeringMetrics: {
     metrics: DashboardV2Metric[];
     recentCompleted: ReportsTaskSummary[];
@@ -175,6 +185,20 @@ function asArray<T>(value?: T[] | null): T[] {
 
 function metric(label: string, value: string | number | null | undefined, detail?: string | null): DashboardV2Metric {
   return { label, value: value ?? 0, detail };
+}
+
+function operatingNoteFromApi(note?: DashboardOperatingNote | null): OperatingNoteViewModel {
+  return {
+    status: note?.status,
+    summary: note?.summary,
+    phase: note?.phase,
+    priorities: asArray(note?.priorities),
+    blockers: asArray(note?.blockers),
+    risks: asArray(note?.risks),
+    nextActions: asArray(note?.next_actions),
+    kpis: asArray(note?.kpis),
+    milestones: asArray(note?.milestones).length ? asArray(note?.milestones) : asArray(note?.items),
+  };
 }
 
 function createEmptyReports(project: string, q: string): ReportsResponse {
@@ -310,6 +334,23 @@ function buildFallbackDashboard(reports: ReportsResponse): DashboardViewModel {
     careerProgress: {
       status: "not configured",
       summary: "Career progress requires an opted-in career board or report source.",
+      phase: null,
+      priorities: [],
+      blockers: [],
+      risks: [],
+      nextActions: [],
+      kpis: [],
+      milestones: [],
+    },
+    artistManagement: {
+      status: "not configured",
+      summary: "Artist management requires an opted-in operating note or report source.",
+      phase: null,
+      priorities: [],
+      blockers: [],
+      risks: [],
+      nextActions: [],
+      kpis: [],
       milestones: [],
     },
     engineeringMetrics: {
@@ -415,13 +456,8 @@ function buildDashboardV2(data: DashboardV2Response, project: string, q: string)
       ],
       projects: reports.active_projects,
     },
-    careerProgress: {
-      status: data.career_progress?.status,
-      summary: data.career_progress?.summary,
-      milestones: asArray(data.career_progress?.milestones).length
-        ? asArray(data.career_progress?.milestones)
-        : asArray(data.career_progress?.items),
-    },
+    careerProgress: operatingNoteFromApi(data.career_progress),
+    artistManagement: operatingNoteFromApi(data.artist_management),
     engineeringMetrics: {
       metrics: asArray(engineering.metrics).length
         ? asArray(engineering.metrics)
@@ -524,6 +560,54 @@ function TextList({ items, emptyLabel, emptyDetail }: { items: string[]; emptyLa
         <li key={`${item}-${index}`} className="rounded border border-border/60 bg-card/60 px-3 py-2">{item}</li>
       ))}
     </ul>
+  );
+}
+
+function OperatingNoteCard({ note, emptyDetail }: { note: OperatingNoteViewModel; emptyDetail: string }) {
+  const hasContent = Boolean(
+    note.summary
+      || note.phase
+      || note.priorities.length
+      || note.blockers.length
+      || note.risks.length
+      || note.nextActions.length
+      || note.kpis.length,
+  );
+  if (!hasContent) return <EmptyState label="No operating-note source" detail={emptyDetail} />;
+
+  const groups = [
+    { title: "Priorities", items: note.priorities },
+    { title: "Blockers", items: note.blockers },
+    { title: "Risks", items: note.risks },
+    { title: "Next actions", items: note.nextActions },
+    { title: "KPIs", items: note.kpis },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg border border-border/60 bg-card/70 p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium text-foreground">{note.phase || note.status || "Operating note"}</span>
+          <Badge className={statusTone(note.status || "available")}>{note.status || "available"}</Badge>
+        </div>
+        {note.summary && <p className="mt-2 text-sm text-muted-foreground">{note.summary}</p>}
+      </div>
+      <MetricGrid metrics={note.milestones} emptyLabel="No operating metrics" emptyDetail="Phase, priorities, blockers, risks, next actions, and KPIs will appear when present in the note." />
+      <div className="grid gap-3 md:grid-cols-2">
+        {groups.map((group) => (
+          <div key={group.title} className="rounded-lg border border-border/60 bg-card/70 p-3">
+            <h3 className="text-sm font-medium text-foreground">{group.title}</h3>
+            {group.items.length ? (
+              <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
+                {group.items.slice(0, 5).map((item, index) => <li key={`${group.title}-${index}`}>• {item}</li>)}
+              </ul>
+            ) : (
+              <p className="mt-2 text-xs text-text-tertiary">No {group.title.toLowerCase()} recorded.</p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1134,16 +1218,7 @@ export default function ReportsPage() {
 
           <section className="grid gap-6 xl:grid-cols-2">
             <DashboardSection id={EXECUTIVE_AREA_TARGETS.careerDevelopment} title="Career Development" icon={<GraduationCap className="h-5 w-5 text-muted-foreground" />}>
-              <div className="mb-4 rounded-lg border border-border/60 bg-card/70 p-4">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-foreground">{dashboard.careerProgress.status || "Not configured"}</span>
-                  <Badge className={statusTone(dashboard.careerProgress.status || "not configured")}>{dashboard.careerProgress.status || "placeholder"}</Badge>
-                </div>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  {dashboard.careerProgress.summary || "No opted-in career progress source is configured."}
-                </p>
-              </div>
-              <MetricGrid metrics={dashboard.careerProgress.milestones} emptyLabel="No career milestones" emptyDetail="Connect a career board/report source to populate progress milestones." />
+              <OperatingNoteCard note={dashboard.careerProgress} emptyDetail="Connect the Career Development Obsidian operating note to populate phase, priorities, blockers, risks, next actions, and KPIs." />
             </DashboardSection>
 
             <DashboardSection id={EXECUTIVE_AREA_TARGETS.engineeringBrand} title="Engineering Brand" icon={<LineChart className="h-5 w-5 text-muted-foreground" />}>
@@ -1210,7 +1285,7 @@ export default function ReportsPage() {
             </DashboardSection>
 
             <DashboardSection id={EXECUTIVE_AREA_TARGETS.artistManagement} title="Artist Management" icon={<DollarSign className="h-5 w-5 text-muted-foreground" />}>
-              <EmptyState label="No artist management source" detail="Artist roster, campaign, release, and blocker data is not configured yet; connect a report source to populate this mission area." />
+              <OperatingNoteCard note={dashboard.artistManagement} emptyDetail="Connect the Artist Management Obsidian operating note to populate phase, priorities, blockers, risks, next actions, and KPIs." />
             </DashboardSection>
           </section>
 

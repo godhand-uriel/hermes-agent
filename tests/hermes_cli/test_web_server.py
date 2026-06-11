@@ -1414,6 +1414,7 @@ class TestWebServerEndpoints:
 
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
         kanban_db.init_db(board="default")
         conn = kanban_db.connect(board="default")
         try:
@@ -1548,6 +1549,7 @@ class TestWebServerEndpoints:
         assert data["financial_metrics"]["ai_usage_cost_usd"]["estimated"] == 0.42
         assert data["weekly_reports"]["latest"][0]["title"] == "Weekly Report"
         assert data["career_progress"] == {"status": "unconfigured", "items": [], "summary": None}
+        assert data["artist_management"] == {"status": "unconfigured", "items": [], "summary": None}
         assert data["portfolio_ventures"][0]["project"] == "hermes-dashboard"
 
         empty_resp = self.client.get("/api/dashboard/v2?days=7&project=no-such-project")
@@ -1566,6 +1568,64 @@ class TestWebServerEndpoints:
             "review_required_tasks": [],
             "completed_tasks": [],
         }
+
+    def test_dashboard_v2_reads_obsidian_operating_notes(self, tmp_path, monkeypatch):
+        vault = tmp_path / "vault"
+        career_note = vault / "Career Development" / "Career Development.md"
+        artist_note = vault / "Business Ventures" / "Artist Management" / "Artist Management.md"
+        career_note.parent.mkdir(parents=True)
+        artist_note.parent.mkdir(parents=True)
+        career_note.write_text(
+            "---\n"
+            "dashboard_source: true\n"
+            "dashboard_area: career_development\n"
+            "source_type: obsidian_operating_note\n"
+            "---\n\n"
+            "# Vision\n\nBuild durable career leverage.\n\n"
+            "# Current Phase\n\nCapability-building phase focused on cloud depth.\n\n"
+            "# Current Priorities\n\n- Finish CS coursework.\n- Ship portfolio proof.\n\n"
+            "# Blockers\n\n- Time constraints.\n\n"
+            "# Risks\n\n- Studying without shipping.\n\n"
+            "# Next Actions\n\n- Pick next portfolio project.\n\n"
+            "# KPIs\n\n- Courses completed.\n- Projects shipped.\n",
+            encoding="utf-8",
+        )
+        artist_note.write_text(
+            "# Vision\n\nBuild a premium contemporary artist brand.\n\n"
+            "# Current Phase\n\nFoundation and positioning phase.\n\n"
+            "# Current Priorities\n\n- Define next collection.\n\n"
+            "# Blockers\n\n- Collector pipeline needs review.\n\n"
+            "# Risks\n\n- Weak positioning may dilute perception.\n\n"
+            "# Next Actions\n\n- Review collector targets.\n\n"
+            "# KPIs\n\n- Collector relationships developed.\n\n"
+            "---\n\n# 🎨 SECTION 1 — PAINTS\n\nSupply reference should not become operating KPIs.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(vault))
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["career_progress"]["status"] == "available"
+        assert data["career_progress"]["source"]["path"].endswith("Career Development/Career Development.md")
+        assert data["career_progress"]["phase"] == "Capability-building phase focused on cloud depth."
+        assert data["career_progress"]["summary"] == "Build durable career leverage."
+        assert data["career_progress"]["priorities"] == ["Finish CS coursework.", "Ship portfolio proof."]
+        assert data["career_progress"]["blockers"] == ["Time constraints."]
+        assert data["career_progress"]["risks"] == ["Studying without shipping."]
+        assert data["career_progress"]["next_actions"] == ["Pick next portfolio project."]
+        assert data["career_progress"]["kpis"] == ["Courses completed.", "Projects shipped."]
+        assert data["career_progress"]["items"][0] == {"label": "Current phase", "value": "Capability-building phase focused on cloud depth."}
+
+        assert data["artist_management"]["status"] == "available"
+        assert data["artist_management"]["phase"] == "Foundation and positioning phase."
+        assert data["artist_management"]["priorities"] == ["Define next collection."]
+        assert data["artist_management"]["blockers"] == ["Collector pipeline needs review."]
+        assert data["artist_management"]["risks"] == ["Weak positioning may dilute perception."]
+        assert data["artist_management"]["next_actions"] == ["Review collector targets."]
+        assert data["artist_management"]["kpis"] == ["Collector relationships developed."]
+        assert "Supply reference" not in "\n".join(data["artist_management"]["kpis"])
 
     def test_dashboard_v2_summary_returns_safe_empty_sections_when_sources_fail(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -1837,6 +1897,37 @@ class TestWebServerEndpoints:
         assert data["generated_reports"]["latest"]["morning_brief"]["status"] == "available"
         assert data["generated_reports"]["latest"]["morning_brief"]["report"]["title"] == "Daily Morning Brief"
         assert data["generated_reports"]["history"]["morning_brief"][0]["type"] == "morning_brief"
+
+    def test_dashboard_weekly_report_library_excludes_generated_json_files(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "reports"
+        generated_dir = reports_dir / "generated"
+        generated_dir.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+        (reports_dir / "completion-report.md").write_text(
+            "# Completion Report\n\nProject: command-center\n\nHuman-readable weekly report.",
+            encoding="utf-8",
+        )
+        (generated_dir / "2026-06-02-weekly-executive-report.json").write_text(
+            json.dumps(
+                {
+                    "type": "weekly_executive_review",
+                    "title": "Weekly Executive Review",
+                    "content": "Generated executive summary.",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        weekly = data["weekly_reports"]["latest"]
+        assert [item["title"] for item in weekly] == ["Completion Report"]
+        assert not any(item["excerpt"].lstrip().startswith("{") for item in weekly)
+        assert data["generated_reports"]["latest"]["weekly_executive_review"]["status"] == "available"
+        assert data["generated_reports"]["latest"]["weekly_executive_review"]["report"]["title"] == "Weekly Executive Review"
 
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")

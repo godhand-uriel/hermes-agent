@@ -11934,6 +11934,30 @@ def _coerce_report_lines(value: Any) -> list[str]:
     return [str(value).strip()] if str(value).strip() else []
 
 
+def _telegram_clean_report_lines(value: Any) -> list[str]:
+    """Return short, mobile-readable report lines without raw JSON/internal ids."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = " ".join(value.split())
+        return [stripped] if stripped else []
+    if isinstance(value, dict):
+        title = value.get("title") or value.get("name") or value.get("mission") or value.get("task")
+        detail = value.get("recommendation") or value.get("summary") or value.get("detail") or value.get("description")
+        status = value.get("status") or value.get("state")
+        parts = [str(item).strip() for item in (title, status, detail) if item]
+        if parts:
+            return [" — ".join(parts)]
+        return []
+    if isinstance(value, (list, tuple, set)):
+        lines: list[str] = []
+        for item in value:
+            lines.extend(_telegram_clean_report_lines(item))
+        return lines
+    stripped = " ".join(str(value).split())
+    return [stripped] if stripped else []
+
+
 _GENERATED_REPORT_READABLE_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("summary", "Executive summary", ("summary", "executive_summary", "overview", "brief", "abstract")),
     ("key_wins", "Key wins", ("key_wins", "wins", "highlights", "accomplishments", "successes")),
@@ -12113,6 +12137,41 @@ def _build_readable_generated_report_content(payload: dict[str, Any], title: str
     return "\n".join(lines).strip()
 
 
+def _build_telegram_generated_report_content(payload: dict[str, Any], title: str, fallback_content: str = "") -> str:
+    """Create a concise Telegram/mobile report body from structured report JSON."""
+    summary = _telegram_clean_report_lines(_first_payload_value(payload, ("summary", "executive_summary", "overview", "brief", "abstract")))
+    wins = _telegram_clean_report_lines(_first_payload_value(payload, ("key_wins", "wins", "highlights", "accomplishments", "successes")))[:3]
+    recommendations = _telegram_clean_report_lines(_first_payload_value(payload, ("recommendations", "recommendation", "suggestions", "guidance")))[:3]
+    risks = _telegram_clean_report_lines(_first_payload_value(payload, ("risks", "blockers", "risks_blockers", "risk_blockers", "issues", "concerns")))[:3]
+    next_actions = _telegram_clean_report_lines(_first_payload_value(payload, ("next_actions", "actions", "action_items", "todos", "next_steps")))[:3]
+    related = _telegram_clean_report_lines(_first_payload_value(payload, ("related_missions", "missions", "related_tasks", "tasks", "linked_items")))[:3]
+
+    lines = [title]
+    date_value = _first_payload_value(payload, ("date_range", "range", "period", "reporting_period", "date"))
+    if date_value:
+        lines.append(str(date_value))
+    if summary:
+        lines.extend(["", f"Focus: {summary[0]}"])
+    elif fallback_content:
+        compact = _safe_report_excerpt(fallback_content, limit=220)
+        if compact:
+            lines.extend(["", f"Focus: {compact}"])
+
+    def add_section(label: str, items: list[str]) -> None:
+        if not items:
+            return
+        lines.extend(["", f"{label}:"])
+        lines.extend(f"- {item}" for item in items)
+
+    add_section("Wins", wins)
+    add_section("Do next", next_actions or recommendations)
+    if next_actions and recommendations:
+        add_section("Recommendations", recommendations)
+    add_section("Watch", risks)
+    add_section("Related", related)
+    return "\n".join(lines).strip()
+
+
 def _extract_generated_report_file(path: Path, root: Path) -> Optional[dict[str, Any]]:
     import re
 
@@ -12127,6 +12186,7 @@ def _extract_generated_report_file(path: Path, root: Path) -> Optional[dict[str,
             payload = None
     title = path.stem.replace("-", " ").replace("_", " ").title()
     content = text
+    telegram_content = ""
     raw_status: str | None = None
     error: str | None = None
     generated_at: int | None = None
@@ -12140,6 +12200,8 @@ def _extract_generated_report_file(path: Path, root: Path) -> Optional[dict[str,
             content = str(content_value)
         else:
             content = _build_readable_generated_report_content(payload, title)
+        telegram_value = payload.get("telegram_content") or payload.get("telegram") or payload.get("mobile_summary")
+        telegram_content = str(telegram_value).strip() if telegram_value else _build_telegram_generated_report_content(payload, title, content)
         raw_status = str(payload.get("status") or "") or None
         error_value = payload.get("error") or payload.get("error_message")
         error = str(error_value) if error_value else None
@@ -12186,6 +12248,7 @@ def _extract_generated_report_file(path: Path, root: Path) -> Optional[dict[str,
         "generated_at": generated_at,
         "content_type": "application/json" if path.suffix.lower() == ".json" else "text/markdown",
         "content": content,
+        "telegram_content": telegram_content or _safe_report_excerpt(content, limit=1200),
         "excerpt": _safe_report_excerpt(content),
         "metadata": metadata,
     }
@@ -12474,6 +12537,12 @@ def _dashboard_empty_contract(
             "alerts": [],
         },
         "portfolio_ventures": [],
+        "portfolio_health": {
+            "active_projects": 0,
+            "total_projects": 0,
+            "projects": [],
+            "source": {"type": "unconfigured", "report_type": None},
+        },
         "career_progress": {"status": "unconfigured", "items": [], "summary": None},
         "artist_management": {"status": "unconfigured", "items": [], "summary": None},
         "engineering_metrics": {
@@ -12514,6 +12583,61 @@ def _dashboard_task_item(row: dict[str, Any]) -> dict[str, Any]:
         "summary": _dashboard_task_summary(row),
         "metadata": row.get("latest_metadata"),
     }
+
+
+def _dashboard_default_board(requested_board: str = "") -> str:
+    """Resolve the executive dashboard board, preferring Command Center when available."""
+    requested = (requested_board or "").strip()
+    if requested:
+        return requested
+    try:
+        from hermes_cli import kanban_db
+
+        if kanban_db.board_exists("command-center-board"):
+            return "command-center-board"
+        env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if env_board and kanban_db.board_exists(env_board):
+            return env_board
+        current = kanban_db.get_current_board()
+        return "" if current == getattr(kanban_db, "DEFAULT_BOARD", "default") else current
+    except Exception:
+        return ""
+
+
+_REGISTERED_DASHBOARD_VENTURES: tuple[str, ...] = (
+    "BureauOS",
+    "Parlay Analyzer",
+    "Trust Base Social Platform",
+    "Frontend Streaming Platform",
+)
+
+
+def _dashboard_registered_ventures(limit: int) -> list[dict[str, Any]]:
+    """Return the explicit Venture Portfolio registry.
+
+    Venture Portfolio membership is a product decision, not an inference from
+    board/profile/task/report metadata. Keep this list narrow until a durable
+    venture registry store exists.
+    """
+    now = int(time.time())
+    ventures: list[dict[str, Any]] = []
+    for index, name in enumerate(_REGISTERED_DASHBOARD_VENTURES[:limit], start=1):
+        ventures.append(
+            {
+                "project": name,
+                "rank": index,
+                "status": "registered",
+                "recommendation": None,
+                "summary": None,
+                "active_tasks": 0,
+                "blocked_tasks": 0,
+                "review_required": 0,
+                "completed_tasks": 0,
+                "latest_activity_at": now,
+                "source": "registered_venture",
+            }
+        )
+    return ventures
 
 
 def _dashboard_is_review_required(row: dict[str, Any]) -> bool:
@@ -12691,14 +12815,15 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
     days = max(1, min(int(days or 7), 365))
     limit = max(1, min(int(limit or 20), 100))
     errors: list[dict[str, str]] = []
-    response = _dashboard_empty_contract(days=days, board=board, profile=profile, project=project, q=q)
+    effective_board = _dashboard_default_board(board)
+    response = _dashboard_empty_contract(days=days, board=effective_board, profile=profile, project=project, q=q)
     operating_notes, operating_note_errors = _dashboard_collect_obsidian_operating_notes()
     response.update(operating_notes)
     errors.extend(operating_note_errors)
     cutoff = int(time.time() - days * 86400)
 
     tasks, status_counts, kanban_errors = _dashboard_collect_kanban(
-        board=board,
+        board=effective_board,
         profile=profile,
         project=project,
         q=q,
@@ -12753,43 +12878,26 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
             "error": str(exc),
         }
 
-    portfolios: dict[str, dict[str, Any]] = {}
+    generated_reports = _generated_reports_contract(limit_per_type=limit)
+
     tests_reported = 0
     for item in tasks:
-        project_key = item.get("project") or "default"
-        entry = portfolios.setdefault(
-            project_key,
-            {
-                "project": project_key,
-                "active_tasks": 0,
-                "blocked_tasks": 0,
-                "review_required": 0,
-                "completed_tasks": 0,
-                "latest_activity_at": 0,
-                "summary": None,
-            },
-        )
-        status = item.get("status")
-        if status in active_statuses:
-            entry["active_tasks"] += 1
-        if status == "blocked":
-            entry["blocked_tasks"] += 1
-        if _dashboard_is_review_required(item):
-            entry["review_required"] += 1
-        if status == "done":
-            entry["completed_tasks"] += 1
-        entry["latest_activity_at"] = max(
-            int(entry["latest_activity_at"] or 0),
-            int(item.get("completed_at") or item.get("started_at") or item.get("created_at") or 0),
-        )
-        if item.get("summary") and not entry["summary"]:
-            entry["summary"] = item.get("summary")
         try:
             metadata = json.loads(item.get("latest_metadata") or "{}")
             tests_reported += int(metadata.get("tests_run") or 0)
         except Exception:
             pass
-    response["portfolio_ventures"] = sorted(portfolios.values(), key=lambda item: item["latest_activity_at"], reverse=True)[:limit]
+    portfolio_ventures = _dashboard_registered_ventures(limit)
+    response["portfolio_ventures"] = portfolio_ventures
+    response["portfolio_health"] = {
+        "active_projects": len(portfolio_ventures),
+        "total_projects": len(portfolio_ventures),
+        "projects": portfolio_ventures,
+        "source": {
+            "type": "registered_ventures",
+            "report_type": None,
+        },
+    }
     response["engineering_metrics"] = {
         "completed_tasks": len(completed_tasks),
         "review_required": len(review_required),
@@ -12828,7 +12936,7 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
         errors.append({"source": "reports", "message": str(exc)})
         report_files = []
     response["weekly_reports"] = {"latest": report_files[:limit], "count": len(report_files)}
-    response["generated_reports"] = _generated_reports_contract(limit_per_type=limit)
+    response["generated_reports"] = generated_reports
     response["errors"] = errors
     return response
 

@@ -240,6 +240,10 @@ function reportsFromDashboard(data: DashboardV2Response, project: string, q: str
     blocked_tasks: item.blocked_tasks ?? 0,
     review_required: item.review_required ?? 0,
     latest_activity_at: item.latest_activity_at ?? data.generated_at ?? 0,
+    rank: item.rank ?? null,
+    status: item.status ?? null,
+    recommendation: item.recommendation ?? null,
+    summary: item.summary ?? null,
   }));
   const latestReports = asArray(weekly.latest_reports).length ? asArray(weekly.latest_reports) : asArray(weekly.latest);
   const completionReports = asArray(weekly.completion_reports).length
@@ -325,9 +329,9 @@ function buildFallbackDashboard(reports: ReportsResponse): DashboardViewModel {
     },
     portfolioHealth: {
       metrics: [
-        metric("Active projects", reports.summary.active_projects),
-        metric("Open project tasks", reports.active_projects.reduce((sum, project) => sum + project.active_tasks, 0)),
-        metric("Projects blocked", reports.active_projects.filter((project) => project.blocked_tasks > 0).length),
+        metric("Registered ventures", reports.summary.active_projects),
+        metric("Open venture tasks", reports.active_projects.reduce((sum, project) => sum + project.active_tasks, 0)),
+        metric("Ventures blocked", reports.active_projects.filter((project) => project.blocked_tasks > 0).length),
       ],
       projects: reports.active_projects,
     },
@@ -450,9 +454,9 @@ function buildDashboardV2(data: DashboardV2Response, project: string, q: string)
     },
     portfolioHealth: {
       metrics: [
-        metric("Active projects", portfolio.active_projects ?? reports.summary.active_projects),
-        metric("Total projects", portfolio.total_projects ?? reports.summary.active_projects),
-        metric("Blocked projects", reports.active_projects.filter((item) => item.blocked_tasks > 0).length),
+        metric("Registered ventures", portfolio.total_projects ?? reports.summary.active_projects),
+        metric("Open venture tasks", reports.active_projects.reduce((sum, item) => sum + item.active_tasks, 0)),
+        metric("Ventures blocked", reports.active_projects.filter((item) => item.blocked_tasks > 0).length),
       ],
       projects: reports.active_projects,
     },
@@ -913,7 +917,7 @@ function GeneratedReportStatusList({ reports }: { reports: GeneratedReportLatest
 
 function ProjectList({ projects }: { projects: ReportsProjectSummary[] }) {
   if (projects.length === 0) {
-    return <EmptyState label="No active projects" detail="Active triage, todo, ready, running, blocked, and review tasks will appear here." />;
+    return <EmptyState label="No registered ventures" detail="Portfolio registry entries will appear here after ventures are explicitly registered." />;
   }
   return (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -922,8 +926,18 @@ function ProjectList({ projects }: { projects: ReportsProjectSummary[] }) {
           <CardContent className="p-4">
             <div className="flex items-center justify-between gap-3">
               <Link to={boardHref(project.project)} className="truncate text-sm font-medium text-foreground hover:underline">{project.project}</Link>
-              <Badge>{project.active_tasks} active</Badge>
+              <div className="flex shrink-0 items-center gap-2">
+                {project.rank != null && <Badge>#{project.rank}</Badge>}
+                <Badge>{project.active_tasks} active</Badge>
+              </div>
             </div>
+            {(project.summary || project.recommendation || project.status) && (
+              <div className="mt-3 rounded border border-border/60 bg-background/50 p-3 text-xs text-muted-foreground">
+                {project.status && <Badge className={statusTone(project.status)}>{project.status}</Badge>}
+                {project.summary && <p className="mt-2">{project.summary}</p>}
+                {project.recommendation && <p className="mt-2 font-medium text-foreground">Next: {project.recommendation}</p>}
+              </div>
+            )}
             <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
               <div className="rounded border border-border/60 p-2">
                 <div className="text-base font-semibold text-foreground">{project.blocked_tasks}</div>
@@ -1068,6 +1082,16 @@ export default function ReportsPage() {
     dashboard.agentMetrics.metrics.length === 0 &&
     dashboard.financialMetrics.metrics.length === 0;
 
+  const shouldShowDeploymentStatus = Boolean(dashboard && dashboard.engineeringMetrics.deploymentStatus.length > 0);
+  const shouldShowGithubActivity = Boolean(dashboard && dashboard.engineeringMetrics.githubActivity.length > 0);
+  const shouldShowReportLibrary = Boolean(
+    dashboard && (
+      dashboard.weeklyReports.completionReports.length > 0
+      || dashboard.weeklyReports.qaFindings.length > 0
+      || dashboard.weeklyReports.latestReports.length > 0
+    ),
+  );
+
   return (
     <div className="flex flex-col gap-6">
       <PluginSlot name="reports:top" />
@@ -1209,7 +1233,8 @@ export default function ReportsPage() {
             </DashboardSection>
 
             <DashboardSection id={EXECUTIVE_AREA_TARGETS.venturePortfolio} title="Venture Portfolio" icon={<BriefcaseBusiness className="h-5 w-5 text-muted-foreground" />}>
-              <MetricGrid metrics={dashboard.portfolioHealth.metrics} emptyLabel="No portfolio metrics" emptyDetail="Portfolio metadata is optional and may not be configured yet." />
+              <p className="mb-4 text-sm text-muted-foreground">Portfolio registry: only explicitly registered ventures are shown here.</p>
+              <MetricGrid metrics={dashboard.portfolioHealth.metrics} emptyLabel="No portfolio metrics" emptyDetail="Registered venture metadata is optional and may not be configured yet." />
               <div className="mt-4">
                 <ProjectList projects={dashboard.portfolioHealth.projects} />
               </div>
@@ -1299,36 +1324,50 @@ export default function ReportsPage() {
             </DashboardSection>
           </section>
 
-          <section className="grid gap-6 xl:grid-cols-2">
-            <DashboardSection title="Deployment status" icon={<Server className="h-5 w-5 text-muted-foreground" />}>
-              <DeploymentList items={dashboard.engineeringMetrics.deploymentStatus} />
-            </DashboardSection>
+          {(shouldShowDeploymentStatus || shouldShowGithubActivity) && (
+            <section className="grid gap-6 xl:grid-cols-2">
+              {shouldShowDeploymentStatus && (
+                <DashboardSection title="Deployment status" icon={<Server className="h-5 w-5 text-muted-foreground" />}>
+                  <DeploymentList items={dashboard.engineeringMetrics.deploymentStatus} />
+                </DashboardSection>
+              )}
 
-            <DashboardSection title="GitHub activity" icon={<GitBranch className="h-5 w-5 text-muted-foreground" />}>
-              <ReportList reports={dashboard.engineeringMetrics.githubActivity} emptyLabel="No GitHub activity reports" />
-            </DashboardSection>
-          </section>
+              {shouldShowGithubActivity && (
+                <DashboardSection title="GitHub activity" icon={<GitBranch className="h-5 w-5 text-muted-foreground" />}>
+                  <ReportList reports={dashboard.engineeringMetrics.githubActivity} emptyLabel="No GitHub activity reports" />
+                </DashboardSection>
+              )}
+            </section>
+          )}
 
           <DashboardSection title="Reports" icon={<FileText className="h-5 w-5 text-muted-foreground" />}>
             <GeneratedReportStatusList reports={dashboard.generatedReports} />
           </DashboardSection>
 
-          <DashboardSection title="Report Library" icon={<CalendarDays className="h-5 w-5 text-muted-foreground" />}>
-            <section className="grid gap-6 xl:grid-cols-2">
-              <div>
-                <h3 className="mb-3 text-sm font-medium text-foreground">Completion reports</h3>
-                <ReportList reports={dashboard.weeklyReports.completionReports} emptyLabel="No completion report files" />
-              </div>
-              <div>
-                <h3 className="mb-3 text-sm font-medium text-foreground">QA findings</h3>
-                <ReportList reports={dashboard.weeklyReports.qaFindings} emptyLabel="No QA findings" />
-              </div>
-            </section>
-            <div className="mt-6">
-              <h3 className="mb-3 text-sm font-medium text-foreground">Latest report links</h3>
-              <ReportList reports={dashboard.weeklyReports.latestReports} emptyLabel="No latest reports" emptyDetail="Latest report links will appear when report files are discovered." />
-            </div>
-          </DashboardSection>
+          {shouldShowReportLibrary && (
+            <DashboardSection title="Report Library" icon={<CalendarDays className="h-5 w-5 text-muted-foreground" />}>
+              <section className="grid gap-6 xl:grid-cols-2">
+                {dashboard.weeklyReports.completionReports.length > 0 && (
+                  <div>
+                    <h3 className="mb-3 text-sm font-medium text-foreground">Completion reports</h3>
+                    <ReportList reports={dashboard.weeklyReports.completionReports} emptyLabel="No completion report files" />
+                  </div>
+                )}
+                {dashboard.weeklyReports.qaFindings.length > 0 && (
+                  <div>
+                    <h3 className="mb-3 text-sm font-medium text-foreground">QA findings</h3>
+                    <ReportList reports={dashboard.weeklyReports.qaFindings} emptyLabel="No QA findings" />
+                  </div>
+                )}
+              </section>
+              {dashboard.weeklyReports.latestReports.length > 0 && (
+                <div className="mt-6">
+                  <h3 className="mb-3 text-sm font-medium text-foreground">Latest report links</h3>
+                  <ReportList reports={dashboard.weeklyReports.latestReports} emptyLabel="No latest reports" emptyDetail="Latest report links will appear when report files are discovered." />
+                </div>
+              )}
+            </DashboardSection>
+          )}
 
           <p className="flex items-center gap-1 text-xs text-text-tertiary">
             <ExternalLink className="h-3.5 w-3.5" /> Generated {formatDate(dashboard.generatedAt)} from {dashboard.source === "dashboard-v2" ? "/api/dashboard/v2" : "the existing /api/reports compatibility path"}.

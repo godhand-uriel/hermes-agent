@@ -2279,6 +2279,10 @@ export interface ReportsProjectSummary {
   blocked_tasks: number;
   review_required: number;
   latest_activity_at: number;
+  rank?: number | null;
+  status?: string | null;
+  recommendation?: string | null;
+  summary?: string | null;
 }
 
 export interface ReportFileSummary {
@@ -2326,6 +2330,7 @@ export interface GeneratedReportItem {
   generated_at: number;
   content_type: string;
   content: string;
+  telegram_content?: string | null;
   excerpt: string;
   metadata?: Record<string, unknown> | null;
 }
@@ -2407,8 +2412,10 @@ export interface DashboardV2PortfolioItem {
   review_required?: number | null;
   completed_tasks?: number | null;
   latest_activity_at?: number | null;
+  rank?: number | null;
   status?: string | null;
   summary?: string | null;
+  recommendation?: string | null;
 }
 
 export interface DashboardV2ModelHealthItem {
@@ -2509,6 +2516,7 @@ export interface DashboardV2Response {
     active_projects?: number | null;
     total_projects?: number | null;
     projects?: DashboardV2PortfolioItem[] | null;
+    source?: { type?: string | null; report_type?: string | null } | null;
   } | null;
   career_progress?: DashboardOperatingNote | null;
   artist_management?: DashboardOperatingNote | null;

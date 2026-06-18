@@ -702,6 +702,179 @@ class TestWebServerEndpoints:
         assert resp.json()["gateway_state"] == "startup_failed"
         assert resp.json()["gateway_platforms"] == {}
 
+    def test_dashboard_v2_uses_command_center_board_by_default_when_available(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "personal_operating_system")
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+
+        kanban_db.create_board("personal_operating_system")
+        with kanban_db.connect_closing(board="personal_operating_system") as conn:
+            done_id = kanban_db.create_task(conn, title="Old completed personal item", created_by="test", initial_status="running")
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (1_780_000_000, done_id))
+            conn.commit()
+
+        kanban_db.create_board("command-center-board")
+        with kanban_db.connect_closing(board="command-center-board") as conn:
+            active_id = kanban_db.create_task(
+                conn,
+                title="Current executive priority",
+                created_by="test",
+                tenant="command-center",
+                priority=10,
+                initial_status="running",
+            )
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["filters"]["board"] == "command-center-board"
+        assert data["executive_briefing"]["top_priorities"][0]["id"] == active_id
+        assert data["board_health"]["active_tasks"] == 1
+        assert data["board_health"]["status_counts"] == {"ready": 1}
+
+    def test_dashboard_v2_ignores_stale_default_board_env_when_command_center_absent(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "deleted-board")
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+
+        kanban_db.create_board("personal_operating_system")
+        with kanban_db.connect_closing(board="personal_operating_system") as conn:
+            active_id = kanban_db.create_task(
+                conn,
+                title="Fallback executive priority",
+                created_by="test",
+                priority=8,
+                initial_status="running",
+            )
+
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "personal_operating_system")
+        kanban_db.set_current_board("personal_operating_system")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "deleted-board")
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["filters"]["board"] == "personal_operating_system"
+        assert data["executive_briefing"]["top_priorities"][0]["id"] == active_id
+
+    def test_dashboard_v2_portfolio_uses_only_registered_ventures(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        kanban_db.create_board("command-center-board")
+        with kanban_db.connect_closing(board="command-center-board") as conn:
+            kanban_db.create_task(
+                conn,
+                title="Engineering Brand launch",
+                created_by="test",
+                assignee="engineering_brand",
+                tenant="engineering_brand",
+                initial_status="running",
+            )
+            kanban_db.create_task(
+                conn,
+                title="Artist Management supply ops",
+                created_by="test",
+                assignee="artist_management",
+                tenant="artist_management",
+                initial_status="running",
+            )
+
+        (reports_dir / "latest-venture-portfolio-rank.json").write_text(
+            json.dumps(
+                {
+                    "type": "venture_portfolio_rank",
+                    "title": "Venture Portfolio Rank",
+                    "summary": "This report contains task/profile/report-derived noise that must not define the portfolio.",
+                    "ventures": [
+                        {"rank": 1, "name": "BureauOS", "status": "continue"},
+                        {"rank": 2, "name": "Artist Management", "status": "watch"},
+                        {"rank": 3, "name": "Engineering Brand", "status": "watch"},
+                        {"rank": 4, "name": "command-center-board", "status": "watch"},
+                        {"rank": 5, "name": "master-venture-portfolio", "status": "watch"},
+                        {"rank": 6, "name": "venture_portfolio", "status": "watch"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        ventures = data["portfolio_ventures"]
+        assert [item["project"] for item in ventures] == [
+            "BureauOS",
+            "Parlay Analyzer",
+            "Trust Base Social Platform",
+            "Frontend Streaming Platform",
+        ]
+        assert data["portfolio_health"]["projects"] == ventures
+        assert data["portfolio_health"]["source"]["type"] == "registered_ventures"
+        assert data["portfolio_health"]["total_projects"] == 4
+        forbidden_values = {
+            "Artist Management",
+            "Engineering Brand",
+            "artist_management",
+            "engineering_brand",
+            "command-center-board",
+            "master-venture-portfolio",
+            "venture_portfolio",
+            "default",
+        }
+        serialized = json.dumps(data["portfolio_health"], sort_keys=True)
+        for value in forbidden_values:
+            assert value not in serialized
+        for item in ventures:
+            assert "assignee" not in item
+            assert "board" not in item
+            assert "tenant" not in item
+
+    def test_generated_report_exposes_telegram_readable_summary(self, tmp_path, monkeypatch):
+        reports_dir = tmp_path / "generated-reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        (reports_dir / "2026-06-02-morning-brief.json").write_text(
+            json.dumps(
+                {
+                    "type": "morning_brief",
+                    "title": "Daily Morning Brief",
+                    "summary": "Protect dashboard trust by focusing on source-backed widgets.",
+                    "recommendations": ["Fix default board selection", "Hide empty placeholder widgets"],
+                    "risks": ["GitHub and deployment widgets are not wired to live sources"],
+                    "next_actions": ["Ship tested dashboard remediation"],
+                    "related_tasks": [
+                        {"id": "t_internal123", "title": "Fix dashboard trust", "status": "running", "assignee": "engineering_lab"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/reports/generated/latest/morning_brief")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        telegram = data["report"]["telegram_content"]
+        assert telegram.startswith("Daily Morning Brief\n")
+        assert "Focus: Protect dashboard trust" in telegram
+        assert "Do next:" in telegram
+        assert "Watch:" in telegram
+        assert "t_internal123" not in telegram
+        assert "```" not in telegram
+        assert "{" not in telegram
+
     def test_dashboard_v2_summary_contract_combines_kanban_reports_and_usage(self, tmp_path, monkeypatch):
         import hermes_cli.kanban_db as kanban_db
         import hermes_state
@@ -817,7 +990,7 @@ class TestWebServerEndpoints:
         finally:
             db.close()
 
-        resp = self.client.get("/api/dashboard/v2?days=7&project=hermes")
+        resp = self.client.get("/api/dashboard/v2?days=7&board=default&project=hermes")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -845,7 +1018,13 @@ class TestWebServerEndpoints:
         assert data["weekly_reports"]["latest"][0]["title"] == "Weekly Report"
         assert data["career_progress"] == {"status": "unconfigured", "items": [], "summary": None}
         assert data["artist_management"] == {"status": "unconfigured", "items": [], "summary": None}
-        assert data["portfolio_ventures"][0]["project"] == "hermes-dashboard"
+        assert [item["project"] for item in data["portfolio_ventures"]] == [
+            "BureauOS",
+            "Parlay Analyzer",
+            "Trust Base Social Platform",
+            "Frontend Streaming Platform",
+        ]
+        assert data["portfolio_health"]["source"]["type"] == "registered_ventures"
 
         empty_resp = self.client.get("/api/dashboard/v2?days=7&project=no-such-project")
         assert empty_resp.status_code == 200

@@ -119,6 +119,10 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or finance_registry_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    try:
+        db_path.chmod(0o600)
+    except OSError:
+        pass
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -527,10 +531,13 @@ __all__ = [
     "FINANCE_EMPTY_MESSAGE",
     "TREND_METRICS",
     "calculate_finance_metrics",
+    "configure_finance_sync_schedule",
     "dashboard_financial_metrics",
+    "enqueue_finance_sync",
     "finance_command_center_contract",
     "finance_history",
     "finance_registry_path",
+    "finance_sync_schedule",
     "insert_finance_snapshot",
     "seed_default_finance_registry",
 ]
@@ -659,6 +666,26 @@ NORMALIZED_FINANCE_MIGRATIONS: tuple[tuple[str, str], ...] = (
             error_message TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS finance_sync_schedule (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cadence TEXT NOT NULL DEFAULT 'manual',
+            enabled INTEGER NOT NULL DEFAULT 0,
+            retry_max_attempts INTEGER NOT NULL DEFAULT 3,
+            retry_backoff_base_seconds INTEGER NOT NULL DEFAULT 60,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS finance_sync_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL DEFAULT 'plaid',
+            institution_id TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            next_attempt_at INTEGER NOT NULL,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         """,
     ),
 )
@@ -774,8 +801,22 @@ def finish_finance_sync_run(sync_run_id: int, *, status: str, message: str | Non
         conn.close()
 
 
+def _sanitize_finance_error_message(error_message: str) -> str:
+    sanitized = str(error_message)
+    for env_key in ("PLAID_SECRET", "PLAID_CLIENT_ID"):
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            sanitized = sanitized.replace(value, "[REDACTED]")
+    lowered = sanitized.lower()
+    for marker in ("access-", "public-"):
+        if marker in lowered:
+            # Avoid persisting Plaid token-like substrings; keep the operator-safe class only.
+            return "Provider request failed; sensitive token value redacted."
+    return sanitized
+
+
 def record_finance_sync_error(sync_run_id: int | None, error_type: str, error_message: str, *, provider: str = "plaid", path: Path | None = None) -> None:
-    sanitized = str(error_message).replace(os.environ.get("PLAID_SECRET", "__no_secret__"), "[REDACTED]")
+    sanitized = _sanitize_finance_error_message(error_message)
     conn = _connect(path)
     try:
         ensure_schema(conn)
@@ -847,6 +888,79 @@ def recent_finance_sync_runs(*, limit: int = 10, path: Path | None = None) -> li
         conn.close()
 
 
+SYNC_CADENCES: dict[str, int | None] = {
+    "manual": None,
+    "hourly": 3600,
+    "every_6_hours": 21600,
+    "every_12_hours": 43200,
+    "daily": 86400,
+}
+
+
+def configure_finance_sync_schedule(*, cadence: str = "manual", enabled: bool | None = None, retry_max_attempts: int = 3, retry_backoff_base_seconds: int = 60, path: Path | None = None) -> dict[str, Any]:
+    normalized = cadence.strip().lower().replace(" ", "_")
+    aliases = {"every_hour": "hourly", "1h": "hourly", "6h": "every_6_hours", "12h": "every_12_hours", "24h": "daily"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in SYNC_CADENCES:
+        raise ValueError(f"Unsupported finance sync cadence: {cadence}")
+    is_enabled = bool(enabled) if enabled is not None else normalized != "manual"
+    now = int(time.time())
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO finance_sync_schedule (id, cadence, enabled, retry_max_attempts, retry_backoff_base_seconds, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET cadence=excluded.cadence, enabled=excluded.enabled,
+                retry_max_attempts=excluded.retry_max_attempts,
+                retry_backoff_base_seconds=excluded.retry_backoff_base_seconds,
+                updated_at=excluded.updated_at
+            """,
+            (normalized, 1 if is_enabled else 0, max(1, int(retry_max_attempts)), max(1, int(retry_backoff_base_seconds)), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return finance_sync_schedule(path=path)
+
+
+def finance_sync_schedule(*, path: Path | None = None) -> dict[str, Any]:
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        row = conn.execute("SELECT * FROM finance_sync_schedule WHERE id=1").fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"cadence": "manual", "enabled": False, "interval_seconds": None, "retry_max_attempts": 3, "retry_backoff_base_seconds": 60}
+    cadence = str(row["cadence"] or "manual")
+    return {
+        "cadence": cadence,
+        "enabled": bool(row["enabled"]),
+        "interval_seconds": SYNC_CADENCES.get(cadence),
+        "retry_max_attempts": int(row["retry_max_attempts"] or 3),
+        "retry_backoff_base_seconds": int(row["retry_backoff_base_seconds"] or 60),
+        "updated_at": row["updated_at"],
+    }
+
+
+def enqueue_finance_sync(*, institution_id: str | None = None, provider: str = "plaid", path: Path | None = None) -> dict[str, Any]:
+    now = int(time.time())
+    schedule = finance_sync_schedule(path=path)
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        cur = conn.execute(
+            "INSERT INTO finance_sync_queue (provider, institution_id, status, attempts, max_attempts, next_attempt_at, created_at, updated_at) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)",
+            (provider, institution_id, int(schedule["retry_max_attempts"]), now, now, now),
+        )
+        conn.commit()
+        return {"id": int(cur.lastrowid or 0), "status": "queued", "next_attempt_at": now, "max_attempts": int(schedule["retry_max_attempts"])}
+    finally:
+        conn.close()
+
+
 def latest_finance_sync_status(*, path: Path | None = None) -> dict[str, Any]:
     db_path = path or finance_registry_path()
     conn = _connect(path)
@@ -862,6 +976,7 @@ def latest_finance_sync_status(*, path: Path | None = None) -> dict[str, Any]:
             "provider_label": "Plaid Sandbox",
             "environment": "Sandbox",
             "history": recent_finance_sync_runs(limit=10, path=path),
+            "schedule": finance_sync_schedule(path=path),
         }
         if run is None:
             return {**base, "configured": False, "last_sync_at": None, "last_successful_sync_at": None, "sync_health": "warning", "status": "never_synced", "errors": []}
@@ -922,10 +1037,12 @@ def upsert_plaid_registry_data(data: dict[str, Any], *, sync_run_id: int | None 
                 (institution.get("institution_id"), institution.get("name"), institution.get("item_id"), json.dumps(data.get("products") or []), now, now, now),
             )
             counts["institutions"] += 1
+        current_account_ids: list[str] = []
         for account in data.get("accounts") or []:
             account_id = account.get("account_id")
             if not account_id:
                 continue
+            current_account_ids.append(str(account_id))
             balances = account.get("balances") or {}
             conn.execute(
                 """
@@ -960,6 +1077,12 @@ def upsert_plaid_registry_data(data: dict[str, Any], *, sync_run_id: int | None 
             )
             counts["accounts"] += 1
             counts["balances"] += 1
+        if institution.get("institution_id") and current_account_ids:
+            placeholders = ",".join("?" for _ in current_account_ids)
+            conn.execute(
+                f"UPDATE finance_accounts SET is_active=0, updated_at=? WHERE provider='plaid' AND institution_id=? AND provider_account_id NOT IN ({placeholders})",
+                (now, institution.get("institution_id"), *current_account_ids),
+            )
         for txn in data.get("transactions") or []:
             transaction_id = txn.get("transaction_id")
             account_id = txn.get("account_id")

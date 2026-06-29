@@ -200,3 +200,60 @@ def test_executive_dashboard_excludes_regtech_products_from_homepage() -> None:
     text = source()
     for forbidden in ["GovShield", "HIPAAOS", "AI Governance", "CloudComply", "VendorRisk", "FedRAMP Navigator", "FireInspect", "DOT Command", "MedWasteTrack"]:
         assert forbidden not in text
+
+
+def test_career_command_is_career_advancement_console_not_generic_progress_card() -> None:
+    text = source()
+    command_center = command_center_source()
+    career_component = text[text.index("function CareerCommandConsole"):text.index("const SYNC_PROGRESS_STEPS")]
+    career_panel = command_center[command_center.index('id="career-development"'):command_center.index('id="engineering-brand"')]
+
+    for label in [
+        "Current Position",
+        "Target Role",
+        "Certification Roadmap",
+        "Skill Matrix",
+        "Today’s Study Plan",
+        "Career Risk",
+        "Income Strategy",
+        "Job Readiness",
+        "Microsoft 365 / Azure",
+        "Networking",
+        "Windows support",
+        "Linux",
+        "Cloud fundamentals",
+        "Security",
+        "Scripting / automation",
+        "Troubleshooting",
+    ]:
+        assert label in text
+    assert "<CareerCommandConsole career={dashboard.careerProgress} />" in career_panel
+    assert "grid grid-cols-3" not in career_panel
+    assert 'value="End User Technician"' not in career_panel
+    assert 'value="Cloud Engineer"' not in career_panel
+    assert 'value="Cloud Architect"' not in career_panel
+
+
+def test_career_command_surfaces_missing_inputs_and_next_actions() -> None:
+    career_component = source()[source().index("function CareerCommandConsole"):source().index("const SYNC_PROGRESS_STEPS")]
+    for missing_field in [
+        "employer/client",
+        "contract/permanent status",
+        "pay_rate",
+        "start_date",
+        "conversion_target",
+        "target_salary",
+        "timeline",
+        "study_hours_needed",
+        "daily_study_target",
+        "current_hourly_pay",
+        "next_income_lever",
+        "resume_status",
+        "linkedin_status",
+        "portfolio_status",
+        "interview_readiness",
+        "applications_sent",
+    ]:
+        assert f'"{missing_field}"' in career_component
+    assert career_component.count("Next action:") >= 8
+    assert 'studyTasks.length ? studyTasks : [careerMissing("study_plan")]' in career_component

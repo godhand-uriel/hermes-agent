@@ -229,13 +229,14 @@ def calculate_finance_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
             if isinstance(account, dict)
         )
 
-    assets = checking_balance + savings_balance + emergency_fund + car_fund + brokerage_value
+    cash_position = _number(snapshot.get("cash_position"), None)
+    assets = (cash_position if cash_position is not None else checking_balance + savings_balance + emergency_fund + car_fund) + brokerage_value
     net_worth = _number(snapshot.get("net_worth"), None)
     if net_worth is None:
         net_worth = assets - debt_total
 
     monthly_burn = monthly_expenses or 0.0
-    liquid_runway_base = checking_balance + savings_balance + emergency_fund
+    liquid_runway_base = cash_position if cash_position is not None else checking_balance + savings_balance + emergency_fund
     runway_months = _number(snapshot.get("runway_months"), None)
     if runway_months is None:
         runway_months = None if monthly_burn <= 0 else liquid_runway_base / monthly_burn
@@ -373,6 +374,9 @@ def latest_finance_snapshot(*, path: Path | None = None) -> FinanceSourceState:
 def finance_history(metric: str, *, limit: int = 90, path: Path | None = None) -> list[dict[str, Any]]:
     if metric not in TREND_METRICS:
         raise ValueError(f"Unsupported finance trend metric: {metric}")
+    normalized_points = _normalized_history_points(metric, limit=limit, path=path)
+    if normalized_points:
+        return normalized_points
     state = latest_finance_snapshot(path=path)
     if not state.initialized:
         return []
@@ -784,25 +788,102 @@ def record_finance_sync_error(sync_run_id: int | None, error_type: str, error_me
         conn.close()
 
 
+def _sync_duration_seconds(row: sqlite3.Row) -> float | None:
+    started = row["started_at"]
+    completed = row["completed_at"]
+    if not started or not completed:
+        return None
+    return round(max(0, int(completed) - int(started)), 2)
+
+
+def _sync_health(status: str | None, *, completed_at: int | None = None) -> str:
+    normalized = (status or "").lower()
+    if normalized == "success":
+        if completed_at and int(time.time()) - int(completed_at) > 86400:
+            return "warning"
+        return "healthy"
+    if normalized == "running":
+        return "warning"
+    if normalized in {"failed", "error"}:
+        return "error"
+    return "warning"
+
+
+def recent_finance_sync_runs(*, limit: int = 10, path: Path | None = None) -> list[dict[str, Any]]:
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT * FROM finance_sync_runs ORDER BY started_at DESC, id DESC LIMIT ?",
+            (max(1, min(int(limit or 10), 50)),),
+        ).fetchall()
+        errors = conn.execute(
+            "SELECT sync_run_id, error_type, error_message FROM finance_sync_errors ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        errors_by_run: dict[int, list[str]] = {}
+        for error_row in errors:
+            run_id = error_row["sync_run_id"]
+            if run_id is None:
+                continue
+            errors_by_run.setdefault(int(run_id), []).append(str(error_row["error_message"]))
+        return [
+            {
+                "id": row["id"],
+                "provider": row["provider"],
+                "environment": row["environment"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "duration_seconds": _sync_duration_seconds(row),
+                "accounts_count": row["accounts_count"],
+                "transactions_count": row["transactions_count"],
+                "liabilities_count": row["liabilities_count"],
+                "investments_count": row["investments_count"],
+                "status": row["status"],
+                "errors": errors_by_run.get(int(row["id"]), []),
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
 def latest_finance_sync_status(*, path: Path | None = None) -> dict[str, Any]:
+    db_path = path or finance_registry_path()
     conn = _connect(path)
     try:
         ensure_schema(conn)
         run = conn.execute("SELECT * FROM finance_sync_runs ORDER BY started_at DESC, id DESC LIMIT 1").fetchone()
         errors = conn.execute("SELECT error_type, error_message, created_at FROM finance_sync_errors ORDER BY created_at DESC, id DESC LIMIT 5").fetchall()
+        base = {
+            "registry_source": "Finance Registry",
+            "registry_location": str(db_path),
+            "model": "Normalized Registry",
+            "provider": "Plaid",
+            "provider_label": "Plaid Sandbox",
+            "environment": "Sandbox",
+            "history": recent_finance_sync_runs(limit=10, path=path),
+        }
         if run is None:
-            return {"configured": False, "last_sync_at": None, "sync_health": "never_synced", "errors": []}
+            return {**base, "configured": False, "last_sync_at": None, "last_successful_sync_at": None, "sync_health": "warning", "status": "never_synced", "errors": []}
         status = run["status"]
-        health = "healthy" if status == "success" else ("running" if status == "running" else "degraded")
+        completed = run["completed_at"]
+        latest_success = conn.execute("SELECT completed_at FROM finance_sync_runs WHERE status='success' AND completed_at IS NOT NULL ORDER BY completed_at DESC, id DESC LIMIT 1").fetchone()
+        environment = str(run["environment"] or "sandbox")
+        provider = str(run["provider"] or "plaid")
+        display_env = environment.capitalize()
         return {
+            **base,
             "configured": True,
-            "provider": run["provider"],
-            "environment": run["environment"],
+            "provider": provider.capitalize() if provider else "Plaid",
+            "provider_label": f"Plaid {display_env}" if provider == "plaid" else provider.capitalize(),
+            "environment": display_env,
             "status": status,
-            "sync_health": health,
-            "last_sync_at": run["completed_at"] or run["started_at"],
+            "sync_health": _sync_health(status, completed_at=completed),
+            "last_sync_at": completed or run["started_at"],
+            "last_successful_sync_at": latest_success["completed_at"] if latest_success else None,
             "started_at": run["started_at"],
-            "completed_at": run["completed_at"],
+            "completed_at": completed,
+            "duration_seconds": _sync_duration_seconds(run),
             "accounts_count": run["accounts_count"],
             "transactions_count": run["transactions_count"],
             "liabilities_count": run["liabilities_count"],
@@ -939,7 +1020,7 @@ def upsert_plaid_registry_data(data: dict[str, Any], *, sync_run_id: int | None 
                 account_id = loan.get("account_id")
                 if not account_id:
                     continue
-                balance = loan.get("outstanding_principal_balance") if loan_key == "student" else loan.get("current_late_fee", loan.get("outstanding_principal_balance"))
+                balance = loan.get("outstanding_principal_balance") or loan.get("origination_principal_amount") or loan.get("current_balance")
                 conn.execute(
                     """
                     INSERT INTO finance_liabilities (provider, provider_account_id, liability_type, loan_balance, credit_card_balance, apr_percent, minimum_payment_amount, next_payment_due_date, created_at, updated_at)
@@ -994,82 +1075,224 @@ def _has_normalized_finance_data(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _active_account_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM finance_accounts WHERE is_active = 1").fetchall()
+
+
+def _latest_investment_value(conn: sqlite3.Connection) -> float:
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(investment_holdings), 0) AS value
+        FROM finance_investments
+        WHERE captured_at = (SELECT MAX(captured_at) FROM finance_investments)
+        """
+    ).fetchone()
+    return float(row["value"] or 0.0) if row is not None else 0.0
+
+
+def _normalized_cash_bucket(row: sqlite3.Row) -> str | None:
+    subtype = str(row["account_subtype"] or "").lower()
+    fund = str(row["fund_category"] or "").lower()
+    name = str(row["account_name"] or "").lower()
+    if fund == "emergency" or "emergency" in name:
+        return "emergency"
+    if fund == "car" or "car fund" in name:
+        return "car"
+    if subtype == "checking":
+        return "checking"
+    if subtype in {"savings", "money market", "cash management", "cd", "hsa"}:
+        return "savings"
+    return None
+
+
+def _normalized_liability_total(accounts: list[sqlite3.Row], liabilities: list[sqlite3.Row]) -> float:
+    """Return outstanding debt without double-counting liability detail rows.
+
+    Plaid account balances are the most complete normalized source for loans in
+    the registry. Liability rows add payment/APR detail and are used only for
+    accounts that do not have an active credit/loan account balance.
+    """
+    account_debt_by_id: dict[str, float] = {}
+    for row in accounts:
+        if row["account_type"] in {"credit", "loan"}:
+            account_debt_by_id[str(row["provider_account_id"])] = abs(float(row["current_balance"] or 0.0))
+    extra_detail_debt = 0.0
+    for row in liabilities:
+        account_id = str(row["provider_account_id"] or "")
+        if account_id in account_debt_by_id:
+            continue
+        extra_detail_debt += abs(float(row["loan_balance"] or row["credit_card_balance"] or 0.0))
+    return sum(account_debt_by_id.values()) + extra_detail_debt
+
+
+def _normalized_credit_utilization(accounts: list[sqlite3.Row]) -> float | None:
+    balance = 0.0
+    limit = 0.0
+    for row in accounts:
+        if row["account_type"] != "credit":
+            continue
+        current = abs(float(row["current_balance"] or 0.0))
+        available = float(row["available_balance"] or 0.0)
+        balance += current
+        limit += current + max(available, 0.0)
+    return None if limit <= 0 else round((balance / limit) * 100.0, 2)
+
+
+def _normalized_monthly_income_expenses(conn: sqlite3.Connection) -> tuple[float, float]:
+    import datetime as _dt
+
+    latest = conn.execute("SELECT MAX(transaction_date) AS latest FROM finance_transactions WHERE pending_status = 0").fetchone()
+    latest_date = _dt.date.today()
+    if latest and latest["latest"]:
+        try:
+            latest_date = _dt.date.fromisoformat(str(latest["latest"]))
+        except ValueError:
+            latest_date = _dt.date.today()
+    cutoff = (latest_date - _dt.timedelta(days=30)).isoformat()
+    row = conn.execute(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN amount < 0 AND LOWER(COALESCE(category, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(merchant_name, '')) NOT LIKE '%transfer%' THEN -amount ELSE 0 END), 0) AS income,
+          COALESCE(SUM(CASE WHEN amount > 0 AND LOWER(COALESCE(category, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(merchant_name, '')) NOT LIKE '%transfer%' THEN amount ELSE 0 END), 0) AS expenses
+        FROM finance_transactions
+        WHERE pending_status = 0 AND transaction_date >= ?
+        """,
+        (cutoff,),
+    ).fetchone()
+    return (round(float(row["income"] or 0.0), 2), round(float(row["expenses"] or 0.0), 2))
+
+
+def _normalized_finance_aggregate(conn: sqlite3.Connection) -> dict[str, Any]:
+    accounts = _active_account_rows(conn)
+    liabilities = conn.execute("SELECT * FROM finance_liabilities").fetchall()
+    cash_position = checking = savings = emergency = car = 0.0
+    investment_accounts = 0.0
+    for row in accounts:
+        balance = float(row["current_balance"] or 0.0)
+        if row["account_type"] == "depository":
+            cash_position += balance
+            bucket = _normalized_cash_bucket(row)
+            if bucket == "checking":
+                checking += balance
+            elif bucket == "emergency":
+                emergency += balance
+                savings += balance
+            elif bucket == "car":
+                car += balance
+                savings += balance
+            elif bucket == "savings":
+                savings += balance
+        elif row["account_type"] == "investment":
+            investment_accounts += balance
+    brokerage_value = _latest_investment_value(conn) or investment_accounts
+    debt_total = _normalized_liability_total(accounts, liabilities)
+    income, expenses = _normalized_monthly_income_expenses(conn)
+    net_worth = cash_position + brokerage_value - debt_total
+    credit_utilization = _normalized_credit_utilization(accounts)
+    return {
+        "annual_income": round(income * 12.0, 2) if income else None,
+        "monthly_income": income,
+        "monthly_expenses": expenses,
+        "emergency_fund": round(emergency, 2),
+        "emergency_fund_target": 1000.0,
+        "car_fund": round(car, 2),
+        "car_fund_target": 5000.0,
+        "brokerage_value": round(brokerage_value, 2),
+        "brokerage_contributions": 0.0,
+        "checking_balance": round(checking, 2),
+        "savings_balance": round(savings, 2),
+        "cash_position": round(cash_position, 2),
+        "debt_total": round(debt_total, 2),
+        "debt_accounts": [],
+        "debt_original_total": round(debt_total, 2),
+        "net_worth": round(net_worth, 2),
+        "last_finance_sync": None,
+        "sync_health": None,
+        "credit_utilization_percent": credit_utilization,
+    }
+
+
+def _normalized_history_points(metric: str, *, limit: int, path: Path | None = None) -> list[dict[str, Any]]:
+    if metric not in TREND_METRICS:
+        raise ValueError(f"Unsupported finance trend metric: {metric}")
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        if not _has_normalized_finance_data(conn):
+            return []
+        rows = conn.execute(
+            """
+            SELECT b.sync_run_id, COALESCE(sr.completed_at, MAX(b.captured_at)) AS captured_at,
+                   SUM(CASE WHEN a.account_type='depository' THEN b.current_balance ELSE 0 END) AS cash_position,
+                   SUM(CASE WHEN a.account_type IN ('credit','loan') THEN ABS(b.current_balance) ELSE 0 END) AS debt_total
+            FROM finance_balances b
+            JOIN finance_accounts a ON a.provider_account_id = b.provider_account_id
+            LEFT JOIN finance_sync_runs sr ON sr.id = b.sync_run_id
+            GROUP BY b.sync_run_id
+            ORDER BY captured_at DESC, b.sync_run_id DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 90), 3650)),),
+        ).fetchall()
+        inv_rows = conn.execute(
+            """
+            SELECT sync_run_id, SUM(investment_holdings) AS brokerage_value
+            FROM finance_investments
+            GROUP BY sync_run_id
+            """
+        ).fetchall()
+        inv_by_run = {row["sync_run_id"]: float(row["brokerage_value"] or 0.0) for row in inv_rows}
+        tx_rows = conn.execute("SELECT transaction_date, amount, category, name, merchant_name FROM finance_transactions WHERE pending_status = 0").fetchall()
+    finally:
+        conn.close()
+    import datetime as _dt
+    txns = []
+    for row in tx_rows:
+        try:
+            text = f"{row['category'] or ''} {row['name'] or ''} {row['merchant_name'] or ''}".lower()
+            txns.append((_dt.date.fromisoformat(str(row["transaction_date"])), float(row["amount"] or 0.0), text))
+        except ValueError:
+            continue
+    points: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        captured = int(row["captured_at"] or 0)
+        run_id = row["sync_run_id"]
+        cash = float(row["cash_position"] or 0.0)
+        debt = float(row["debt_total"] or 0.0)
+        brokerage = inv_by_run.get(run_id, 0.0)
+        value: float | None
+        if metric == "cash_position":
+            value = cash
+        elif metric == "debt_total":
+            value = debt
+        elif metric == "brokerage_value":
+            value = brokerage
+        elif metric == "net_worth":
+            value = cash + brokerage - debt
+        elif metric in {"monthly_expenses", "net_cash_flow"}:
+            end = _dt.datetime.fromtimestamp(captured).date() if captured else _dt.date.today()
+            start = end - _dt.timedelta(days=30)
+            income = sum(abs(amount) for date, amount, text in txns if start <= date <= end and amount < 0 and "transfer" not in text)
+            expenses = sum(amount for date, amount, text in txns if start <= date <= end and amount > 0 and "transfer" not in text)
+            value = expenses if metric == "monthly_expenses" else income - expenses
+        elif metric == "emergency_fund" or metric == "car_fund":
+            value = 0.0
+        else:
+            value = None
+        points.append({"captured_at": captured, "value": None if value is None else round(float(value), 2)})
+    return points
+
+
 def normalized_finance_snapshot(*, path: Path | None = None) -> dict[str, Any] | None:
     conn = _connect(path)
     try:
         ensure_schema(conn)
         if not _has_normalized_finance_data(conn):
             return None
-        accounts = conn.execute("SELECT * FROM finance_accounts WHERE is_active = 1").fetchall()
-        txns = conn.execute("SELECT * FROM finance_transactions WHERE pending_status = 0").fetchall()
-        liabilities = conn.execute("SELECT * FROM finance_liabilities").fetchall()
-        holdings_row = conn.execute("SELECT COALESCE(SUM(investment_holdings), 0) AS value FROM finance_investments WHERE captured_at = (SELECT MAX(captured_at) FROM finance_investments)").fetchone()
-        cash_position = 0.0
-        checking = 0.0
-        savings = 0.0
-        emergency = 0.0
-        car = 0.0
-        investment_accounts = 0.0
-        credit_loan_accounts = 0.0
-        for row in accounts:
-            balance = float(row["current_balance"] or 0.0)
-            atype = row["account_type"]
-            subtype = row["account_subtype"]
-            fund = row["fund_category"]
-            if atype == "depository":
-                cash_position += balance
-                if subtype == "checking":
-                    checking += balance
-                elif subtype == "savings":
-                    savings += balance
-                if fund == "emergency":
-                    emergency += balance
-                elif fund == "car":
-                    car += balance
-            elif atype == "investment":
-                investment_accounts += balance
-            elif atype in {"credit", "loan"}:
-                credit_loan_accounts += abs(balance)
-        holdings_value = float(holdings_row["value"] or 0.0) if holdings_row is not None else 0.0
-        brokerage_value = holdings_value if holdings_value > 0 else investment_accounts
-        explicit_debt = 0.0
-        for row in liabilities:
-            explicit_debt += abs(float(row["loan_balance"] or row["credit_card_balance"] or 0.0))
-        debt_total = explicit_debt if explicit_debt > 0 else credit_loan_accounts
-        import datetime as _dt
-        cutoff = (_dt.date.today() - _dt.timedelta(days=30)).isoformat()
-        income = 0.0
-        spending = 0.0
-        for row in txns:
-            if str(row["transaction_date"]) < cutoff:
-                continue
-            amount = float(row["amount"] or 0.0)
-            # Plaid transaction amounts are positive for outflows and negative for inflows.
-            if amount < 0:
-                income += abs(amount)
-            elif amount > 0:
-                spending += amount
+        snapshot = _normalized_finance_aggregate(conn)
         latest_sync = latest_finance_sync_status(path=path)
-        snapshot = {
-            "snapshot_source": "normalized_registry",
-            "annual_income": round(income * 12.0, 2) if income else None,
-            "monthly_income": round(income, 2),
-            "monthly_expenses": round(spending, 2),
-            "emergency_fund": round(emergency, 2),
-            "emergency_fund_target": 1000.0,
-            "car_fund": round(car, 2),
-            "car_fund_target": 5000.0,
-            "brokerage_value": round(brokerage_value, 2),
-            "brokerage_contributions": 0.0,
-            "checking_balance": round(checking, 2),
-            "savings_balance": round(savings, 2),
-            "cash_position": round(cash_position, 2),
-            "debt_total": round(debt_total, 2),
-            "debt_accounts": [],
-            "debt_original_total": debt_total,
-            "last_finance_sync": latest_sync.get("last_sync_at"),
-            "sync_health": latest_sync.get("sync_health"),
-        }
+        snapshot["last_finance_sync"] = latest_sync.get("last_sync_at")
+        snapshot["sync_health"] = latest_sync.get("sync_health")
         snapshot = normalize_finance_snapshot(snapshot)
         snapshot["metrics"]["cash_position"] = snapshot["cash_position"]
         snapshot["metrics"]["total_debt"] = snapshot["debt_total"]
@@ -1132,6 +1355,7 @@ def finance_command_center_contract(*, path: Path | None = None) -> dict[str, An
             "metrics": normalized.get("metrics") or calculate_finance_metrics(normalized),
             "snapshot": normalized,
             "sync": sync,
+            "executive_dashboard": executive_finance_dashboard(normalized, contract={"sync": sync}, path=path),
         }
     state = latest_finance_snapshot(path=path)
     if not state.initialized or not state.latest:
@@ -1149,8 +1373,307 @@ def finance_command_center_contract(*, path: Path | None = None) -> dict[str, An
         "metrics": snapshot.get("metrics") or calculate_finance_metrics(snapshot),
         "snapshot": snapshot,
         "sync": latest_finance_sync_status(path=path),
+        "executive_dashboard": executive_finance_dashboard(snapshot, contract={"sync": latest_finance_sync_status(path=path)}, path=path),
     }
 
+
+
+def _timestamp_to_iso(value: int | None) -> str | None:
+    if not value:
+        return None
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(int(value), tz=_dt.timezone.utc).isoformat()
+
+
+def _change_from_history(metric: str, *, days: int, current: float | None, path: Path | None = None) -> float | None:
+    if current is None:
+        return None
+    try:
+        points = finance_history(metric, limit=max(days + 2, 3), path=path)
+    except Exception:
+        return None
+    if len(points) < 2:
+        return None
+    import time as _time
+    cutoff = int(_time.time()) - days * 86400
+    baseline = None
+    for point in points:
+        if int(point.get("captured_at") or 0) <= cutoff and point.get("value") is not None:
+            baseline = float(point["value"])
+    if baseline is None:
+        for point in points[:-1]:
+            if point.get("value") is not None:
+                baseline = float(point["value"])
+                break
+    if baseline is None:
+        return None
+    return round(float(current) - baseline, 2)
+
+
+def _status_for_percent(value: float | None, *, good: float, warn: float, invert: bool = False) -> str:
+    if value is None:
+        return "Unknown"
+    if invert:
+        if value <= good:
+            return "Safe"
+        if value <= warn:
+            return "Watch"
+        return "High"
+    if value >= good:
+        return "Excellent"
+    if value >= warn:
+        return "Good"
+    if value > 0:
+        return "Building"
+    return "Critical"
+
+
+def _normalize_trend_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"captured_at": point.get("captured_at"), "value": point.get("value")} for point in points[-30:]]
+
+
+def finance_registry_metadata(*, sync: dict[str, Any] | None = None, path: Path | None = None) -> dict[str, Any]:
+    db_path = path or finance_registry_path()
+    sync = sync or latest_finance_sync_status(path=path)
+    size = db_path.stat().st_size if db_path.exists() else 0
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        migration = conn.execute("SELECT migration_id, applied_at FROM finance_registry_migrations ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
+        version = conn.execute("SELECT COUNT(*) AS count FROM finance_registry_migrations").fetchone()
+    finally:
+        conn.close()
+    return {
+        "registry_version": int(version["count"] or 0) if version else 0,
+        "last_migration": dict(migration) if migration else None,
+        "last_sync": sync.get("last_sync_at"),
+        "provider": sync.get("provider") or "Plaid",
+        "environment": sync.get("environment") or "Sandbox",
+        "registry_location": str(db_path),
+        "database_size_bytes": size,
+        "synchronization_duration": sync.get("duration_seconds"),
+        "synchronization_status": sync.get("status") or "never_synced",
+    }
+
+
+def connected_finance_institutions(*, path: Path | None = None) -> list[dict[str, Any]]:
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT i.*, COUNT(a.id) AS account_count,
+                   GROUP_CONCAT(DISTINCT a.account_subtype) AS account_subtypes,
+                   GROUP_CONCAT(DISTINCT a.account_type) AS account_types
+            FROM finance_institutions i
+            LEFT JOIN finance_accounts a ON a.institution_id = i.institution_id AND a.is_active = 1
+            GROUP BY i.id
+            ORDER BY COALESCE(i.last_sync_at, i.updated_at, i.created_at) DESC, i.institution_name
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    institutions = []
+    has_connected_accounts = any(int(row["account_count"] or 0) > 0 for row in rows)
+    for row in rows:
+        if has_connected_accounts and int(row["account_count"] or 0) <= 0:
+            continue
+        subtypes = [item for item in str(row["account_subtypes"] or "").split(",") if item]
+        types = [item for item in str(row["account_types"] or "").split(",") if item]
+        institutions.append({
+            "institution_logo": None,
+            "institution_name": row["institution_name"] or row["institution_id"],
+            "institution_id": row["institution_id"],
+            "connected_account_count": int(row["account_count"] or 0),
+            "last_synchronized": row["last_sync_at"],
+            "connection_status": row["status"] or "active",
+            "account_types": subtypes or types,
+        })
+    return institutions
+
+
+def recent_finance_activity(*, path: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        txns = conn.execute(
+            """
+            SELECT t.*, a.account_name, a.account_type, a.account_subtype
+            FROM finance_transactions t
+            LEFT JOIN finance_accounts a ON a.provider_account_id = t.provider_account_id
+            WHERE t.pending_status = 0
+            ORDER BY t.transaction_date DESC, t.id DESC
+            LIMIT 50
+            """
+        ).fetchall()
+        investments = conn.execute(
+            """
+            SELECT * FROM finance_investments
+            ORDER BY captured_at DESC, id DESC
+            LIMIT 10
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    income: list[dict[str, Any]] = []
+    expenses: list[dict[str, Any]] = []
+    transfers: list[dict[str, Any]] = []
+    debt_payments: list[dict[str, Any]] = []
+    for row in txns:
+        amount = float(row["amount"] or 0.0)
+        item = {"date": row["transaction_date"], "name": row["merchant_name"] or row["name"], "amount": round(amount, 2), "account": row["account_name"], "category": row["category"]}
+        category = str(row["category"] or "").lower()
+        name = str(item["name"] or "").lower()
+        if amount < 0 and len(income) < 5:
+            income.append({**item, "amount": round(abs(amount), 2)})
+        elif "transfer" in category or "transfer" in name:
+            if len(transfers) < 5:
+                transfers.append(item)
+        elif "loan" in category or "credit card" in category or "payment" in name:
+            if len(debt_payments) < 5:
+                debt_payments.append(item)
+        elif amount > 0:
+            expenses.append(item)
+    expenses = sorted(expenses, key=lambda item: float(item.get("amount") or 0.0), reverse=True)[:5]
+    investment_activity = [
+        {"date": row["captured_at"], "name": row["ticker_symbol"] or row["security_name"] or "Holding", "amount": row["investment_holdings"], "account": row["provider_account_id"]}
+        for row in investments
+    ]
+    return {"latest_income": income, "largest_recent_expenses": expenses, "recent_transfers": transfers, "investment_activity": investment_activity, "debt_payments": debt_payments}
+
+
+def executive_financial_health(snapshot: dict[str, Any], *, path: Path | None = None) -> dict[str, Any]:
+    metrics = snapshot.get("metrics") or calculate_finance_metrics(snapshot)
+    net_worth = _number(metrics.get("net_worth"), 0.0) or 0.0
+    cash = _number(snapshot.get("cash_position", (snapshot.get("checking_balance") or 0) + (snapshot.get("savings_balance") or 0) + (snapshot.get("emergency_fund") or 0)), 0.0) or 0.0
+    monthly_expenses = _number(metrics.get("monthly_expenses"), 0.0) or 0.0
+    monthly_income = _number(metrics.get("monthly_income"), 0.0) or 0.0
+    debt = _number(snapshot.get("debt_total"), 0.0) or 0.0
+    ef_pct = metrics.get("emergency_fund_completion_percent")
+    savings_rate = metrics.get("savings_rate_percent")
+    cash_flow = metrics.get("net_cash_flow")
+    runway = metrics.get("runway_months")
+    net_worth_monthly_change = _change_from_history("net_worth", days=30, current=net_worth, path=path)
+    debt_ratio = None if net_worth + debt <= 0 else (debt / (net_worth + debt)) * 100.0
+    liquidity = None if monthly_expenses <= 0 else cash / monthly_expenses
+    credit_util = snapshot.get("credit_utilization_percent")
+    component_scores = {
+        "emergency_fund": min(100.0, float(ef_pct or 0.0)),
+        "debt_ratio": 100.0 if debt_ratio is None else max(0.0, 100.0 - debt_ratio),
+        "cash_flow": 100.0 if (cash_flow or 0) > 0 else 40.0 if (cash_flow or 0) == 0 else 10.0,
+        "savings_rate": max(0.0, min(100.0, float(savings_rate or 0.0) * 2.5)),
+        "credit_utilization": 100.0 if credit_util is None else max(0.0, 100.0 - float(credit_util) * 1.6),
+        "liquidity": max(0.0, min(100.0, float(liquidity or runway or 0.0) / 6.0 * 100.0)),
+        "net_worth_trend": 85.0 if (net_worth_monthly_change or 0) > 0 else 55.0 if net_worth_monthly_change == 0 else 25.0,
+    }
+    weights = {"emergency_fund": 0.18, "debt_ratio": 0.16, "cash_flow": 0.18, "savings_rate": 0.14, "credit_utilization": 0.12, "liquidity": 0.12, "net_worth_trend": 0.10}
+    score = round(sum(component_scores[key] * weights[key] for key in weights))
+    rating = "Excellent" if score >= 85 else "Good" if score >= 70 else "Fair" if score >= 50 else "Poor"
+    reasons = []
+    if cash_flow is not None:
+        reasons.append("positive monthly cash flow" if cash_flow >= 0 else "negative monthly cash flow")
+    if ef_pct is not None:
+        reasons.append(f"emergency fund is {ef_pct:.0f}% funded")
+    if net_worth_monthly_change is not None:
+        reasons.append("net worth improved" if net_worth_monthly_change >= 0 else "net worth declined")
+    explanation = "Score reflects " + ", ".join(reasons[:3]) + "." if reasons else "Score reflects available registry metrics."
+    return {"score": score, "rating": rating, "components": {k: round(v, 1) for k, v in component_scores.items()}, "weights": weights, "explanation": explanation, "changed_because": explanation}
+
+
+def executive_finance_alerts(snapshot: dict[str, Any], *, activity: dict[str, list[dict[str, Any]]] | None = None) -> list[dict[str, Any]]:
+    metrics = snapshot.get("metrics") or calculate_finance_metrics(snapshot)
+    alerts: list[dict[str, Any]] = []
+    ef_pct = metrics.get("emergency_fund_completion_percent")
+    if ef_pct is not None and ef_pct < 100:
+        severity = "critical" if ef_pct < 25 else "warning"
+        alerts.append({"severity": severity, "title": "Emergency fund below target", "message": f"Emergency fund is {ef_pct:.0f}% funded.", "action": "Prioritize emergency savings."})
+    cash_flow = metrics.get("net_cash_flow")
+    if cash_flow is not None and cash_flow < 0:
+        alerts.append({"severity": "critical", "title": "Negative monthly cash flow", "message": f"Expenses exceed income by ${abs(cash_flow):,.2f}.", "action": "Reduce discretionary spending."})
+    debt = _number(snapshot.get("debt_total"), 0.0) or 0.0
+    if debt > 0:
+        alerts.append({"severity": "warning", "title": "Debt requires monitoring", "message": f"Total debt is ${debt:,.2f}.", "action": "Review payoff plan."})
+    activity = activity or {}
+    large_expense = next(iter(activity.get("largest_recent_expenses") or []), None)
+    if large_expense and float(large_expense.get("amount") or 0.0) >= 500:
+        alerts.append({"severity": "warning", "title": "Large transaction posted", "message": f"{large_expense.get('name')} posted for ${float(large_expense.get('amount') or 0):,.2f}.", "action": "Confirm it is expected."})
+    latest_income = next(iter(activity.get("latest_income") or []), None)
+    if latest_income:
+        alerts.append({"severity": "good", "title": "Income received", "message": f"{latest_income.get('name')} deposited ${float(latest_income.get('amount') or 0):,.2f}.", "action": "Allocate to goals."})
+    return alerts[:6]
+
+
+def executive_finance_insights(snapshot: dict[str, Any], *, path: Path | None = None) -> list[str]:
+    metrics = snapshot.get("metrics") or calculate_finance_metrics(snapshot)
+    insights: list[str] = []
+    net_worth = metrics.get("net_worth")
+    nw_change = _change_from_history("net_worth", days=30, current=net_worth, path=path) if net_worth is not None else None
+    if nw_change is not None:
+        insights.append(f"Net Worth {'increased' if nw_change >= 0 else 'decreased'} by ${abs(nw_change):,.2f} over the latest registry trend window.")
+    ef_change = _change_from_history("emergency_fund", days=30, current=snapshot.get("emergency_fund"), path=path)
+    if ef_change is not None and ef_change != 0:
+        insights.append(f"Emergency Fund {'increased' if ef_change >= 0 else 'decreased'} by ${abs(ef_change):,.2f}.")
+    spending = metrics.get("monthly_expenses")
+    spending_change = _change_from_history("monthly_expenses", days=30, current=spending, path=path) if spending is not None else None
+    if spending_change is not None and spending:
+        pct = abs(spending_change) / max(abs(float(spending) - spending_change), 1.0) * 100.0
+        insights.append(f"You spent {pct:.0f}% {'more' if spending_change > 0 else 'less'} than the prior registry period.")
+    ef_pct = metrics.get("emergency_fund_completion_percent")
+    cash_flow = metrics.get("net_cash_flow")
+    if ef_pct is not None and cash_flow and cash_flow > 0 and ef_pct < 100:
+        remaining = max(0.0, float(snapshot.get("emergency_fund_target") or 0.0) - float(snapshot.get("emergency_fund") or 0.0))
+        months = int((remaining / cash_flow) + 0.999) if cash_flow else None
+        if months:
+            insights.append(f"You are projected to reach your Emergency Fund goal in {months} months.")
+    if not insights:
+        insights.append("Finance insights are ready after the next successful registry sync adds trend data.")
+    return insights[:5]
+
+
+def executive_finance_dashboard(snapshot: dict[str, Any], *, contract: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    metrics = snapshot.get("metrics") or calculate_finance_metrics(snapshot)
+    sync = contract.get("sync") or latest_finance_sync_status(path=path)
+    activity = recent_finance_activity(path=path)
+    health = executive_financial_health(snapshot, path=path)
+    cash_available = snapshot.get("cash_position") if snapshot.get("cash_position") is not None else (snapshot.get("checking_balance") or 0.0) + (snapshot.get("savings_balance") or 0.0)
+    emergency_pct = metrics.get("emergency_fund_completion_percent")
+    credit_util = snapshot.get("credit_utilization_percent")
+    net_worth = metrics.get("net_worth")
+    kpis = {
+        "net_worth": {"current": net_worth, "daily_change": _change_from_history("net_worth", days=1, current=net_worth, path=path), "monthly_change": _change_from_history("net_worth", days=30, current=net_worth, path=path)},
+        "cash_available": {"checking": snapshot.get("checking_balance"), "savings": snapshot.get("savings_balance"), "available_cash": round(float(cash_available or 0.0), 2)},
+        "monthly_cash_flow": {"income": metrics.get("monthly_income"), "expenses": metrics.get("monthly_expenses"), "cash_flow": metrics.get("net_cash_flow"), "status": "Positive" if (metrics.get("net_cash_flow") or 0) >= 0 else "Negative"},
+        "emergency_fund": {"current": snapshot.get("emergency_fund"), "target": snapshot.get("emergency_fund_target"), "progress_percent": emergency_pct, "status": _status_for_percent(emergency_pct, good=100, warn=50)},
+        "investment_portfolio": {"current_value": snapshot.get("brokerage_value"), "gain_loss": None, "allocation": metrics.get("investment_allocation_percent")},
+        "debt": {"total_debt": snapshot.get("debt_total"), "monthly_reduction": None if _change_from_history("debt_total", days=30, current=snapshot.get("debt_total"), path=path) is None else round(-float(_change_from_history("debt_total", days=30, current=snapshot.get("debt_total"), path=path) or 0.0), 2), "projected_payoff_date": None},
+        "monthly_burn": {"average_monthly_spending": metrics.get("monthly_expenses"), "trend": _change_from_history("monthly_expenses", days=30, current=metrics.get("monthly_expenses"), path=path)},
+        "credit_utilization": {"current_utilization": credit_util, "status": _status_for_percent(credit_util, good=30, warn=60, invert=True)},
+        "savings_rate": {"monthly_percent": metrics.get("savings_rate_percent"), "target_percent": 20},
+        "runway": {"months_remaining": metrics.get("runway_months")},
+        "next_payday": {"date": snapshot.get("next_payday_date"), "estimated_amount": snapshot.get("next_payday_amount")},
+        "last_successful_sync": {"relative_time": sync.get("last_successful_sync_at"), "sync_duration": sync.get("duration_seconds")},
+    }
+    trends = {
+        "net_worth_30_days": {"label": "Net Worth (30 days)", "points": _normalize_trend_points(finance_history("net_worth", limit=30, path=path))},
+        "cash_flow_30_days": {"label": "Cash Flow (30 days)", "points": _normalize_trend_points(finance_history("net_cash_flow", limit=30, path=path))},
+        "debt_30_days": {"label": "Debt (30 days)", "points": _normalize_trend_points(finance_history("debt_total", limit=30, path=path))},
+        "investments_30_days": {"label": "Investments (30 days)", "points": _normalize_trend_points(finance_history("brokerage_value", limit=30, path=path))},
+        "emergency_fund_progress": {"label": "Emergency Fund Progress", "points": _normalize_trend_points(finance_history("emergency_fund", limit=30, path=path))},
+        "car_fund_progress": {"label": "Car Fund Progress", "points": _normalize_trend_points(finance_history("car_fund", limit=30, path=path))},
+    }
+    return {
+        "kpis": kpis,
+        "financial_health": health,
+        "alerts": executive_finance_alerts(snapshot, activity=activity),
+        "connected_institutions": connected_finance_institutions(path=path),
+        "quick_actions": ["Connect Bank", "Sync Now", "Disconnect Bank", "View Accounts", "View Transactions", "Generate Financial Report", "Export CSV"],
+        "trends": trends,
+        "recent_activity": activity,
+        "registry_metadata": finance_registry_metadata(sync=sync, path=path),
+        "sync_history": sync.get("history") or [],
+        "insights": executive_finance_insights(snapshot, path=path),
+        "performance": {"cached_registry_data": True, "frontend_direct_plaid": False, "target_load_ms": 1000},
+    }
 
 def dashboard_financial_metrics(*, ai_usage_cost_usd: dict[str, Any] | None = None) -> dict[str, Any]:  # type: ignore[no-redef]
     contract = finance_command_center_contract()
@@ -1183,4 +1706,5 @@ def dashboard_financial_metrics(*, ai_usage_cost_usd: dict[str, Any] | None = No
         "setup_action": None,
         "last_finance_sync": contract.get("sync", {}).get("last_sync_at"),
         "sync_health": contract.get("sync", {}).get("sync_health"),
+        "executive_dashboard": contract.get("executive_dashboard"),
     }

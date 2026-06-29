@@ -27,6 +27,13 @@ declare global {
   interface Window {
     __HERMES_SESSION_TOKEN__?: string;
     __HERMES_BASE_PATH__?: string;
+    Plaid?: {
+      create: (config: {
+        token: string;
+        onSuccess: (publicToken: string, metadata: Record<string, unknown>) => void;
+        onExit?: (error: unknown, metadata: Record<string, unknown>) => void;
+      }) => { open: () => void; exit?: () => void };
+    };
     /** Server-injected flag: ``true`` when the dashboard's OAuth gate is
      * engaged (public bind, no ``--insecure``). Toggles the SPA's
      * WS-upgrade path from legacy ``?token=`` to single-use ``?ticket=``
@@ -502,6 +509,53 @@ export const api = {
     const suffix = qs.toString();
     return fetchJSON<DashboardV2Response>(`/api/dashboard/v2${suffix ? `?${suffix}` : ""}`);
   },
+  syncFinanceRegistry: () =>
+    fetchJSON<FinanceSyncResponse>("/api/dashboard/v2/finance/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }),
+  requestPlaidLinkToken: () =>
+    fetchJSON<PlaidLinkTokenResponse>("/api/finance/plaid/link-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }),
+  exchangePlaidPublicToken: (body: PlaidPublicTokenExchangeRequest) =>
+    fetchJSON<PlaidExchangeResponse>("/api/finance/plaid/exchange-public-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  getFinanceSyncStatus: () => fetchJSON<FinanceSyncStatus>("/api/dashboard/v2/finance/sync"),
+  captureTask: (body: { title: string; description?: string; priority?: number; owner?: string; due_date?: string }) =>
+    fetchJSON<{ success: boolean; source_written: boolean; id?: string }>("/api/capture/task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  captureResearch: (body: { topic: string; research_area?: string; notes?: string }) =>
+    fetchJSON<{ success: boolean; source_written: boolean; id?: string }>("/api/capture/research", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  captureVenture: (body: { venture_name: string; description?: string; stage?: string; priority?: number }) =>
+    fetchJSON<{ success: boolean; source_written: boolean; id?: string }>("/api/capture/venture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  captureNote: (body: { title: string; content?: string; destination?: string }) =>
+    fetchJSON<{ success: boolean; source_written: boolean }>("/api/capture/note", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  captureIdea: (body: { idea_text: string }) =>
+    fetchJSON<{ success: boolean; source_written: boolean }>("/api/capture/idea", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   getModelsAnalytics: (days: number, profile = getManagementProfile()) =>
     fetchJSON<ModelsAnalyticsResponse>(
       appendProfileParam(`/api/analytics/models?days=${days}`, profile),
@@ -2280,9 +2334,17 @@ export interface ReportsProjectSummary {
   review_required: number;
   latest_activity_at: number;
   rank?: number | null;
+  stage?: string | null;
+  confidence?: number | null;
+  revenue_usd?: number | null;
+  next_milestone?: string | null;
+  score?: number | null;
   status?: string | null;
   recommendation?: string | null;
   summary?: string | null;
+  id?: string | null;
+  canonical_name?: string | null;
+  aliases?: string[] | null;
 }
 
 export interface ReportFileSummary {
@@ -2393,6 +2455,19 @@ export interface DashboardV2Metric {
   value: string | number | null;
   detail?: string | null;
   tone?: string | null;
+  source?: string | null;
+}
+
+export interface DashboardTrendPoint {
+  captured_at?: number | null;
+  period?: string | null;
+  value?: number | null;
+  count?: number | null;
+}
+
+export interface DashboardFinanceTrend {
+  label?: string | null;
+  points?: DashboardTrendPoint[] | null;
 }
 
 export interface DashboardV2BoardSummary {
@@ -2407,15 +2482,59 @@ export interface DashboardV2BoardSummary {
 
 export interface DashboardV2PortfolioItem {
   project: string;
+  id?: string | null;
+  slug?: string | null;
+  name?: string | null;
   active_tasks?: number | null;
   blocked_tasks?: number | null;
   review_required?: number | null;
   completed_tasks?: number | null;
   latest_activity_at?: number | null;
   rank?: number | null;
+  stage?: string | null;
+  confidence?: number | null;
+  momentum?: string | null;
+  risk?: string | null;
+  revenue_usd?: number | null;
+  next_milestone?: string | null;
+  decision_needed?: string | null;
+  blocking_issue?: string | null;
+  latest_activity?: string | null;
+  latest_research?: string | null;
+  revenue_status?: string | null;
+  owner?: string | null;
+  updated_at?: string | number | null;
+  score?: number | null;
   status?: string | null;
   summary?: string | null;
   recommendation?: string | null;
+}
+
+export interface DashboardV2BureauOSApplication {
+  id?: string | null;
+  name: string;
+  parent_venture?: string | null;
+  stage?: string | null;
+  confidence?: number | null;
+  progress_percent?: number | null;
+  risk?: string | null;
+  next_action?: string | null;
+  next_milestone?: string | null;
+  latest_research?: string | null;
+  blocking_issue?: string | null;
+  last_activity?: string | null;
+  updated_at?: string | number | null;
+}
+
+export interface DashboardV2PipelineStage {
+  stage: string;
+  count: number;
+}
+
+export interface DashboardV2VenturePipeline {
+  stages?: DashboardV2PipelineStage[] | null;
+  items?: Array<{ venture_id?: string | null; name?: string | null; stage?: string | null; status?: string | null }> | null;
+  empty_message?: string | null;
 }
 
 export interface DashboardV2ModelHealthItem {
@@ -2512,14 +2631,55 @@ export interface DashboardV2Response {
   } | null;
   notification_watchdog?: DashboardV2WatchdogStatus | null;
   portfolio_ventures?: DashboardV2PortfolioItem[] | null;
+  venture_registry?: {
+    ventures?: DashboardV2PortfolioItem[] | null;
+    empty_message?: string | null;
+    source?: Record<string, unknown> | null;
+  } | null;
+  bureauos_applications?: DashboardV2BureauOSApplication[] | null;
+  bureauos_application_registry?: {
+    applications?: DashboardV2BureauOSApplication[] | null;
+    empty_message?: string | null;
+    source?: Record<string, unknown> | null;
+  } | null;
+  venture_pipeline?: DashboardV2VenturePipeline | null;
+  executive_brief_source?: Record<string, unknown> | null;
+  dashboard_sources?: Record<string, unknown> | null;
   portfolio_health?: {
     active_projects?: number | null;
     total_projects?: number | null;
     projects?: DashboardV2PortfolioItem[] | null;
+    empty_message?: string | null;
     source?: { type?: string | null; report_type?: string | null } | null;
   } | null;
   career_progress?: DashboardOperatingNote | null;
+  engineering_brand?: {
+    status?: string | null;
+    metrics?: DashboardV2Metric[] | null;
+    content_pipeline?: Record<string, number> | null;
+    upcoming_videos?: string[] | null;
+    published_count?: number | null;
+    active_projects?: string[] | null;
+    source?: Record<string, unknown> | null;
+  } | null;
   artist_management?: DashboardOperatingNote | null;
+  knowledge_vault?: {
+    status?: string | null;
+    total_notes?: number | null;
+    research_reports?: number | null;
+    recent_notes?: ReportFileSummary[] | null;
+    recent_decisions?: ReportFileSummary[] | null;
+    referenced_documents?: Array<{ title?: string | null; references?: number | null }> | null;
+    knowledge_health?: number | null;
+    vault_growth_trend?: DashboardTrendPoint[] | null;
+    source?: Record<string, unknown> | null;
+  } | null;
+  empire_health?: {
+    score?: number | null;
+    components?: Record<string, number> | null;
+    weights?: Record<string, number> | null;
+    source?: Record<string, unknown> | null;
+  } | null;
   engineering_metrics?: {
     metrics?: DashboardV2Metric[] | null;
     completed_tasks?: number | null;
@@ -2542,10 +2702,15 @@ export interface DashboardV2Response {
   } | null;
   financial_metrics?: {
     metrics?: DashboardV2Metric[] | null;
+    widgets?: DashboardV2Metric[] | null;
+    finance_command_center?: Record<string, unknown> | null;
+    trends?: Record<string, DashboardFinanceTrend> | null;
     ai_usage_cost_usd?: { estimated?: number | null; actual?: number | null } | null;
     revenue_usd?: number | null;
     burn_usd?: number | null;
     notes?: string[] | string | null;
+    source?: { type?: string | null; configured?: boolean | null; path?: string | null } | null;
+    setup_action?: { label?: string; method?: string; endpoint?: string } | null;
   } | null;
   weekly_reports?: {
     completion_reports?: ReportFileSummary[] | null;
@@ -2557,6 +2722,75 @@ export interface DashboardV2Response {
   generated_reports?: GeneratedReportsResponse | null;
   errors?: Array<{ source?: string; message?: string }> | null;
   legacy_reports?: ReportsResponse | null;
+}
+
+export interface FinanceSyncHistoryRow {
+  id?: number | string;
+  started_at?: number | null;
+  completed_at?: number | null;
+  duration_seconds?: number | null;
+  accounts_count?: number | null;
+  transactions_count?: number | null;
+  liabilities_count?: number | null;
+  investments_count?: number | null;
+  status?: string | null;
+  errors?: string[] | null;
+}
+
+export interface FinanceSyncStatus {
+  configured?: boolean | null;
+  provider?: string | null;
+  provider_label?: string | null;
+  environment?: string | null;
+  registry_source?: string | null;
+  registry_location?: string | null;
+  model?: string | null;
+  status?: string | null;
+  sync_health?: string | null;
+  last_sync_at?: number | null;
+  last_successful_sync_at?: number | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+  duration_seconds?: number | null;
+  accounts_count?: number | null;
+  transactions_count?: number | null;
+  investments_count?: number | null;
+  liabilities_count?: number | null;
+  message?: string | null;
+  errors?: Array<{ error_type?: string; error_message?: string; created_at?: number }> | null;
+  history?: FinanceSyncHistoryRow[] | null;
+}
+
+export interface FinanceSyncResponse {
+  success: boolean;
+  status: string;
+  message: string;
+  sync?: FinanceSyncStatus | null;
+  finance_command_center?: Record<string, unknown> | null;
+  financial_metrics?: DashboardV2Response["financial_metrics"];
+}
+
+export interface PlaidLinkTokenResponse {
+  success: boolean;
+  link_token: string;
+  expiration?: string | null;
+  request_id?: string | null;
+  environment?: string | null;
+}
+
+export interface PlaidPublicTokenExchangeRequest {
+  public_token: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PlaidExchangeResponse extends FinanceSyncResponse {
+  exchange?: {
+    access_token?: "[ENCRYPTED_AND_STORED]" | "[REDACTED]" | string;
+    item_id?: string | null;
+    request_id?: string | null;
+    environment?: string | null;
+    institution?: { institution_id?: string | null; name?: string | null } | null;
+  } | null;
 }
 
 export interface OAuthSubmitResponse {

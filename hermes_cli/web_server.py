@@ -38,7 +38,7 @@ import zipfile
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -116,6 +116,39 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+
+
+class CaptureTaskRequest(BaseModel):
+    title: str
+    description: str = ""
+    priority: int = 0
+    owner: str = ""
+    due_date: str = ""
+    board: str = ""
+
+
+class CaptureResearchRequest(BaseModel):
+    topic: str
+    research_area: str = "General"
+    notes: str = ""
+
+
+class CaptureVentureRequest(BaseModel):
+    venture_name: str
+    description: str = ""
+    stage: str = "Research"
+    priority: int = 0
+
+
+class CaptureNoteRequest(BaseModel):
+    title: str
+    content: str = ""
+    destination: str = ""
+
+
+class CaptureIdeaRequest(BaseModel):
+    idea_text: str
+
 
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -248,6 +281,7 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+_FINANCE_SYNC_LOCK = threading.Lock()
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -1015,6 +1049,10 @@ def _apply_main_model_assignment(
         clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
     model_cfg.pop("context_length", None)
     return model_cfg
+
+class PlaidPublicTokenExchangeRequest(BaseModel):
+    public_token: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -11800,6 +11838,86 @@ def _extract_report_file(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
+
+def _capture_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _capture_slug(value: Any, *, fallback: str = "capture") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").casefold()).strip("-")
+    return slug or fallback
+
+
+def _capture_filename(title: str, *, suffix: str = ".md") -> str:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{stamp}-{_capture_slug(title)}{suffix}"
+
+
+def _capture_load_json_list(path: Path, key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not path.exists():
+        return {key: []}, []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid JSON registry at {path}: {exc}") from exc
+    if isinstance(payload, list):
+        return {key: payload}, [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail=f"Registry at {path} must be a JSON object or array")
+    items = payload.get(key, [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=500, detail=f"Registry at {path} must contain a {key} list")
+    return payload, [item for item in items if isinstance(item, dict)]
+
+
+def _capture_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _capture_research_registry_path() -> Path:
+    configured = os.environ.get("HERMES_RESEARCH_REGISTRY_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "research" / "registry.json"
+
+
+def _capture_obsidian_vault_path() -> Path:
+    configured = os.environ.get("HERMES_DASHBOARD_OBSIDIAN_VAULT", "").strip() or os.environ.get("HERMES_OBSIDIAN_VAULT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Sync" / "ObsidianVault"
+
+
+def _capture_safe_vault_destination(vault: Path, destination: str, *, default_folder: str = "Inbox") -> Path:
+    rel = (destination or default_folder).strip().strip("/") or default_folder
+    target = (vault / rel).expanduser().resolve()
+    vault_resolved = vault.expanduser().resolve()
+    if not (target == vault_resolved or target.is_relative_to(vault_resolved)):
+        raise HTTPException(status_code=400, detail="destination must stay inside the Obsidian vault")
+    return target
+
+
+def _capture_note_path(vault: Path, title: str, destination: str = "") -> Path:
+    folder = _capture_safe_vault_destination(vault, destination, default_folder="Inbox")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / _capture_filename(title)
+
+
+def _capture_report_root() -> Path:
+    configured = os.environ.get("HERMES_REPORTS_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "reports"
+
+
+def _capture_generated_research_path(topic: str) -> Path:
+    root = _capture_report_root() / "generated" / "research_capture"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / _capture_filename(topic, suffix=".json")
+
 def _iter_report_roots() -> list[Path]:
     """Return report directories searched by the executive reports API."""
     from hermes_cli import kanban_db
@@ -11910,6 +12028,10 @@ _GENERATED_REPORT_TYPES: dict[str, dict[str, Any]] = {
             "blocked-tasks-review",
             "blocked_tasks_review",
         ),
+    },
+    "research_capture": {
+        "label": "Research Capture",
+        "aliases": ("research capture", "research-capture", "research_capture", "new research"),
     },
 }
 
@@ -12333,6 +12455,8 @@ def _generated_report_missing_envelope(report_type: str) -> dict[str, Any]:
 
 
 def _generated_report_latest_envelope(report_type: str, reports_by_type: Optional[dict[str, list[dict[str, Any]]]] = None) -> dict[str, Any]:
+    if report_type == "venture_portfolio_rank":
+        return _generated_venture_portfolio_rank_envelope()
     reports_by_type = reports_by_type if reports_by_type is not None else _collect_generated_report_files()
     reports = reports_by_type.get(report_type, [])
     if not reports:
@@ -12393,6 +12517,79 @@ async def get_generated_report_history(report_type: str, limit: int = 20):
 
 
 _DEFAULT_OBSIDIAN_VAULT = Path(os.environ.get("HERMES_DASHBOARD_OBSIDIAN_VAULT") or "/home/yuu/Sync/ObsidianVault")
+
+
+def _dashboard_registry_path(env_name: str, relative_path: str) -> Path:
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "dashboard" / relative_path
+
+
+_DEFAULT_CAREER_REGISTRY: dict[str, Any] = {
+    "current_role": "End User Technician",
+    "target_role": "Cloud Engineer",
+    "future_role": "Cloud Architect",
+    "next_milestone": "Complete AWS Solutions Architect Associate study track",
+    "current_priority": "AWS Solutions Architect Associate",
+    "current_blockers": [],
+    "roadmap_progress_percent": 18,
+    "certifications": [
+        {"name": "AWS Solutions Architect Associate", "progress_percent": 15, "target_completion_date": None},
+        {"name": "Terraform Associate", "progress_percent": 0, "target_completion_date": None},
+        {"name": "AZ-900", "progress_percent": 0, "target_completion_date": None},
+        {"name": "Linux+", "progress_percent": 0, "target_completion_date": None},
+        {"name": "Security+", "progress_percent": 0, "target_completion_date": None},
+    ],
+    "skills": [
+        {"name": "AWS", "current_proficiency_percent": 20, "target_proficiency_percent": 80},
+        {"name": "Azure", "current_proficiency_percent": 10, "target_proficiency_percent": 65},
+        {"name": "Terraform", "current_proficiency_percent": 10, "target_proficiency_percent": 75},
+        {"name": "Linux", "current_proficiency_percent": 35, "target_proficiency_percent": 80},
+        {"name": "Python", "current_proficiency_percent": 30, "target_proficiency_percent": 70},
+        {"name": "Security", "current_proficiency_percent": 25, "target_proficiency_percent": 70},
+        {"name": "Networking", "current_proficiency_percent": 30, "target_proficiency_percent": 75},
+        {"name": "System Design", "current_proficiency_percent": 15, "target_proficiency_percent": 70},
+    ],
+}
+
+_DEFAULT_ENGINEERING_BRAND_REGISTRY: dict[str, Any] = {
+    "pipeline": {"Content Ideas": 0, "Research": 0, "Recording": 0, "Editing": 0, "Scheduled": 0, "Published": 0},
+    "upcoming_videos": [],
+    "published_count": 0,
+    "active_projects": [],
+}
+
+_DEFAULT_ARTIST_MANAGEMENT_REGISTRY: dict[str, Any] = {
+    "collectors": 0,
+    "gallery_outreach": 0,
+    "inventory": 0,
+    "active_collections": 0,
+    "upcoming_exhibitions": 0,
+    "revenue": 0,
+}
+
+
+def _load_dashboard_json_registry(env_name: str, relative_path: str, default_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = _dashboard_registry_path(env_name, relative_path)
+    explicit_path = bool(os.environ.get(env_name, "").strip())
+    if not path.exists() and not explicit_path:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            seed = {**default_payload, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            path.write_text(json.dumps(seed, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+    source = {"type": relative_path.rsplit(".", 1)[0].replace("/", "_"), "path": str(path), "configured": path.exists()}
+    if not path.exists():
+        return dict(default_payload), source
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else dict(default_payload), source
+    except (OSError, json.JSONDecodeError) as exc:
+        source["error"] = str(exc)
+        return dict(default_payload), source
+
 
 _DASHBOARD_OBSIDIAN_OPERATING_NOTES: dict[str, dict[str, str]] = {
     "career_progress": {
@@ -12532,14 +12729,241 @@ def _read_dashboard_operating_note(field: str, mapping: dict[str, str]) -> tuple
     return note, None
 
 
+def _registry_progress_metric(label: str, value: Any, detail: str | None = None) -> dict[str, Any]:
+    return {"label": label, "value": _coerce_float(value) if _coerce_float(value) is not None else value, "detail": detail}
+
+
+def _dashboard_career_registry_contract() -> dict[str, Any]:
+    payload, source = _load_dashboard_json_registry("HERMES_CAREER_REGISTRY_PATH", "career_registry.json", _DEFAULT_CAREER_REGISTRY)
+    raw_certifications = payload.get("certifications")
+    certifications = raw_certifications if isinstance(raw_certifications, list) else []
+    raw_skills = payload.get("skills")
+    skills = raw_skills if isinstance(raw_skills, list) else []
+    skill_metrics = [
+        _registry_progress_metric(
+            str(item.get("name") or "Skill"),
+            item.get("current_proficiency_percent", 0),
+            f"Target {item.get('target_proficiency_percent', 0)}%",
+        )
+        for item in skills
+        if isinstance(item, dict)
+    ]
+    certification_metrics = [
+        _registry_progress_metric(
+            str(item.get("name") or "Certification"),
+            item.get("progress_percent", 0),
+            f"Target {item.get('target_completion_date') or 'not scheduled'}",
+        )
+        for item in certifications
+        if isinstance(item, dict)
+    ]
+    return {
+        "status": "available" if source.get("configured") else "unconfigured",
+        "summary": f"{payload.get('current_role')} → {payload.get('target_role')} → {payload.get('future_role')}",
+        "current_role": payload.get("current_role"),
+        "target_role": payload.get("target_role"),
+        "future_role": payload.get("future_role"),
+        "next_milestone": payload.get("next_milestone"),
+        "current_priority": payload.get("current_priority"),
+        "blockers": payload.get("current_blockers") or [],
+        "next_actions": [payload.get("next_milestone")] if payload.get("next_milestone") else [],
+        "priorities": [payload.get("current_priority")] if payload.get("current_priority") else [],
+        "items": skill_metrics,
+        "milestones": [*skill_metrics, *certification_metrics, _registry_progress_metric("Roadmap Progress", payload.get("roadmap_progress_percent", 0))],
+        "certifications": certifications,
+        "skills": skills,
+        "source": source,
+    }
+
+
+def _dashboard_engineering_brand_contract() -> dict[str, Any]:
+    payload, source = _load_dashboard_json_registry("HERMES_ENGINEERING_BRAND_REGISTRY_PATH", "engineering_brand_registry.json", _DEFAULT_ENGINEERING_BRAND_REGISTRY)
+    raw_pipeline = payload.get("pipeline")
+    pipeline = raw_pipeline if isinstance(raw_pipeline, dict) else {}
+    metrics = [_registry_progress_metric(label, value) for label, value in pipeline.items()]
+    return {
+        "status": "available" if source.get("configured") else "unconfigured",
+        "metrics": metrics,
+        "content_pipeline": pipeline,
+        "upcoming_videos": payload.get("upcoming_videos") or [],
+        "published_count": payload.get("published_count") or 0,
+        "active_projects": payload.get("active_projects") or [],
+        "source": source,
+    }
+
+
+def _dashboard_artist_management_contract() -> dict[str, Any]:
+    payload, source = _load_dashboard_json_registry("HERMES_ARTIST_MANAGEMENT_REGISTRY_PATH", "artist_management_registry.json", _DEFAULT_ARTIST_MANAGEMENT_REGISTRY)
+    labels = {
+        "collectors": "Collectors",
+        "gallery_outreach": "Gallery Outreach",
+        "inventory": "Inventory",
+        "active_collections": "Active Collections",
+        "upcoming_exhibitions": "Upcoming Exhibitions",
+        "revenue": "Revenue",
+    }
+    metrics = [_registry_progress_metric(label, payload.get(key, 0)) for key, label in labels.items()]
+    return {
+        "status": "available" if source.get("configured") else "unconfigured",
+        "summary": "Artist management source registry",
+        "items": metrics,
+        "milestones": metrics,
+        "source": source,
+        **payload,
+    }
+
+
+def _dashboard_vault_growth_trend(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, int] = {}
+    for item in notes:
+        updated = int(item.get("updated_at") or 0)
+        if not updated:
+            continue
+        month = time.strftime("%Y-%m", time.localtime(updated))
+        buckets[month] = buckets.get(month, 0) + 1
+    return [{"period": month, "count": count} for month, count in sorted(buckets.items())[-12:]]
+
+
+def _dashboard_knowledge_vault_contract(limit: int = 8) -> dict[str, Any]:
+    vault = _dashboard_obsidian_vault()
+    source = {"type": "obsidian_vault", "path": str(vault), "configured": vault.exists()}
+    if not vault.exists():
+        return {
+            "status": "missing_source",
+            "source": source,
+            "missing_source": str(vault),
+            "initialization_action": "Set HERMES_DASHBOARD_OBSIDIAN_VAULT to an existing Obsidian vault path.",
+            "total_notes": 0,
+            "research_reports": 0,
+            "recent_notes": [],
+            "recent_decisions": [],
+            "referenced_documents": [],
+            "knowledge_health": 0,
+        }
+    notes: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    reference_counts: dict[str, int] = {}
+    for path in vault.rglob("*.md"):
+        try:
+            stat = path.stat()
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        rel = str(path.relative_to(vault)) if path.is_relative_to(vault) else str(path)
+        title = path.stem
+        notes.append({"title": title, "relative_path": rel, "updated_at": int(stat.st_mtime)})
+        if re.search(r"(?im)^#{1,3}\s+(decision|decisions|decision log)\b", raw) or "decision:" in raw.casefold():
+            decisions.append({"title": title, "relative_path": rel, "updated_at": int(stat.st_mtime)})
+        for target in re.findall(r"\[\[([^\]|#]+)", raw):
+            key = target.strip()
+            if key:
+                reference_counts[key] = reference_counts.get(key, 0) + 1
+    recent_notes = sorted(notes, key=lambda item: int(item.get("updated_at") or 0), reverse=True)[:limit]
+    recent_decisions = sorted(decisions, key=lambda item: int(item.get("updated_at") or 0), reverse=True)[:limit]
+    referenced_documents = [
+        {"title": title, "references": count}
+        for title, count in sorted(reference_counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    ]
+    research_reports = sum(1 for item in notes if "research" in str(item.get("relative_path") or "").casefold())
+    health = min(100, int((len(notes) > 0) * 35 + min(len(recent_notes), 5) * 8 + min(len(referenced_documents), 5) * 3 + min(len(recent_decisions), 3) * 3))
+    return {
+        "status": "available",
+        "source": source,
+        "total_notes": len(notes),
+        "research_reports": research_reports,
+        "recent_notes": recent_notes,
+        "recent_decisions": recent_decisions,
+        "referenced_documents": referenced_documents,
+        "knowledge_health": health,
+        "vault_growth_trend": _dashboard_vault_growth_trend(notes),
+    }
+
+
+def _dashboard_finance_trends() -> dict[str, Any]:
+    from hermes_cli.finance_registry import finance_history
+
+    metrics = {
+        "net_worth": "Net Worth",
+        "net_cash_flow": "Monthly Cash Flow",
+        "emergency_fund": "Emergency Fund Progress",
+        "brokerage_value": "Brokerage Growth",
+    }
+    return {
+        key: {"label": label, "points": finance_history(key, limit=90)}
+        for key, label in metrics.items()
+    }
+
+
+def _avg_numeric(values: Iterable[Any]) -> float:
+    nums = [float(value) for value in values if isinstance(value, (int, float))]
+    return sum(nums) / len(nums) if nums else 0.0
+
+
+def _dashboard_health_score(response: dict[str, Any]) -> dict[str, Any]:
+    financial = response.get("financial_metrics") or {}
+    finance_metrics = financial.get("finance_command_center", {}).get("metrics", {}) if isinstance(financial, dict) else {}
+    finance_score = 0 if not finance_metrics else max(0, min(100, 50 + float(finance_metrics.get("savings_rate_percent") or 0) / 2 - max(float(finance_metrics.get("monthly_burn") or 0) - float(finance_metrics.get("monthly_income") or 0), 0) / 100))
+    career = response.get("career_progress") or {}
+    career_values = [item.get("value") for item in (career.get("milestones") or []) if isinstance(item, dict)]
+    career_score = _avg_numeric(career_values)
+    bureau_apps = response.get("bureauos_applications") or []
+    bureau_values = [item.get("progress_percent") if item.get("progress_percent") is not None else item.get("confidence") for item in bureau_apps if isinstance(item, dict)]
+    bureau_score = _avg_numeric(bureau_values)
+    reports = response.get("generated_reports") or {}
+    latest = reports.get("latest", {}) if isinstance(reports, dict) else {}
+    research_score = min(100.0, len([item for item in latest.values() if isinstance(item, dict) and item.get("report")]) * 12.5) if isinstance(latest, dict) else 0.0
+    knowledge = response.get("knowledge_vault") or {}
+    knowledge_score = float(knowledge.get("knowledge_health") or 0) if isinstance(knowledge, dict) else 0
+    brand = response.get("engineering_brand") or {}
+    brand_pipeline = brand.get("content_pipeline") or {} if isinstance(brand, dict) else {}
+    brand_count = sum(float(v or 0) for v in brand_pipeline.values()) if isinstance(brand_pipeline, dict) else 0.0
+    brand_score = min(100.0, brand_count * 10.0 + float(brand.get("published_count") or 0) * 5.0) if isinstance(brand, dict) else 0.0
+    artist = response.get("artist_management") or {}
+    artist_metrics = [item.get("value") for item in (artist.get("milestones") or []) if isinstance(item, dict)]
+    artist_score = min(100.0, _avg_numeric(artist_metrics) * 5.0)
+    operations = response.get("agent_metrics") or {}
+    board_health = response.get("board_health") or {}
+    ops_score = min(100, float(operations.get("sessions") or 0) * 5 + float(board_health.get("total_tasks") or 0) * 2)
+    components = {
+        "finance": round(finance_score, 2),
+        "career": round(career_score, 2),
+        "bureauos": round(bureau_score, 2),
+        "research": round(research_score, 2),
+        "knowledge_vault": round(knowledge_score, 2),
+        "engineering_brand": round(brand_score, 2),
+        "artist_management": round(artist_score, 2),
+        "hermes_operations": round(ops_score, 2),
+    }
+    weights = {key: 0.125 for key in components}
+    score = sum(components[key] * weights[key] for key in weights)
+    return {"score": round(score, 2), "components": components, "weights": weights, "source": {"type": "weighted_source_metrics", "hardcoded": False}}
+
+
 def _dashboard_collect_obsidian_operating_notes() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
-    notes: dict[str, dict[str, Any]] = {}
+    career_registry = _dashboard_career_registry_contract()
+    notes: dict[str, dict[str, Any]] = {"career_progress": career_registry}
     errors: list[dict[str, str]] = []
     for field, mapping in _DASHBOARD_OBSIDIAN_OPERATING_NOTES.items():
         note, error = _read_dashboard_operating_note(field, mapping)
+        if field == "career_progress":
+            if note.get("status") == "unconfigured":
+                note = career_registry
+            else:
+                # Keep Obsidian operating-note narrative while guaranteeing the
+                # source-backed career registry fields/metrics are always present.
+                note = {
+                    **career_registry,
+                    **note,
+                    "items": note.get("items") or career_registry.get("items") or [],
+                    "milestones": career_registry.get("milestones") or note.get("milestones") or [],
+                    "source": {**(note.get("source") or {}), "registry": career_registry.get("source"), "operating_note": note.get("source")},
+                }
+        elif field == "artist_management" and note.get("status") == "unconfigured":
+            note = _dashboard_artist_management_contract()
         notes[field] = note
         if error:
             errors.append(error)
+    notes["engineering_brand"] = _dashboard_engineering_brand_contract()
     return notes, errors
 
 
@@ -12584,6 +13008,26 @@ def _dashboard_empty_contract(
             "alerts": [],
         },
         "portfolio_ventures": [],
+        "venture_registry": {"ventures": [], "source": {"type": "unconfigured"}, "empty_message": "No ventures configured."},
+        "bureauos_applications": [],
+        "bureauos_application_registry": {"applications": [], "source": {"type": "unconfigured"}, "empty_message": "No BureauOS applications configured."},
+        "venture_pipeline": {
+            "stages": [{"stage": stage, "count": 0} for stage in _PIPELINE_STAGES],
+            "items": [],
+            "source": {"type": "unconfigured"},
+            "empty_message": "No ventures configured.",
+        },
+        "executive_brief_source": {
+            "changes_since_last_run": [],
+            "today_priorities": [],
+            "decisions_needed": [],
+            "blockers": [],
+            "risks": [],
+            "next_actions": [],
+            "wins": [],
+            "source": {"type": "derived", "sources": []},
+        },
+        "dashboard_sources": {},
         "portfolio_health": {
             "active_projects": 0,
             "total_projects": 0,
@@ -12591,7 +13035,10 @@ def _dashboard_empty_contract(
             "source": {"type": "unconfigured", "report_type": None},
         },
         "career_progress": {"status": "unconfigured", "items": [], "summary": None},
+        "engineering_brand": {"status": "unconfigured", "metrics": [], "source": {"type": "unconfigured"}},
         "artist_management": {"status": "unconfigured", "items": [], "summary": None},
+        "knowledge_vault": {"status": "unconfigured", "total_notes": 0, "recent_notes": [], "source": {"type": "unconfigured"}},
+        "empire_health": {"score": None, "components": {}, "weights": {}, "source": {"type": "unconfigured"}},
         "engineering_metrics": {
             "completed_tasks": 0,
             "review_required": 0,
@@ -12651,40 +13098,497 @@ def _dashboard_default_board(requested_board: str = "") -> str:
         return ""
 
 
-_REGISTERED_DASHBOARD_VENTURES: tuple[str, ...] = (
-    "BureauOS",
-    "Parlay Analyzer",
-    "Trust Base Social Platform",
-    "Frontend Streaming Platform",
+def _slugify_venture_value(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").casefold()).strip("-")
+
+
+def _venture_registry_path() -> Path:
+    configured = os.environ.get("HERMES_VENTURE_REGISTRY_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "ventures" / "registry.json"
+
+
+_CANONICAL_DASHBOARD_VENTURE_IDS: tuple[str, ...] = (
+    "bureauos",
+    "parlay-analyzer",
+    "trustbase",
+    "frontend-streaming-platform",
+)
+_CANONICAL_DASHBOARD_VENTURE_ALIASES: dict[str, str] = {
+    "bureauos": "bureauos",
+    "bureau-os": "bureauos",
+    "parlay-analyzer": "parlay-analyzer",
+    "parlay-analyser": "parlay-analyzer",
+    "trustbase": "trustbase",
+    "trust-base": "trustbase",
+    "trust-base-social-platform": "trustbase",
+    "trust-base-social": "trustbase",
+    "frontend-streaming-platform": "frontend-streaming-platform",
+    "frontend-streaming": "frontend-streaming-platform",
+}
+_PIPELINE_STAGES: tuple[str, ...] = (
+    "Research",
+    "Validation",
+    "MVP",
+    "Build",
+    "Production",
+    "Paying Clients",
+    "Scale",
 )
 
 
-def _dashboard_registered_ventures(limit: int) -> list[dict[str, Any]]:
-    """Return the explicit Venture Portfolio registry.
+def _canonical_venture_id(value: Any) -> Optional[str]:
+    slug = _slugify_venture_value(value)
+    if not slug:
+        return None
+    return _CANONICAL_DASHBOARD_VENTURE_ALIASES.get(slug)
 
-    Venture Portfolio membership is a product decision, not an inference from
-    board/profile/task/report metadata. Keep this list narrow until a durable
-    venture registry store exists.
+
+def _normalize_dashboard_stage(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "No data available"
+    text_lower = text.casefold()
+    for stage in _PIPELINE_STAGES:
+        if stage.casefold() == text_lower or stage.casefold().split()[0] in text_lower:
+            return stage
+    return text
+
+
+def _load_venture_registry() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the explicit Venture Registry source of truth.
+
+    Venture identity is never inferred from task, board, profile, report, or
+    tenant names. Tasks may only roll up to ventures after matching an explicit
+    registered venture id/name/alias. The executive dashboard venture boundary
+    is intentionally limited to BureauOS, Parlay Analyzer, and TrustBase;
+    offices, profiles, reports, tasks, brands, and RegTech/product ideas are
+    ignored even if they appear in a registry file.
     """
+    path = _venture_registry_path()
+    source = {"type": "venture_registry", "path": str(path), "configured": path.exists()}
+    if not path.exists():
+        return [], source
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        source["error"] = str(exc)
+        return [], source
+    raw_ventures = payload.get("ventures") if isinstance(payload, dict) else payload
+    if not isinstance(raw_ventures, list):
+        source["error"] = "Venture registry must contain a ventures list."
+        return [], source
+    ventures_by_id: dict[str, dict[str, Any]] = {}
+    seen_order: dict[str, int] = {}
+    for index, raw in enumerate(raw_ventures, start=1):
+        if not isinstance(raw, dict):
+            continue
+        raw_values = [raw.get("id"), raw.get("slug"), raw.get("name"), raw.get("title"), *(raw.get("aliases") or [] if isinstance(raw.get("aliases"), list) else [])]
+        canonical_id = next((item for item in (_canonical_venture_id(value) for value in raw_values) if item), None)
+        if canonical_id not in _CANONICAL_DASHBOARD_VENTURE_IDS:
+            continue
+        name = str(raw.get("name") or raw.get("title") or "").strip()
+        if not name:
+            name = {
+                "bureauos": "BureauOS",
+                "parlay-analyzer": "Parlay Analyzer",
+                "trustbase": "Trust Base Social Platform",
+                "frontend-streaming-platform": "Frontend Streaming Platform",
+            }[canonical_id]
+        aliases = [str(alias).strip() for alias in raw.get("aliases", []) if str(alias).strip()] if isinstance(raw.get("aliases"), list) else []
+        if canonical_id == "trustbase" and "Trust Base Social Platform" not in aliases:
+            aliases.append("Trust Base Social Platform")
+        item = {
+            "id": canonical_id,
+            "slug": canonical_id,
+            "name": name,
+            "aliases": aliases,
+            "stage": _normalize_dashboard_stage(raw.get("stage")),
+            "status": raw.get("status") or "No data available",
+            "confidence": _coerce_float(raw.get("confidence")),
+            "momentum": raw.get("momentum"),
+            "risk": raw.get("risk"),
+            "next_milestone": raw.get("next_milestone") or raw.get("milestone"),
+            "decision_needed": raw.get("decision_needed"),
+            "blocking_issue": raw.get("blocking_issue"),
+            "latest_activity": raw.get("latest_activity"),
+            "latest_research": raw.get("latest_research"),
+            "revenue_status": raw.get("revenue_status"),
+            "owner": raw.get("owner"),
+            "updated_at": raw.get("updated_at"),
+            "revenue_usd": _coerce_float(raw.get("revenue_usd") or raw.get("revenue")) or 0,
+            "summary": raw.get("summary") or raw.get("description"),
+            "rank": _coerce_int(raw.get("rank")) or (_CANONICAL_DASHBOARD_VENTURE_IDS.index(canonical_id) + 1),
+            "registry_index": seen_order.setdefault(canonical_id, index),
+            "source": "venture_registry",
+        }
+        ventures_by_id.setdefault(canonical_id, item)
+    ventures = [ventures_by_id[item] for item in _CANONICAL_DASHBOARD_VENTURE_IDS if item in ventures_by_id]
+    source["allowed_ventures"] = list(_CANONICAL_DASHBOARD_VENTURE_IDS)
+    return ventures, source
+
+
+def _bureauos_application_registry_path() -> Path:
+    configured = os.environ.get("HERMES_BUREAUOS_APPLICATION_REGISTRY_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "ventures" / "bureauos_applications.json"
+
+
+_DEFAULT_BUREAUOS_APPLICATIONS: list[dict[str, Any]] = [
+    {"name": "DMV Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 45, "progress_percent": 10, "risk": "Research depth low", "next_milestone": "Complete problem research", "blocking_issue": None, "latest_research": "Initial DMV workflow research required"},
+    {"name": "Veteran Benefits Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 45, "progress_percent": 10, "risk": "Benefits workflow validation pending", "next_milestone": "Complete benefits workflow research", "blocking_issue": None, "latest_research": "VA benefits workflow research required"},
+    {"name": "Insurance Denial Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 40, "progress_percent": 8, "risk": "Appeal-path complexity", "next_milestone": "Map denial appeal workflows", "blocking_issue": None, "latest_research": "Insurance denial appeal workflow mapping required"},
+    {"name": "Tenant Rights Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 40, "progress_percent": 8, "risk": "Jurisdiction variance", "next_milestone": "Map tenant-rights jurisdictions", "blocking_issue": None, "latest_research": "Tenant-rights jurisdiction map required"},
+    {"name": "Small Business Compliance Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 40, "progress_percent": 8, "risk": "Scope breadth", "next_milestone": "Define compliance scope", "blocking_issue": None, "latest_research": "Small-business compliance scope research required"},
+]
+
+def _load_bureauos_application_registry() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    path = _bureauos_application_registry_path()
+    explicit_path = bool(os.environ.get("HERMES_BUREAUOS_APPLICATION_REGISTRY_PATH", "").strip())
+    if not path.exists() and not explicit_path:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"applications": _DEFAULT_BUREAUOS_APPLICATIONS, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+    source = {"type": "bureauos_application_registry", "path": str(path), "configured": path.exists()}
+    if not path.exists():
+        return [], source
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        source["error"] = str(exc)
+        return [], source
+    raw_apps = payload.get("applications") if isinstance(payload, dict) else payload
+    if not isinstance(raw_apps, list):
+        source["error"] = "BureauOS application registry must contain an applications list."
+        return [], source
+    if not explicit_path:
+        existing_slugs = {_slugify_venture_value((item or {}).get("slug") or (item or {}).get("id") or (item or {}).get("name")) for item in raw_apps if isinstance(item, dict)}
+        missing_defaults = [item for item in _DEFAULT_BUREAUOS_APPLICATIONS if _slugify_venture_value(item.get("name")) not in existing_slugs]
+        if missing_defaults:
+            raw_apps = [*raw_apps, *missing_defaults]
+            try:
+                path.write_text(json.dumps({"applications": raw_apps, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2, sort_keys=True), encoding="utf-8")
+                source["backfilled_missing_applications"] = [item["name"] for item in missing_defaults]
+            except OSError as exc:
+                source["backfill_error"] = str(exc)
+    allowed = {
+        "dmv-navigator": "DMV Navigator",
+        "veteran-benefits-navigator": "Veteran Benefits Navigator",
+        "insurance-denial-navigator": "Insurance Denial Navigator",
+        "tenant-rights-navigator": "Tenant Rights Navigator",
+        "small-business-compliance-navigator": "Small Business Compliance Navigator",
+    }
+    apps_by_slug: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(raw_apps, start=1):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or raw.get("title") or "").strip()
+        slug = _slugify_venture_value(raw.get("slug") or raw.get("id") or name)
+        if slug not in allowed:
+            continue
+        parent = str(raw.get("parent_venture") or raw.get("venture") or "BureauOS").strip()
+        if _canonical_venture_id(parent) != "bureauos":
+            continue
+        apps_by_slug.setdefault(slug, {
+            "id": slug,
+            "name": name or allowed[slug],
+            "parent_venture": "BureauOS",
+            "stage": _normalize_dashboard_stage(raw.get("stage")),
+            "confidence": _coerce_float(raw.get("confidence")),
+            "progress_percent": _coerce_float(raw.get("progress_percent") or raw.get("progress")),
+            "risk": raw.get("risk"),
+            "next_action": raw.get("next_action"),
+            "next_milestone": raw.get("next_milestone"),
+            "latest_research": raw.get("latest_research"),
+            "blocking_issue": raw.get("blocking_issue"),
+            "last_activity": raw.get("last_activity") or raw.get("latest_activity"),
+            "updated_at": raw.get("updated_at"),
+            "rank": _coerce_int(raw.get("rank")) or index,
+            "source": "bureauos_application_registry",
+        })
+    apps = [apps_by_slug[slug] for slug in allowed if slug in apps_by_slug]
+    source["allowed_applications"] = list(allowed)
+    return apps, source
+
+
+def _dashboard_venture_pipeline(ventures: list[dict[str, Any]], source: dict[str, Any]) -> dict[str, Any]:
+    counts = {stage: 0 for stage in _PIPELINE_STAGES}
+    items: list[dict[str, Any]] = []
+    for venture in ventures:
+        stage = _normalize_dashboard_stage(venture.get("stage"))
+        if stage in counts:
+            counts[stage] += 1
+        items.append({
+            "venture_id": venture.get("id"),
+            "name": venture.get("name") or venture.get("project"),
+            "stage": stage,
+            "status": venture.get("status"),
+        })
+    return {
+        "stages": [{"stage": stage, "count": counts[stage]} for stage in _PIPELINE_STAGES],
+        "items": items,
+        "source": {**source, "type": "stage_rollup"},
+        "empty_message": None if items else "No ventures configured.",
+    }
+
+
+def _dashboard_source_objects(
+    *,
+    ventures: list[dict[str, Any]],
+    venture_source: dict[str, Any],
+    bureauos_apps: list[dict[str, Any]],
+    bureauos_source: dict[str, Any],
+    executive_brief: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "venture_registry": {
+            "ventures": ventures,
+            "source": venture_source,
+            "empty_message": None if ventures else "No ventures configured.",
+        },
+        "bureauos_application_registry": {
+            "applications": bureauos_apps,
+            "source": bureauos_source,
+            "empty_message": None if bureauos_apps else "No BureauOS applications configured.",
+        },
+        "venture_pipeline": _dashboard_venture_pipeline(bureauos_apps, bureauos_source),
+        "executive_brief": executive_brief,
+    }
+
+
+def _dashboard_executive_brief_source(
+    *,
+    top_priorities: list[dict[str, Any]],
+    blocked_tasks: list[dict[str, Any]],
+    review_required: list[dict[str, Any]],
+    completed_tasks: list[dict[str, Any]],
+    ventures: list[dict[str, Any]],
+    bureauos_apps: list[dict[str, Any]],
+    report_files: list[dict[str, Any]],
+    watchdog: dict[str, Any],
+    limit: int,
+) -> dict[str, Any]:
+    decisions = []
+    for task in review_required[:limit]:
+        decisions.append({"title": task.get("title"), "owner": task.get("assignee"), "source": "kanban", "task_id": task.get("id")})
+    for venture in ventures:
+        if venture.get("decision_needed"):
+            decisions.append({"title": venture.get("decision_needed"), "owner": venture.get("owner"), "source": "venture_registry", "venture_id": venture.get("id")})
+    blockers = []
+    for task in blocked_tasks[:limit]:
+        blockers.append({"title": task.get("title"), "owner": task.get("assignee"), "source": "kanban", "task_id": task.get("id"), "recommended_action": task.get("summary") or None})
+    for item in [*ventures, *bureauos_apps]:
+        if item.get("blocking_issue"):
+            blockers.append({"title": item.get("blocking_issue"), "owner": item.get("owner"), "source": item.get("source"), "venture_id": item.get("id")})
+    risks = []
+    for item in [*ventures, *bureauos_apps]:
+        if item.get("risk"):
+            risks.append({"title": item.get("risk"), "source": item.get("source"), "venture_id": item.get("id")})
+    next_actions = []
+    for task in top_priorities[:limit]:
+        next_actions.append({"title": task.get("title"), "owner": task.get("assignee"), "source": "kanban", "task_id": task.get("id")})
+    for item in [*ventures, *bureauos_apps]:
+        action = item.get("next_action") or item.get("next_milestone")
+        if action:
+            next_actions.append({"title": action, "source": item.get("source"), "venture_id": item.get("id")})
+    return {
+        "changes_since_last_run": [{"title": item.get("title"), "source": "reports", "updated_at": item.get("updated_at")} for item in report_files[:limit]],
+        "today_priorities": top_priorities[:limit],
+        "decisions_needed": decisions[:limit],
+        "blockers": blockers[:limit],
+        "risks": risks[:limit],
+        "next_actions": next_actions[:limit],
+        "wins": completed_tasks[:limit],
+        "source": {
+            "type": "derived",
+            "sources": ["kanban", "reports", "notifications", "venture_registry", "bureauos_application_registry"],
+            "empty_states_are_honest": True,
+        },
+        "watchdog_status": watchdog.get("status"),
+    }
+
+
+def _venture_registry_match_values(venture: dict[str, Any]) -> set[str]:
+    values = {venture.get("id"), venture.get("slug"), venture.get("name"), *(venture.get("aliases") or [])}
+    normalized: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalized.add(text.casefold())
+        normalized.add(_slugify_venture_value(text))
+    return {item for item in normalized if item}
+
+
+def _task_attached_venture_key(row: dict[str, Any], registry_matches: dict[str, str]) -> Optional[str]:
+    explicit_fields = [row.get("tenant"), row.get("session_id")]
+    body = str(row.get("body") or "")
+    for match in re.findall(r"(?im)^\s*venture\s*:\s*([^\n]+)\s*$", body):
+        explicit_fields.insert(0, match.strip())
+    for value in explicit_fields:
+        candidates = {str(value or "").strip().casefold(), _slugify_venture_value(value)}
+        for candidate in candidates:
+            if candidate and candidate in registry_matches:
+                return registry_matches[candidate]
+    return None
+
+
+def _dashboard_registered_ventures(limit: int, tasks: Optional[list[dict[str, Any]]] = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    registry, source = _load_venture_registry()
     now = int(time.time())
+    if not registry:
+        return [], source
+    registry_matches: dict[str, str] = {}
+    for venture in registry:
+        for value in _venture_registry_match_values(venture):
+            registry_matches[value] = venture["slug"]
+    rollups: dict[str, dict[str, Any]] = {
+        venture["slug"]: {
+            "active_tasks": 0,
+            "blocked_tasks": 0,
+            "review_required": 0,
+            "completed_tasks": 0,
+            "latest_activity_at": 0,
+        }
+        for venture in registry
+    }
+    active_statuses = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
+    for task in tasks or []:
+        venture_key = _task_attached_venture_key(task, registry_matches)
+        if not venture_key or venture_key not in rollups:
+            continue
+        bucket = rollups[venture_key]
+        status = str(task.get("status") or "").casefold()
+        if status in active_statuses:
+            bucket["active_tasks"] += 1
+        if status == "blocked":
+            bucket["blocked_tasks"] += 1
+        if status == "review" or _dashboard_is_review_required(task):
+            bucket["review_required"] += 1
+        if status == "done":
+            bucket["completed_tasks"] += 1
+        activity_at = int(task.get("completed_at") or task.get("started_at") or task.get("created_at") or 0)
+        bucket["latest_activity_at"] = max(int(bucket["latest_activity_at"] or 0), activity_at)
     ventures: list[dict[str, Any]] = []
-    for index, name in enumerate(_REGISTERED_DASHBOARD_VENTURES[:limit], start=1):
+    for index, venture in enumerate(sorted(registry, key=lambda item: (int(item.get("rank") or item.get("registry_index") or 0), int(item.get("registry_index") or 0)))[:limit], start=1):
+        metrics = rollups.get(venture["slug"], {})
+        confidence = venture.get("confidence")
+        blocked = int(metrics.get("blocked_tasks") or 0)
+        active = int(metrics.get("active_tasks") or 0)
+        score = (float(confidence) if confidence is not None else 50.0) + (active * 3) - (blocked * 10)
         ventures.append(
             {
-                "project": name,
+                "id": venture["id"],
+                "slug": venture["slug"],
+                "project": venture["name"],
+                "name": venture["name"],
                 "rank": index,
-                "status": "registered",
-                "recommendation": None,
-                "summary": None,
-                "active_tasks": 0,
-                "blocked_tasks": 0,
-                "review_required": 0,
-                "completed_tasks": 0,
-                "latest_activity_at": now,
+                "status": venture.get("status") or "No data available",
+                "stage": venture.get("stage"),
+                "confidence": confidence,
+                "momentum": venture.get("momentum"),
+                "risk": venture.get("risk"),
+                "score": round(score, 2),
+                "revenue_usd": venture.get("revenue_usd") or 0,
+                "next_milestone": venture.get("next_milestone"),
+                "decision_needed": venture.get("decision_needed"),
+                "blocking_issue": venture.get("blocking_issue"),
+                "latest_activity": venture.get("latest_activity"),
+                "latest_research": venture.get("latest_research"),
+                "revenue_status": venture.get("revenue_status"),
+                "owner": venture.get("owner"),
+                "updated_at": venture.get("updated_at"),
+                "recommendation": venture.get("next_milestone"),
+                "summary": venture.get("summary"),
+                "active_tasks": active,
+                "blocked_tasks": blocked,
+                "review_required": int(metrics.get("review_required") or 0),
+                "completed_tasks": int(metrics.get("completed_tasks") or 0),
+                "latest_activity_at": int(metrics.get("latest_activity_at") or 0) or now,
                 "source": "registered_venture",
             }
         )
-    return ventures
+    return ventures, source
+
+
+def _generated_venture_portfolio_rank_envelope() -> dict[str, Any]:
+    label = _GENERATED_REPORT_TYPES["venture_portfolio_rank"]["label"]
+    errors: list[dict[str, str]] = []
+    effective_board = _dashboard_default_board("")
+    cutoff = int(time.time() - 365 * 86400)
+    tasks, _, kanban_errors = _dashboard_collect_kanban(
+        board=effective_board,
+        profile="",
+        project="",
+        q="",
+        cutoff=cutoff,
+        limit=100,
+    )
+    errors.extend(kanban_errors)
+    ventures, source = _dashboard_registered_ventures(100, tasks)
+    if not ventures:
+        return {
+            "type": "venture_portfolio_rank",
+            "type_label": label,
+            "status": "missing",
+            "report": None,
+            "error": "No ventures configured.",
+        }
+    ranked = []
+    for venture in ventures:
+        ranked.append(
+            {
+                "rank": venture.get("rank"),
+                "id": venture.get("id"),
+                "slug": venture.get("slug"),
+                "name": venture.get("project"),
+                "stage": venture.get("stage"),
+                "status": venture.get("status"),
+                "confidence": venture.get("confidence"),
+                "score": venture.get("score"),
+                "revenue_usd": venture.get("revenue_usd"),
+                "next_milestone": venture.get("next_milestone"),
+                "active_tasks": venture.get("active_tasks") or 0,
+                "blocked_tasks": venture.get("blocked_tasks") or 0,
+                "review_required": venture.get("review_required") or 0,
+                "completed_tasks": venture.get("completed_tasks") or 0,
+            }
+        )
+    content_lines = ["# Venture Portfolio Rank", "", "Source: Venture Registry", ""]
+    for item in ranked:
+        content_lines.append(
+            f"{item['rank']}. {item['name']} — score {item['score']} · {item.get('stage') or 'Registered'}"
+        )
+    report = {
+        "id": "venture-registry:venture_portfolio_rank",
+        "type": "venture_portfolio_rank",
+        "type_label": label,
+        "title": label,
+        "status": "available",
+        "path": None,
+        "relative_path": None,
+        "project": "venture_registry",
+        "updated_at": int(time.time()),
+        "generated_at": int(time.time()),
+        "content_type": "application/json",
+        "content": "\n".join(content_lines),
+        "telegram_content": "\n".join(content_lines),
+        "excerpt": "Venture Portfolio Rank generated from the explicit Venture Registry.",
+        "source": {**source, "type": "venture_registry"},
+        "ventures": ranked,
+        "errors": errors,
+    }
+    return {
+        "type": "venture_portfolio_rank",
+        "type_label": label,
+        "status": "available",
+        "report": report,
+        "error": None,
+    }
 
 
 def _dashboard_is_review_required(row: dict[str, Any]) -> bool:
@@ -12850,6 +13754,316 @@ def _dashboard_collect_session_metrics(days: int) -> tuple[dict[str, Any], list[
         return empty, errors
 
 
+
+@app.post("/api/capture/task")
+async def capture_task(body: CaptureTaskRequest):
+    from hermes_cli import kanban_db
+
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    board = body.board.strip() or None
+    kanban_db.init_db(board=board)
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=title,
+            body=(body.description.strip() + "\n\nreview-required: true").strip(),
+            assignee=body.owner.strip() or None,
+            created_by="dashboard_quick_capture",
+            priority=int(body.priority or 0),
+            workspace_kind="dir",
+            initial_status="running",
+            board=board,
+        )
+        if body.due_date.strip():
+            kanban_db.add_comment(conn, task_id, "dashboard_quick_capture", f"Due Date: {body.due_date.strip()}")
+    finally:
+        conn.close()
+    return {"success": True, "source_written": True, "id": task_id, "source": {"type": "kanban", "board": board or "default"}}
+
+
+@app.post("/api/capture/research")
+async def capture_research(body: CaptureResearchRequest):
+    topic = body.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+    now = _capture_now_iso()
+    entry = {
+        "id": f"research-{int(time.time())}-{secrets.token_hex(4)}",
+        "topic": topic,
+        "research_area": body.research_area.strip() or "General",
+        "notes": body.notes.strip(),
+        "created_at": now,
+        "updated_at": now,
+        "source": "dashboard_quick_capture",
+    }
+    registry_path = _capture_research_registry_path()
+    payload, items = _capture_load_json_list(registry_path, "research")
+    payload["research"] = [*items, entry]
+    payload["last_updated"] = now
+    _capture_write_json(registry_path, payload)
+
+    report_path = _capture_generated_research_path(topic)
+    report_payload = {
+        "type": "research_capture",
+        "title": topic,
+        "status": "available",
+        "generated_at": int(time.time()),
+        "summary": body.notes.strip(),
+        "research_area": entry["research_area"],
+        "source_registry": str(registry_path),
+    }
+    _capture_write_json(report_path, report_payload)
+    return {"success": True, "source_written": True, "id": entry["id"], "source": {"type": "research_registry", "path": str(registry_path), "report_path": str(report_path)}}
+
+
+@app.post("/api/capture/venture")
+async def capture_venture(body: CaptureVentureRequest):
+    name = body.venture_name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="venture_name is required")
+    now = _capture_now_iso()
+    path = _venture_registry_path()
+    payload, ventures = _capture_load_json_list(path, "ventures")
+    venture_id = _capture_slug(name)
+    entry = {
+        "id": venture_id,
+        "slug": venture_id,
+        "name": name,
+        "description": body.description.strip(),
+        "summary": body.description.strip(),
+        "stage": _normalize_dashboard_stage(body.stage),
+        "priority": int(body.priority or 0),
+        "status": "Captured",
+        "latest_activity": "Captured from dashboard Quick Capture",
+        "updated_at": now,
+        "source": "dashboard_quick_capture",
+    }
+    replaced = False
+    merged: list[dict[str, Any]] = []
+    for item in ventures:
+        existing_id = str(item.get("id") or item.get("slug") or _capture_slug(item.get("name")))
+        if existing_id == venture_id:
+            merged.append({**item, **entry})
+            replaced = True
+        else:
+            merged.append(item)
+    if not replaced:
+        merged.append(entry)
+    payload["ventures"] = merged
+    payload["last_updated"] = now
+    _capture_write_json(path, payload)
+    return {"success": True, "source_written": True, "id": venture_id, "source": {"type": "venture_registry", "path": str(path)}}
+
+
+@app.post("/api/capture/note")
+async def capture_note(body: CaptureNoteRequest):
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    vault = _capture_obsidian_vault_path()
+    if not vault.exists():
+        vault.mkdir(parents=True, exist_ok=True)
+    path = _capture_note_path(vault, title, body.destination)
+    now = _capture_now_iso()
+    content = body.content.strip()
+    text = f"---\ntitle: {title}\ncreated_at: {now}\nsource: dashboard_quick_capture\n---\n\n# {title}\n\n{content}\n"
+    path.write_text(text, encoding="utf-8")
+    return {"success": True, "source_written": True, "source": {"type": "obsidian_note", "path": str(path), "vault": str(vault)}}
+
+
+@app.post("/api/capture/idea")
+async def capture_idea(body: CaptureIdeaRequest):
+    idea = body.idea_text.strip()
+    if not idea:
+        raise HTTPException(status_code=400, detail="idea_text is required")
+    vault = _capture_obsidian_vault_path()
+    vault.mkdir(parents=True, exist_ok=True)
+    inbox = vault / "Inbox.md"
+    timestamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    prefix = "" if not inbox.exists() or not inbox.read_text(encoding="utf-8").strip() else "\n\n"
+    with inbox.open("a", encoding="utf-8") as fh:
+        fh.write(f"{prefix}## {timestamp}\n\n{idea}\n")
+    return {"success": True, "source_written": True, "source": {"type": "obsidian_inbox", "path": str(inbox), "vault": str(vault)}}
+
+
+@app.get("/api/finance")
+async def get_finance_registry():
+    """Return the source-backed Finance Command Center contract."""
+    from hermes_cli.finance_registry import finance_command_center_contract
+
+    return finance_command_center_contract()
+
+
+@app.get("/api/finance/widgets")
+async def get_finance_widgets():
+    """Return source-backed finance widgets consumed by the dashboard."""
+    from hermes_cli.finance_registry import finance_command_center_contract
+
+    contract = finance_command_center_contract()
+    return {
+        "initialized": contract["initialized"],
+        "empty_message": contract.get("empty_message"),
+        "setup_action": contract.get("setup_action"),
+        "source": contract.get("source"),
+        "widgets": contract.get("widgets", []),
+    }
+
+
+@app.get("/api/finance/trends/{metric}")
+async def get_finance_trend(metric: str, limit: int = 90):
+    """Return timeline data for a finance metric."""
+    from hermes_cli.finance_registry import FINANCE_EMPTY_MESSAGE, TREND_METRICS, finance_history, finance_registry_path
+
+    if metric not in TREND_METRICS:
+        raise HTTPException(status_code=404, detail=f"Unknown finance trend metric: {metric}")
+    points = finance_history(metric, limit=limit)
+    return {
+        "metric": metric,
+        "points": points,
+        "initialized": bool(points),
+        "empty_message": None if points else FINANCE_EMPTY_MESSAGE,
+        "setup_action": None if points else {"label": "Initialize finance source", "method": "POST", "endpoint": "/api/finance/seed-defaults"},
+        "source": {"type": "finance_registry", "configured": bool(points), "path": str(finance_registry_path())},
+    }
+
+
+@app.post("/api/finance/snapshots")
+async def create_finance_snapshot(payload: dict[str, Any]):
+    """Insert a manual finance snapshot and return the recalculated contract."""
+    from hermes_cli.finance_registry import finance_command_center_contract, insert_finance_snapshot
+
+    insert_finance_snapshot(payload)
+    return finance_command_center_contract()
+
+
+@app.post("/api/finance/seed-defaults")
+async def seed_finance_defaults():
+    """Seed the finance registry with the approved initial manual values."""
+    from hermes_cli.finance_registry import finance_command_center_contract, seed_default_finance_registry
+
+    seed_default_finance_registry()
+    return finance_command_center_contract()
+
+
+def _friendly_finance_sync_error(exc: Exception) -> tuple[int, str, str]:
+    """Map provider/registry exceptions to safe operator-facing messages."""
+    from hermes_cli.plaid_connector import PlaidConfigurationError, PlaidSecurityError
+
+    text = str(exc).lower()
+    if isinstance(exc, PlaidConfigurationError):
+        if "access token" in text:
+            return 409, "no_access_token", "Reconnect financial institution."
+        return 400, "configuration_missing", "Plaid credentials missing."
+    if isinstance(exc, PlaidSecurityError):
+        return 400, "configuration_missing", "Plaid credentials missing."
+    if "database is locked" in text or "database locked" in text:
+        return 423, "registry_locked", "Try again shortly."
+    if "timeout" in text or "timed out" in text:
+        return 504, "network_timeout", "Retry later."
+    return 500, "sync_failed", "Sync Failed"
+
+
+@app.post("/api/finance/plaid/link-token")
+async def create_finance_plaid_link_token():
+    """Create a Plaid Link token for the Finance Command Center.
+
+    The frontend receives only the short-lived Link token. Plaid client_id,
+    secret, public tokens, and access tokens are never returned by this endpoint.
+    """
+    try:
+        from hermes_cli.plaid_connector import PlaidConnector
+
+        connector = PlaidConnector()
+        result = connector.create_link_token()
+        return {
+            "success": True,
+            "link_token": result.get("link_token"),
+            "expiration": result.get("expiration"),
+            "request_id": result.get("request_id"),
+            "environment": connector.config.environment.capitalize(),
+        }
+    except Exception as exc:
+        status_code, code, message = _friendly_finance_sync_error(exc)
+        _log.debug("Plaid Link token creation failed: %s", exc)
+        raise HTTPException(status_code=status_code, detail={"code": code, "message": message}) from exc
+
+
+@app.post("/api/finance/plaid/exchange-public-token")
+async def exchange_finance_plaid_public_token(payload: PlaidPublicTokenExchangeRequest):
+    """Exchange a Plaid public_token, store only encrypted access token, and refresh finance metrics."""
+    if not payload.public_token or not payload.public_token.strip():
+        raise HTTPException(status_code=400, detail={"code": "public_token_required", "message": "Plaid public token is required."})
+    if not _FINANCE_SYNC_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail={"code": "sync_running", "message": "Sync already in progress."})
+    try:
+        from hermes_cli.finance_registry import dashboard_financial_metrics, finance_command_center_contract, latest_finance_sync_status
+        from hermes_cli.plaid_connector import PlaidConnector
+
+        connector = PlaidConnector()
+        exchange = connector.exchange_public_token(payload.public_token, metadata=payload.metadata)
+        sync_result = connector.sync_to_finance_registry()
+        finance = dashboard_financial_metrics()
+        return {
+            "success": True,
+            "status": "success",
+            "message": "Bank connected and synced successfully.",
+            "exchange": exchange,
+            "sync": latest_finance_sync_status(),
+            "result": sync_result,
+            "finance_command_center": finance_command_center_contract(),
+            "financial_metrics": finance,
+        }
+    except Exception as exc:
+        status_code, code, message = _friendly_finance_sync_error(exc)
+        _log.debug("Plaid public token exchange failed: %s", exc)
+        raise HTTPException(status_code=status_code, detail={"code": code, "message": message}) from exc
+    finally:
+        _FINANCE_SYNC_LOCK.release()
+
+
+@app.post("/api/dashboard/v2/finance/sync")
+async def sync_dashboard_finance_registry():
+    """Run Plaid -> Finance Registry sync, then return refreshed dashboard finance state.
+
+    The dashboard never calls Plaid directly; this endpoint reuses the existing
+    PlaidConnector.sync_to_finance_registry ingestion path and returns registry-
+    derived dashboard data.
+    """
+    if not _FINANCE_SYNC_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail={"code": "sync_running", "message": "Sync already in progress."})
+    try:
+        from hermes_cli.finance_registry import dashboard_financial_metrics, finance_command_center_contract, latest_finance_sync_status
+        from hermes_cli.plaid_connector import PlaidConnector
+
+        result = PlaidConnector().sync_to_finance_registry()
+        finance = dashboard_financial_metrics()
+        return {
+            "success": True,
+            "status": "success",
+            "message": "Synced Successfully",
+            "sync": latest_finance_sync_status(),
+            "result": result,
+            "finance_command_center": finance_command_center_contract(),
+            "financial_metrics": finance,
+        }
+    except Exception as exc:
+        status_code, code, message = _friendly_finance_sync_error(exc)
+        _log.debug("dashboard finance sync failed: %s", exc)
+        raise HTTPException(status_code=status_code, detail={"code": code, "message": message}) from exc
+    finally:
+        _FINANCE_SYNC_LOCK.release()
+
+
+@app.get("/api/dashboard/v2/finance/sync")
+async def get_dashboard_finance_sync_status():
+    from hermes_cli.finance_registry import latest_finance_sync_status
+
+    return latest_finance_sync_status()
+
+
 @app.get("/api/dashboard/v2")
 async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", project: str = "", q: str = "", limit: int = 20):
     """Executive Dashboard v2 summary API.
@@ -12866,6 +14080,7 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
     response = _dashboard_empty_contract(days=days, board=effective_board, profile=profile, project=project, q=q)
     operating_notes, operating_note_errors = _dashboard_collect_obsidian_operating_notes()
     response.update(operating_notes)
+    response["knowledge_vault"] = _dashboard_knowledge_vault_contract(limit=limit)
     errors.extend(operating_note_errors)
     cutoff = int(time.time() - days * 86400)
 
@@ -12934,18 +14149,35 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
             tests_reported += int(metadata.get("tests_run") or 0)
         except Exception:
             pass
-    portfolio_ventures = _dashboard_registered_ventures(limit)
+    portfolio_ventures, portfolio_source = _dashboard_registered_ventures(limit, tasks)
+    bureauos_applications, bureauos_application_source = _load_bureauos_application_registry()
     response["portfolio_ventures"] = portfolio_ventures
+    response["venture_registry"] = {
+        "ventures": portfolio_ventures,
+        "source": portfolio_source,
+        "empty_message": None if portfolio_ventures else "No ventures configured.",
+    }
+    response["bureauos_applications"] = bureauos_applications
+    response["bureauos_application_registry"] = {
+        "applications": bureauos_applications,
+        "source": bureauos_application_source,
+        "empty_message": None if bureauos_applications else "No BureauOS applications configured.",
+    }
+    response["venture_pipeline"] = _dashboard_venture_pipeline(bureauos_applications, bureauos_application_source)
     response["portfolio_health"] = {
         "active_projects": len(portfolio_ventures),
         "total_projects": len(portfolio_ventures),
         "projects": portfolio_ventures,
+        "empty_message": None if portfolio_ventures else "No ventures configured.",
         "source": {
-            "type": "registered_ventures",
+            **portfolio_source,
+            "type": "registered_ventures" if portfolio_ventures else "venture_registry",
             "report_type": None,
         },
     }
+    engineering_brand = response.get("engineering_brand") or {}
     response["engineering_metrics"] = {
+        "metrics": engineering_brand.get("metrics", []) if isinstance(engineering_brand, dict) else [],
         "completed_tasks": len(completed_tasks),
         "review_required": len(review_required),
         "blocked_tasks": len(blocked_tasks),
@@ -12962,15 +14194,31 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
         "tool_calls": int(session_metrics["totals"].get("tool_calls") or 0),
         "messages": int(session_metrics["totals"].get("messages") or 0),
     }
-    response["financial_metrics"] = {
-        "ai_usage_cost_usd": {
-            "estimated": session_metrics["totals"].get("estimated_cost") or 0,
-            "actual": session_metrics["totals"].get("actual_cost") or 0,
-        },
-        "revenue_usd": None,
-        "burn_usd": None,
-        "notes": "Business financial sources are not configured; AI usage costs come from session analytics.",
-    }
+    try:
+        from hermes_cli.finance_registry import dashboard_financial_metrics
+
+        response["financial_metrics"] = dashboard_financial_metrics(
+            ai_usage_cost_usd={
+                "estimated": session_metrics["totals"].get("estimated_cost") or 0,
+                "actual": session_metrics["totals"].get("actual_cost") or 0,
+            }
+        )
+        response["financial_metrics"]["trends"] = _dashboard_finance_trends()
+    except Exception as exc:
+        _log.debug("dashboard v2 finance registry failed: %s", exc)
+        errors.append({"source": "finance_registry", "message": str(exc)})
+        response["financial_metrics"] = {
+            "metrics": [],
+            "widgets": [],
+            "ai_usage_cost_usd": {
+                "estimated": session_metrics["totals"].get("estimated_cost") or 0,
+                "actual": session_metrics["totals"].get("actual_cost") or 0,
+            },
+            "revenue_usd": None,
+            "burn_usd": None,
+            "notes": ["Finance registry unavailable; run POST /api/finance/seed-defaults and inspect finance registry path."],
+            "source": {"type": "finance_registry", "configured": False},
+        }
 
     try:
         report_files = _collect_report_files(limit=limit)
@@ -12983,6 +14231,43 @@ async def get_dashboard_v2(days: int = 7, board: str = "", profile: str = "", pr
         errors.append({"source": "reports", "message": str(exc)})
         report_files = []
     response["weekly_reports"] = {"latest": report_files[:limit], "count": len(report_files)}
+    executive_brief_source = _dashboard_executive_brief_source(
+        top_priorities=top_priorities,
+        blocked_tasks=blocked_tasks,
+        review_required=review_required,
+        completed_tasks=completed_tasks,
+        ventures=portfolio_ventures,
+        bureauos_apps=bureauos_applications,
+        report_files=report_files,
+        watchdog=response.get("notification_watchdog") or {},
+        limit=limit,
+    )
+    response["executive_brief_source"] = executive_brief_source
+    response["executive_briefing"].update({
+        "changes_since_last_run": executive_brief_source["changes_since_last_run"],
+        "today_priorities": executive_brief_source["today_priorities"],
+        "decisions_needed": executive_brief_source["decisions_needed"],
+        "blockers": executive_brief_source["blockers"],
+        "risks": executive_brief_source["risks"],
+        "next_actions": executive_brief_source["next_actions"],
+        "wins": executive_brief_source["wins"],
+        "source": executive_brief_source["source"],
+    })
+    response["dashboard_sources"] = _dashboard_source_objects(
+        ventures=portfolio_ventures,
+        venture_source=portfolio_source,
+        bureauos_apps=bureauos_applications,
+        bureauos_source=bureauos_application_source,
+        executive_brief=executive_brief_source,
+    )
+    response["dashboard_sources"].update({
+        "finance_registry": (response.get("financial_metrics") or {}).get("finance_command_center"),
+        "career_registry": response.get("career_progress"),
+        "knowledge_vault": response.get("knowledge_vault"),
+        "engineering_brand_registry": response.get("engineering_brand"),
+        "artist_management_registry": response.get("artist_management"),
+    })
+    response["empire_health"] = _dashboard_health_score(response)
     response["generated_reports"] = generated_reports
     response["errors"] = errors
     return response

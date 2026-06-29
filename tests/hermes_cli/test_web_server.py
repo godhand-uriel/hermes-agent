@@ -1475,6 +1475,21 @@ class TestWebServerEndpoints:
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
         monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        venture_registry = tmp_path / "venture_registry.json"
+        venture_registry.write_text(
+            json.dumps(
+                {
+                    "ventures": [
+                        {"name": "BureauOS"},
+                        {"name": "Parlay Analyzer"},
+                        {"name": "Trust Base Social Platform"},
+                        {"name": "Frontend Streaming Platform"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(venture_registry))
         kanban_db.create_board("command-center-board")
         with kanban_db.connect_closing(board="command-center-board") as conn:
             kanban_db.create_task(
@@ -1658,6 +1673,21 @@ class TestWebServerEndpoints:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
+        venture_registry = tmp_path / "venture_registry_summary.json"
+        venture_registry.write_text(
+            json.dumps(
+                {
+                    "ventures": [
+                        {"name": "BureauOS"},
+                        {"name": "Parlay Analyzer"},
+                        {"name": "Trust Base Social Platform"},
+                        {"name": "Frontend Streaming Platform"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(venture_registry))
         (reports_dir / "weekly-report.md").write_text(
             "# Weekly Report\n\nProject: Hermes dashboard\n\nDeployment status: healthy\n",
             encoding="utf-8",
@@ -1721,8 +1751,12 @@ class TestWebServerEndpoints:
         assert data["engineering_metrics"]["completed_tasks"] == 1
         assert data["financial_metrics"]["ai_usage_cost_usd"]["estimated"] == 0.42
         assert data["weekly_reports"]["latest"][0]["title"] == "Weekly Report"
-        assert data["career_progress"] == {"status": "unconfigured", "items": [], "summary": None}
-        assert data["artist_management"] == {"status": "unconfigured", "items": [], "summary": None}
+        assert data["career_progress"]["status"] == "available"
+        assert data["career_progress"]["summary"] == "End User Technician → Cloud Engineer → Cloud Architect"
+        assert data["career_progress"]["items"]
+        assert data["artist_management"]["status"] == "available"
+        assert data["artist_management"]["summary"] == "Artist management source registry"
+        assert data["artist_management"]["items"]
         assert [item["project"] for item in data["portfolio_ventures"]] == [
             "BureauOS",
             "Parlay Analyzer",
@@ -1741,12 +1775,8 @@ class TestWebServerEndpoints:
             "blocked_tasks": 0,
             "review_required": 0,
         }
-        assert empty_data["executive_briefing"] == {
-            "top_priorities": [],
-            "blocked_tasks": [],
-            "review_required_tasks": [],
-            "completed_tasks": [],
-        }
+        for key in ("top_priorities", "blocked_tasks", "review_required_tasks", "completed_tasks"):
+            assert empty_data["executive_briefing"][key] == []
 
     def test_dashboard_v2_reads_obsidian_operating_notes(self, tmp_path, monkeypatch):
         vault = tmp_path / "vault"
@@ -1818,12 +1848,8 @@ class TestWebServerEndpoints:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["executive_briefing"] == {
-            "top_priorities": [],
-            "blocked_tasks": [],
-            "review_required_tasks": [],
-            "completed_tasks": [],
-        }
+        for key in ("top_priorities", "blocked_tasks", "review_required_tasks", "completed_tasks"):
+            assert data["executive_briefing"][key] == []
         assert data["board_health"]["status_counts"] == {}
         assert data["weekly_reports"]["latest"] == []
         assert data["provider_model_health"]["models"] == []

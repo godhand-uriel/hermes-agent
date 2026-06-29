@@ -12,6 +12,10 @@ __pycache__/
 .env.development.local
 .env.test.local
 .env.production.local
+*.env
+*.key
+*.secret
+finance/secrets/
 .env.development
 .env.test
 .hermes-docker/

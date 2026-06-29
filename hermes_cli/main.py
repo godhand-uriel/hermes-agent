@@ -11923,7 +11923,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "finance", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -12820,6 +12820,16 @@ def main():
                     plugin_parser.set_defaults(func=cmd_info["handler_fn"])
         except Exception as _exc:
             logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
+
+    # =========================================================================
+    # finance command — local Finance Registry + read-only Plaid Sandbox sync
+    # =========================================================================
+    try:
+        from hermes_cli.finance_cli import register_cli as _register_finance_cli
+
+        _register_finance_cli(subparsers)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("finance CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # curator command — background skill maintenance

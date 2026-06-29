@@ -41,6 +41,7 @@ interface OperatingNoteViewModel {
   nextActions: string[];
   kpis: string[];
   milestones: DashboardV2Metric[];
+  raw?: DashboardOperatingNote | null;
 }
 
 interface DashboardViewModel {
@@ -86,6 +87,7 @@ interface DashboardViewModel {
     trends: Record<string, DashboardFinanceTrend>;
     sync: FinanceSyncStatus | null;
     source: { type?: string | null; configured?: boolean | null; path?: string | null; model?: string | null } | null;
+    executiveDashboard?: Record<string, unknown> | null;
   };
   empireHealth: {
     score?: number | null;
@@ -222,6 +224,7 @@ function operatingNoteFromApi(note?: DashboardOperatingNote | null): OperatingNo
     nextActions: asArray(note?.next_actions),
     kpis: asArray(note?.kpis),
     milestones: asArray(note?.milestones).length ? asArray(note?.milestones) : asArray(note?.items),
+    raw: note ?? null,
   };
 }
 
@@ -543,6 +546,7 @@ function buildDashboardV2(data: DashboardV2Response, project: string, q: string)
       trends: financial.trends ?? {},
       sync: ((financeCommandCenter as { sync?: FinanceSyncStatus | null } | undefined)?.sync ?? null) as FinanceSyncStatus | null,
       source: (financial.source ?? ((financeCommandCenter as { source?: DashboardViewModel["financialMetrics"]["source"] } | undefined)?.source ?? null)) as DashboardViewModel["financialMetrics"]["source"],
+      executiveDashboard: (financial.executive_dashboard ?? (financeCommandCenter as { executive_dashboard?: Record<string, unknown> | null } | undefined)?.executive_dashboard ?? null) as Record<string, unknown> | null,
     },
     empireHealth: {
       score: data.empire_health?.score ?? null,
@@ -1110,14 +1114,6 @@ function clampPercent(value?: number | string | null): number | null {
   return Math.max(0, Math.min(100, numeric));
 }
 
-function toneFromStatus(status?: string | null): "good" | "warn" | "bad" | "muted" {
-  const value = (status || "").toLowerCase();
-  if (["healthy", "available", "on track", "done", "stable", "active", "data available"].some((needle) => value.includes(needle))) return "good";
-  if (["blocked", "failed", "at risk", "outage"].some((needle) => value.includes(needle))) return "bad";
-  if (["degraded", "review", "attention", "watch", "warning"].some((needle) => value.includes(needle))) return "warn";
-  return "muted";
-}
-
 function toneClasses(tone: "good" | "warn" | "bad" | "muted") {
   switch (tone) {
     case "good": return { text: "text-emerald-300", bg: "bg-emerald-400", border: "border-emerald-400/30", soft: "bg-emerald-400/10", fill: "#34d399" };
@@ -1198,6 +1194,188 @@ function MetricTile({ label, value, detail, tone = "muted", compact = false }: {
   );
 }
 
+
+type CareerRecord = Record<string, unknown>;
+
+const CAREER_SKILL_AREAS = ["Microsoft 365 / Azure", "Networking", "Windows support", "Linux", "Cloud fundamentals", "Security", "Scripting / automation", "Troubleshooting"];
+
+function careerRecord(note: OperatingNoteViewModel): CareerRecord {
+  return (note.raw && typeof note.raw === "object" ? note.raw : {}) as CareerRecord;
+}
+
+function careerText(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+function careerValue(record: CareerRecord, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = careerText(record[key]);
+    if (value) return value;
+  }
+  return null;
+}
+
+function careerNumber(record: CareerRecord, keys: string[]): number | null {
+  for (const key of keys) {
+    const raw = record[key];
+    const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw.replace(/[^0-9.-]/g, "")) : NaN;
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function careerMissing(field: string): string {
+  return `Needs input: ${field}`;
+}
+
+function careerDisplay(record: CareerRecord, keys: string[], missingField: string): string {
+  return careerValue(record, keys) ?? careerMissing(missingField);
+}
+
+function careerList(record: CareerRecord, keys: string[]): string[] {
+  for (const key of keys) {
+    const value = record[key];
+    if (Array.isArray(value)) return value.map((item) => typeof item === "string" ? item : careerText((item as CareerRecord)?.name) ?? careerText((item as CareerRecord)?.label) ?? "").filter(Boolean);
+    const text = careerText(value);
+    if (text) return [text];
+  }
+  return [];
+}
+
+function careerArray(record: CareerRecord, key: string): CareerRecord[] {
+  const value = record[key];
+  return Array.isArray(value) ? value.filter((item): item is CareerRecord => item != null && typeof item === "object") as CareerRecord[] : [];
+}
+
+function careerPercent(value: unknown): number | null {
+  return clampPercent(typeof value === "number" || typeof value === "string" ? value : null);
+}
+
+function careerLevel(value: unknown): string {
+  const percent = careerPercent(value);
+  if (percent == null) return "Needs input";
+  if (percent >= 75) return "Advanced";
+  if (percent >= 45) return "Working";
+  if (percent >= 20) return "Foundation";
+  return "Starter";
+}
+
+function careerSkillMatches(area: string, name: string): boolean {
+  const a = area.toLowerCase();
+  const n = name.toLowerCase();
+  if (a.includes("microsoft") || a.includes("azure")) return n.includes("microsoft") || n.includes("365") || n.includes("azure") || n.includes("entra");
+  if (a.includes("cloud")) return n.includes("cloud") || n.includes("aws") || n.includes("azure");
+  if (a.includes("scripting")) return n.includes("script") || n.includes("automation") || n.includes("python") || n.includes("powershell") || n.includes("bash");
+  if (a.includes("windows")) return n.includes("windows") || n.includes("desktop") || n.includes("endpoint");
+  return n.includes(a.split(" ")[0]);
+}
+
+function currency(value: number | null): string | null {
+  if (value == null) return null;
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
+}
+
+function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
+  const record = careerRecord(career);
+  const certifications = careerArray(record, "certifications");
+  const skills = careerArray(record, "skills");
+  const currentCertName = careerValue(record, ["current_certification_priority", "current_priority", "certification_priority"]);
+  const currentCert = certifications.find((item) => careerText(item.name) === currentCertName) ?? certifications[0];
+  const currentCertProgress = careerPercent(currentCert?.progress_percent) ?? careerPercent(record.roadmap_progress_percent);
+  const currentHourlyPay = careerNumber(record, ["current_hourly_pay", "current_pay_rate", "pay_rate", "hourly_pay"]);
+  const estimatedAnnual = currentHourlyPay == null ? null : currentHourlyPay * 2080;
+  const targetSalary = careerNumber(record, ["target_salary", "salary_target", "target_annual_salary"]);
+  const incomeGap = targetSalary == null || estimatedAnnual == null ? null : targetSalary - estimatedAnnual;
+  const behindSchedule = careerValue(record, ["behind_schedule"]);
+  const resumeStatus = careerValue(record, ["resume_status"]);
+  const linkedInStatus = careerValue(record, ["linkedin_status", "linked_in_status"]);
+  const portfolioStatus = careerValue(record, ["portfolio_status"]);
+  const interviewReadiness = careerValue(record, ["interview_readiness"]);
+  const applicationsSent = careerValue(record, ["applications_sent"]);
+  const studyTasks = careerList(record, ["study_plan", "todays_study_plan", "today_study_plan"]).length
+    ? careerList(record, ["study_plan", "todays_study_plan", "today_study_plan"])
+    : career.nextActions.length
+    ? career.nextActions
+    : career.priorities;
+  const skillGaps = careerList(record, ["skill_gaps", "gaps"]);
+  const skillRows = CAREER_SKILL_AREAS.map((area) => {
+    const skill = skills.find((item) => careerSkillMatches(area, careerText(item.name) ?? careerText(item.label) ?? ""));
+    const current = careerPercent(skill?.current_proficiency_percent ?? skill?.current_level_percent ?? skill?.current_level);
+    const target = careerPercent(skill?.target_proficiency_percent ?? skill?.target_level_percent ?? skill?.target_level);
+    return {
+      area,
+      current,
+      target,
+      gap: current == null || target == null ? null : Math.max(0, target - current),
+      action: careerText(skill?.next_action) ?? careerMissing(`skills[].next_action for ${area}`),
+    };
+  });
+  const riskItems = [
+    { label: "Behind schedule", value: behindSchedule ?? (currentCertProgress == null ? careerMissing("behind_schedule or certification progress") : currentCertProgress < 25 ? "Watch" : "On pace") },
+    { label: "Missing certification", value: currentCertName ? currentCertName : careerMissing("current_certification_priority") },
+    { label: "Weak interview prep", value: interviewReadiness ?? careerMissing("interview_readiness") },
+    { label: "No resume update", value: resumeStatus ?? careerMissing("resume_status") },
+    { label: "Low study consistency", value: careerValue(record, ["study_consistency", "weekly_study_consistency"]) ?? careerMissing("study_consistency") },
+  ];
+  const readiness = [
+    { label: "Resume", value: resumeStatus ?? careerMissing("resume_status") },
+    { label: "LinkedIn", value: linkedInStatus ?? careerMissing("linkedin_status") },
+    { label: "Portfolio", value: portfolioStatus ?? careerMissing("portfolio_status") },
+    { label: "Interview", value: interviewReadiness ?? careerMissing("interview_readiness") },
+    { label: "Applications", value: applicationsSent ?? careerMissing("applications_sent") },
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+        <ExecutiveKpiCard title="Current Position" tone="good">
+          <MetricTile compact label="Current role" value={careerDisplay(record, ["current_role"], "current_role")} tone="good" detail={`Next action: update current position fields`} />
+          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
+            <span>{careerDisplay(record, ["employer", "client", "employer_client"], "employer/client")}</span>
+            <span>{careerDisplay(record, ["contract_status", "employment_status", "status_type"], "contract/permanent status")}</span>
+            <span>{careerDisplay(record, ["pay_rate", "current_pay_rate", "current_hourly_pay"], "pay_rate")}</span>
+            <span>{careerDisplay(record, ["start_date"], "start_date")}</span>
+          </div>
+          <p className="text-[11px] text-cyan-100">Conversion target: {careerDisplay(record, ["conversion_target"], "conversion_target")}</p>
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Target Role" tone="warn">
+          <MetricTile compact label="Next target role" value={careerDisplay(record, ["target_role"], "target_role")} tone="warn" detail={`Next action: close top skill gap`} />
+          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300"><span>{careerDisplay(record, ["target_salary", "salary_target"], "target_salary")}</span><span>{careerDisplay(record, ["timeline", "target_timeline"], "timeline")}</span></div>
+          <CompactFeed items={skillGaps.length ? skillGaps : [careerMissing("skill_gaps")]} emptyLabel="Needs input: skill_gaps" max={3} />
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Certification Roadmap" tone={currentCertProgress == null ? "muted" : currentCertProgress >= 50 ? "good" : "warn"}>
+          <ProgressBar label={careerText(currentCert?.name) ?? currentCertName ?? careerMissing("current_certification_priority")} value={currentCertProgress} detail={`Exam: ${careerText(currentCert?.exam_date) ?? careerText(currentCert?.target_completion_date) ?? careerMissing("certifications[].exam_date")}`} tone={currentCertProgress == null ? "muted" : currentCertProgress >= 50 ? "good" : "warn"} />
+          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300"><span>{careerDisplay(record, ["study_hours_needed"], "study_hours_needed")}</span><span>{careerDisplay(record, ["daily_study_target"], "daily_study_target")}</span></div>
+          <p className="text-[11px] text-cyan-100">Next action: {careerText(currentCert?.next_action) ?? career.nextActions[0] ?? careerMissing("certifications[].next_action")}</p>
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Income Strategy" tone="good">
+          <div className="grid grid-cols-2 gap-1.5">
+            <MetricTile compact label="Hourly" value={currentHourlyPay == null ? careerMissing("current_hourly_pay") : currency(currentHourlyPay) ?? "—"} tone={currentHourlyPay == null ? "muted" : "good"} />
+            <MetricTile compact label="Annual est." value={estimatedAnnual == null ? careerMissing("current_hourly_pay") : currency(estimatedAnnual) ?? "—"} tone={estimatedAnnual == null ? "muted" : "good"} />
+            <MetricTile compact label="Target" value={targetSalary == null ? careerMissing("target_salary") : currency(targetSalary) ?? "—"} tone={targetSalary == null ? "muted" : "warn"} />
+            <MetricTile compact label="Gap" value={incomeGap == null ? careerMissing("target_salary/current_hourly_pay") : currency(incomeGap) ?? "—"} tone={incomeGap == null ? "muted" : incomeGap > 0 ? "warn" : "good"} />
+          </div>
+          <p className="text-[11px] text-cyan-100">Next action: execute income lever — {careerDisplay(record, ["next_income_lever", "income_lever"], "next_income_lever")}</p>
+        </ExecutiveKpiCard>
+      </div>
+      <div className="grid gap-2 xl:grid-cols-[1.1fr_0.9fr]">
+        <ExecutiveKpiCard title="Skill Matrix" tone="muted">
+          <div className="grid gap-1.5 md:grid-cols-2">
+            {skillRows.map((row) => <div key={row.area} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="flex items-center justify-between gap-2 text-xs"><span className="font-semibold text-white">{row.area}</span><span className="text-slate-400">Gap {row.gap == null ? "Needs input" : `${Math.round(row.gap)}%`}</span></div><p className="mt-1 text-[11px] text-slate-300">Current: {careerLevel(row.current)} · Target: {careerLevel(row.target)}</p><p className="mt-1 text-[10px] text-cyan-100">Next action: {row.action}</p></div>)}
+          </div>
+        </ExecutiveKpiCard>
+        <div className="space-y-2">
+          <ExecutiveKpiCard title="Today’s Study Plan" tone="warn"><CompactFeed items={(studyTasks.length ? studyTasks : [careerMissing("study_plan")]).slice(0, 3)} emptyLabel="Needs input: study_plan" max={3} /><p className="text-[11px] text-cyan-100">Next action: finish the first study task only.</p></ExecutiveKpiCard>
+          <ExecutiveKpiCard title="Career Risk" tone={career.blockers.length ? "bad" : "warn"}>{riskItems.map((item) => <div key={item.label} className="flex items-start justify-between gap-2 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[11px]"><span className="text-slate-400">{item.label}</span><span className="max-w-[60%] text-right text-white">{item.value}</span></div>)}<p className="text-[11px] text-cyan-100">Next action: clear the top red/yellow risk.</p></ExecutiveKpiCard>
+          <ExecutiveKpiCard title="Job Readiness" tone="muted"><div className="grid grid-cols-2 gap-1.5">{readiness.map((item) => <MetricTile key={item.label} compact label={item.label} value={item.value} tone={item.value.startsWith("Needs input") ? "muted" : "good"} />)}</div><p className="text-[11px] text-cyan-100">Next action: update resume, LinkedIn, portfolio, interview prep, and applications.</p></ExecutiveKpiCard>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const SYNC_PROGRESS_STEPS = ["Connecting…", "Downloading Accounts…", "Downloading Transactions…", "Updating Registry…", "Refreshing Dashboard…", "Completed"];
 
 const PLAID_LINK_SCRIPT_ID = "plaid-link-script";
@@ -1222,10 +1400,110 @@ function loadPlaidLinkScript(): Promise<void> {
   });
 }
 
+function formatFinanceValue(value: unknown, unit: "currency" | "percent" | "months" | "number" = "number"): string {
+  if (value == null || value === "") return "—";
+  if (typeof value === "string") return value;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  if (unit === "currency") return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  if (unit === "percent") return `${n.toFixed(1)}%`;
+  if (unit === "months") return `${n.toFixed(1)} mo`;
+  return n.toLocaleString();
+}
+
+function financeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function financeArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function financeKpi(exec: Record<string, unknown> | null | undefined, key: string): Record<string, unknown> {
+  return financeRecord(financeRecord(exec?.kpis)[key]);
+}
+
+function toneFromFinanceStatus(value: unknown): "good" | "warn" | "bad" | "muted" {
+  const s = String(value || "").toLowerCase();
+  if (["excellent", "good", "positive", "safe", "healthy", "success", "active"].some((needle) => s.includes(needle))) return "good";
+  if (["critical", "negative", "high", "poor", "failed", "error"].some((needle) => s.includes(needle))) return "bad";
+  if (["building", "fair", "watch", "warning"].some((needle) => s.includes(needle))) return "warn";
+  return "muted";
+}
+
+function ExecutiveKpiCard({ title, children, tone = "muted" }: { title: string; children: ReactNode; tone?: "good" | "warn" | "bad" | "muted" }) {
+  const cls = toneClasses(tone);
+  return <div className={`rounded-xl border ${cls.border} ${cls.soft} p-3`}><div className="mb-2 flex items-center justify-between gap-2"><p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{title}</p><SignalDot tone={tone} /></div><div className="space-y-1.5">{children}</div></div>;
+}
+
+function KpiLine({ label, value, unit = "number" }: { label: string; value: unknown; unit?: "currency" | "percent" | "months" | "number" }) {
+  return <div className="flex items-center justify-between gap-2 text-xs"><span className="text-slate-400">{label}</span><span className="font-semibold text-white">{formatFinanceValue(value, unit)}</span></div>;
+}
+
+function ExecutiveHealthCard({ exec }: { exec?: Record<string, unknown> | null }) {
+  const health = financeRecord(exec?.financial_health);
+  const score = Number(health.score ?? 0);
+  const rating = String(health.rating || "Unknown");
+  const tone = toneFromFinanceStatus(rating);
+  return <div className="rounded-xl border border-white/10 bg-black/30 p-3"><div className="flex items-start justify-between gap-3"><div><p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Executive Financial Health</p><h3 className="mt-1 text-2xl font-bold text-white">{Number.isFinite(score) ? score : 0}<span className="text-sm text-slate-500">/100</span></h3><Badge className={statusTone(rating.toLowerCase())}>{rating}</Badge></div><div className="w-28"><ProgressBar label="Health Score" value={Number.isFinite(score) ? score : 0} tone={tone} /></div></div><p className="mt-3 text-xs text-slate-300">{String(health.explanation || "Score updates after successful registry syncs.")}</p></div>;
+}
+
+function ExecutiveFinanceDashboard({ finance, syncing, connectingBank, progressStep, onSync, onConnectBank }: { finance: DashboardViewModel["financialMetrics"]; syncing: boolean; connectingBank: boolean; progressStep: string; onSync: () => void; onConnectBank: () => void }) {
+  const exec = finance.executiveDashboard ?? {};
+  const alerts = financeArray(exec.alerts);
+  const institutions = financeArray(exec.connected_institutions);
+  const insights = (Array.isArray(exec.insights) ? exec.insights : finance.notes).map(String);
+  const trends = financeRecord(exec.trends);
+  const activity = financeRecord(exec.recent_activity);
+  const metadata = financeRecord(exec.registry_metadata);
+  const syncHistory = financeArray(exec.sync_history).length ? financeArray(exec.sync_history) : financeArray(finance.sync?.history);
+  const nw = financeKpi(exec, "net_worth");
+  const cash = financeKpi(exec, "cash_available");
+  const flow = financeKpi(exec, "monthly_cash_flow");
+  const ef = financeKpi(exec, "emergency_fund");
+  const inv = financeKpi(exec, "investment_portfolio");
+  const debt = financeKpi(exec, "debt");
+  const burn = financeKpi(exec, "monthly_burn");
+  const util = financeKpi(exec, "credit_utilization");
+  const savings = financeKpi(exec, "savings_rate");
+  const runway = financeKpi(exec, "runway");
+  const payday = financeKpi(exec, "next_payday");
+  const lastSync = financeKpi(exec, "last_successful_sync");
+  const trendCards = Object.entries(trends).slice(0, 6);
+  return <div className="relative space-y-3">
+    {syncing && <div className="absolute inset-0 z-10 grid place-items-center rounded-xl border border-cyan-300/20 bg-black/60 text-xs text-cyan-100"><span className="inline-flex items-center gap-2"><Spinner className="h-4 w-4" /> {progressStep || "Syncing..."}</span></div>}
+    <ExecutiveHealthCard exec={exec} />
+    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+      <ExecutiveKpiCard title="Net Worth" tone={toneFromFinanceStatus(Number(nw.monthly_change ?? 0) >= 0 ? "good" : "bad")}><KpiLine label="Current" value={nw.current} unit="currency" /><KpiLine label="Daily Change" value={nw.daily_change} unit="currency" /><KpiLine label="Monthly Change" value={nw.monthly_change} unit="currency" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Cash Available" tone="good"><KpiLine label="Checking" value={cash.checking} unit="currency" /><KpiLine label="Savings" value={cash.savings} unit="currency" /><KpiLine label="Available Cash" value={cash.available_cash} unit="currency" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Monthly Cash Flow" tone={toneFromFinanceStatus(flow.status)}><KpiLine label="Income" value={flow.income} unit="currency" /><KpiLine label="Expenses" value={flow.expenses} unit="currency" /><KpiLine label={String(flow.status || "Status")} value={flow.cash_flow} unit="currency" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Emergency Fund" tone={toneFromFinanceStatus(ef.status)}><KpiLine label="Current" value={ef.current} unit="currency" /><KpiLine label="Target" value={ef.target} unit="currency" /><ProgressBar label={String(ef.status || "Progress")} value={Number(ef.progress_percent ?? 0)} tone={toneFromFinanceStatus(ef.status)} /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Investment Portfolio" tone="good"><KpiLine label="Current Value" value={inv.current_value} unit="currency" /><KpiLine label="Gain/Loss" value={inv.gain_loss} unit="currency" /><KpiLine label="Allocation" value={inv.allocation} unit="percent" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Debt" tone={Number(debt.total_debt ?? 0) > 0 ? "warn" : "good"}><KpiLine label="Total Debt" value={debt.total_debt} unit="currency" /><KpiLine label="Monthly Reduction" value={debt.monthly_reduction} unit="currency" /><KpiLine label="Projected Payoff" value={debt.projected_payoff_date} /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Monthly Burn" tone={Number(burn.trend ?? 0) > 0 ? "warn" : "good"}><KpiLine label="Average Spending" value={burn.average_monthly_spending} unit="currency" /><KpiLine label="Trend" value={burn.trend} unit="currency" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Credit Utilization" tone={toneFromFinanceStatus(util.status)}><KpiLine label="Current Utilization" value={util.current_utilization} unit="percent" /><KpiLine label="Status" value={util.status} /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Savings Rate" tone={Number(savings.monthly_percent ?? 0) >= Number(savings.target_percent ?? 20) ? "good" : "warn"}><KpiLine label="Monthly %" value={savings.monthly_percent} unit="percent" /><KpiLine label="Target %" value={savings.target_percent} unit="percent" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Runway" tone={Number(runway.months_remaining ?? 0) >= 3 ? "good" : "warn"}><KpiLine label="Months Remaining" value={runway.months_remaining} unit="months" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Next Payday" tone="muted"><KpiLine label="Date" value={payday.date} /><KpiLine label="Estimated Amount" value={payday.estimated_amount} unit="currency" /></ExecutiveKpiCard>
+      <ExecutiveKpiCard title="Last Successful Sync" tone={toneFromFinanceStatus(finance.sync?.sync_health)}><KpiLine label="Relative Time" value={formatRelativeTime(Number(lastSync.relative_time || finance.sync?.last_successful_sync_at || 0))} /><KpiLine label="Sync Duration" value={formatDuration(Number(lastSync.sync_duration ?? finance.sync?.duration_seconds ?? 0))} /></ExecutiveKpiCard>
+    </div>
+    <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+      <div className="rounded-xl border border-white/10 bg-black/25 p-3"><p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-white">Executive Alerts</p>{alerts.length ? <div className="space-y-2">{alerts.map((a, i) => <div key={i} className={`rounded-lg border p-2 text-xs ${toneClasses(toneFromFinanceStatus(a.severity)).soft} ${toneClasses(toneFromFinanceStatus(a.severity)).border}`}><div className="font-semibold text-white">{String(a.title || "Alert")}</div><div className="text-slate-300">{String(a.message || "")}</div><div className="text-slate-500">Action: {String(a.action || "Review")}</div></div>)}</div> : <p className="text-xs text-slate-500">No actionable alerts.</p>}</div>
+      <div className="rounded-xl border border-white/10 bg-black/25 p-3"><p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-white">Dashboard Intelligence</p><ul className="space-y-1 text-xs text-slate-300">{insights.map((item, i) => <li key={i}>• {item}</li>)}</ul></div>
+    </div>
+    <div className="grid grid-cols-2 gap-2 xl:grid-cols-3">{trendCards.map(([key, raw]) => { const trend = financeRecord(raw); const pts = Array.isArray(trend.points) ? trend.points as Array<Record<string, unknown>> : []; return <div key={key} className="rounded-lg border border-white/10 bg-black/25 p-2"><p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">{String(trend.label || key)}</p><MiniBars values={pts.map((pt) => Math.abs(Number(pt.value || 0))).slice(-12)} tone="good" /><p className="text-[10px] text-slate-500">30-day registry trend</p></div>; })}</div>
+    <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+      <div className="rounded-xl border border-white/10 bg-black/25 p-3"><p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-white">Connected Institutions</p>{institutions.length ? institutions.map((item, i) => <div key={i} className="mb-2 flex items-center justify-between rounded-lg border border-white/10 p-2 text-xs"><div><div className="font-semibold text-white">{String(item.institution_name || "Institution")}</div><div className="text-slate-500">{String((item.account_types as unknown[])?.join?.(", ") || "Accounts")}</div></div><div className="text-right"><div className="text-white">{String(item.connected_account_count || 0)} accounts</div><div className="text-slate-500">{formatRelativeTime(Number(item.last_synchronized || 0))}</div><Badge className={statusTone(String(item.connection_status || "active"))}>{String(item.connection_status || "active")}</Badge></div></div>) : <p className="text-xs text-slate-500">No connected institutions in the registry yet.</p>}</div>
+      <div className="rounded-xl border border-white/10 bg-black/25 p-3"><p className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-white">Recent Activity</p>{["latest_income", "largest_recent_expenses", "recent_transfers", "investment_activity", "debt_payments"].map((key) => <div key={key} className="mb-2"><p className="text-[10px] uppercase text-slate-500">{key.replaceAll("_", " ")}</p>{financeArray(activity[key]).slice(0, 2).map((item, i) => <div key={i} className="flex justify-between text-xs text-slate-300"><span className="truncate">{String(item.name || "Activity")}</span><span>{formatFinanceValue(item.amount, "currency")}</span></div>)}</div>)}</div>
+    </div>
+    <FinanceSyncConsole finance={finance} syncing={syncing} connectingBank={connectingBank} progressStep={progressStep} onSync={onSync} onConnectBank={onConnectBank} />
+    <details className="rounded-lg border border-white/10 bg-black/25 p-2 text-xs"><summary className="cursor-pointer font-semibold text-white">Diagnostics</summary><div className="mt-2 grid grid-cols-2 gap-2 text-slate-300"><KpiLine label="Registry Version" value={metadata.registry_version} /><KpiLine label="Last Migration" value={String(financeRecord(metadata.last_migration).migration_id || "—")} /><KpiLine label="Last Sync" value={formatDate(Number(metadata.last_sync || 0))} /><KpiLine label="Provider" value={metadata.provider} /><KpiLine label="Environment" value={metadata.environment} /><KpiLine label="Database Size" value={metadata.database_size_bytes} /><KpiLine label="Sync Duration" value={formatDuration(Number(metadata.synchronization_duration || 0))} /><KpiLine label="Sync Status" value={metadata.synchronization_status} /></div><p className="mt-2 break-all text-slate-500">Registry Location: {String(metadata.registry_location || finance.source?.path || "—")}</p><div className="mt-2 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-[11px]"><thead className="text-slate-500"><tr><th>Started</th><th>Completed</th><th>Duration</th><th>Accounts</th><th>Transactions</th><th>Investments</th><th>Status</th><th>Operator Message</th><th>Errors</th></tr></thead><tbody>{syncHistory.length ? syncHistory.map((row) => <tr key={String(row.id ?? row.started_at)} className="border-t border-white/10"><td>{formatDate(Number(row.started_at || 0))}</td><td>{formatDate(Number(row.completed_at || 0))}</td><td>{formatDuration(Number(row.duration_seconds || 0))}</td><td>{String(row.accounts_count ?? 0)}</td><td>{String(row.transactions_count ?? 0)}</td><td>{String(row.investments_count ?? 0)}</td><td>{String(row.status || "—")}</td><td>{String(row.operator_message || row.message || "—")}</td><td>{Array.isArray(row.errors) ? row.errors.join(", ") : "—"}</td></tr>) : <tr><td colSpan={9} className="py-2 text-slate-500">No recent syncs.</td></tr>}</tbody></table></div></details>
+  </div>;
+}
+
 function FinanceSyncConsole({ finance, syncing, connectingBank, progressStep, onSync, onConnectBank }: { finance: DashboardViewModel["financialMetrics"]; syncing: boolean; connectingBank: boolean; progressStep: string; onSync: () => void; onConnectBank: () => void }) {
   const sync = finance.sync;
   const health = syncHealthLabel(sync?.sync_health);
-  const tone = health === "Healthy" ? "good" : health === "Error" ? "bad" : "warn";
   const environment = sync?.environment || "Sandbox";
   const environmentTone = environment.toLowerCase() === "production" ? "bad" : "warn";
   const history = asArray(sync?.history).slice(0, 5);
@@ -1246,22 +1524,13 @@ function FinanceSyncConsole({ finance, syncing, connectingBank, progressStep, on
         </div>
       </div>
       {syncing && <div className="rounded-lg border border-cyan-300/20 bg-cyan-300/10 p-2"><ProgressBar label={progressStep || "Connecting…"} value={clampPercent(((SYNC_PROGRESS_STEPS.indexOf(progressStep) + 1) / SYNC_PROGRESS_STEPS.length) * 100)} detail="Live Progress" tone="good" /></div>}
-      <div className="grid grid-cols-2 gap-2">
-        <MetricTile compact label="Provider" value={sync?.provider_label || "Plaid Sandbox"} tone={tone} />
-        <MetricTile compact label="Environment" value={sync?.environment || "Sandbox"} tone={tone} />
-        <MetricTile compact label="Sync Duration" value={formatDuration(sync?.duration_seconds)} tone={tone} />
-        <MetricTile compact label="Accounts" value={sync?.accounts_count ?? 0} tone={tone} />
-        <MetricTile compact label="Transactions" value={sync?.transactions_count ?? 0} tone={tone} />
-        <MetricTile compact label="Investments" value={sync?.investments_count ?? 0} tone={tone} />
-        <MetricTile compact label="Liabilities" value={sync?.liabilities_count ?? 0} tone={tone} />
-        <MetricTile compact label="Registry Source" value={sync?.registry_source || "Finance Registry"} tone="good" />
+      <div className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] text-slate-500">
+        Environment: {sync?.environment || "Sandbox"} · Last Successful Sync: {formatRelativeTime(sync?.last_successful_sync_at)} · Registry-backed Plaid ingestion
       </div>
       <details className="rounded-lg border border-white/10 bg-black/25 p-2 text-xs">
-        <summary className="cursor-pointer font-semibold text-white">Registry Metadata</summary>
-        <div className="mt-2 space-y-1 text-slate-300"><p>Provider: Plaid</p><p>Environment: {sync?.environment || "Sandbox"}</p><p>Registry Location: {sync?.registry_location || finance.source?.path || "Current SQLite path"}</p><p>Model: {sync?.model || finance.source?.model || "Normalized Registry"}</p></div>
-      </details>
-      <details className="rounded-lg border border-white/10 bg-black/25 p-2 text-xs">
-        <summary className="cursor-pointer font-semibold text-white">Recent Syncs</summary>
+        <summary className="cursor-pointer font-semibold text-white">Diagnostics</summary>
+        <div className="mt-2 grid grid-cols-2 gap-2 text-slate-300"><KpiLine label="Provider" value={sync?.provider_label || "Plaid Sandbox"} /><KpiLine label="Environment" value={sync?.environment || "Sandbox"} /><KpiLine label="Sync Duration" value={formatDuration(sync?.duration_seconds)} /><KpiLine label="Accounts" value={sync?.accounts_count ?? 0} /><KpiLine label="Transactions" value={sync?.transactions_count ?? 0} /><KpiLine label="Investments" value={sync?.investments_count ?? 0} /><KpiLine label="Liabilities" value={sync?.liabilities_count ?? 0} /><KpiLine label="Registry Source" value={sync?.registry_source || "Finance Registry"} /></div>
+        <p className="mt-2 break-all text-slate-500">Registry Location: {sync?.registry_location || finance.source?.path || "Current SQLite path"}</p>
         <div className="mt-2 overflow-x-auto"><table className="w-full min-w-[520px] text-left text-[11px]"><thead className="text-slate-500"><tr><th>Started</th><th>Completed</th><th>Duration</th><th>Accounts</th><th>Transactions</th><th>Status</th><th>Errors</th></tr></thead><tbody>{history.length ? history.map((row) => <tr key={String(row.id ?? row.started_at)} className="border-t border-white/10"><td>{formatDate(row.started_at)}</td><td>{formatDate(row.completed_at)}</td><td>{formatDuration(row.duration_seconds)}</td><td>{row.accounts_count ?? 0}</td><td>{row.transactions_count ?? 0}</td><td>{row.status || "—"}</td><td>{asArray(row.errors).join(", ") || "—"}</td></tr>) : <tr><td colSpan={7} className="py-2 text-slate-500">No recent syncs.</td></tr>}</tbody></table></div>
       </details>
     </div>
@@ -1514,7 +1783,7 @@ function QuickCaptureBar({ actions, onCapture }: { actions: QuickCaptureAction[]
 }
 
 function OperationsHealthStrip({ cards, diagnostics, onDiagnostics }: { cards: { label: string; value: string | number; tone: string }[]; diagnostics: { name: string; status: string; sync: string }[]; onDiagnostics: () => void }) {
-  const failing = diagnostics.filter((item) => toneFromStatus(item.status) !== "good").length;
+  const failing = diagnostics.filter((item) => toneFromFinanceStatus(item.status) !== "good").length;
   return (
     <div className="space-y-2">
       <div className="grid grid-cols-2 gap-2">{cards.slice(0, 4).map((card) => <MetricTile compact key={card.label} label={card.label} value={card.value} tone={card.tone as "good" | "warn" | "bad" | "muted"} />)}</div>
@@ -1672,9 +1941,12 @@ function ExecutiveCommandCenterShell({ dashboard }: { dashboard: DashboardViewMo
   const sidebar = [
     { label: "Dashboard", shortLabel: "Dash", target: "dashboard-top" },
     { label: "Mission Control", shortLabel: "Ctrl", target: "mission-control" },
-    { label: "Business Ventures", shortLabel: "Vent", target: "venture-portfolio", children: ["BureauOS", "Parlay Analyzer", "TrustBase"] },
-    { label: "Career Development", shortLabel: "Career", target: "career-development" },
     { label: "Finance", shortLabel: "Fin", target: "finance-command" },
+    { label: "Ventures", shortLabel: "Vent", target: "venture-portfolio" },
+    { label: "BureauOS", shortLabel: "Bureau", target: "bureauos" },
+    { label: "Parlay Analyzer", shortLabel: "Parlay", target: "venture-portfolio" },
+    { label: "TrustBase", shortLabel: "Trust", target: "venture-portfolio" },
+    { label: "Career Development", shortLabel: "Career", target: "career-development" },
     { label: "Research", shortLabel: "Res", target: "research-center" },
     { label: "Knowledge Vault", shortLabel: "Vault", target: "knowledge-vault" },
     { label: "Engineering Brand", shortLabel: "Brand", target: "engineering-brand" },
@@ -1769,12 +2041,6 @@ function ExecutiveCommandCenterShell({ dashboard }: { dashboard: DashboardViewMo
     ...blockedTasks.map((task) => ({ task, priority: "P1" })),
     ...dashboard.engineeringMetrics.recentCompleted.slice(0, 4).map((task) => ({ task, priority: "P3" })),
   ].filter((row, index, rows) => rows.findIndex((candidate) => candidate.task.id === row.task.id) === index);
-  const financeMetrics = dashboard.financialMetrics.metrics;
-  const financeMetricByLabel = (needle: string) => financeMetrics.find((item) => item.label.toLowerCase().includes(needle.toLowerCase()));
-  const financeCards = [
-    "Net Worth", "Emergency Fund", "Car Fund", "Brokerage", "Monthly Income", "Monthly Expenses", "Runway", "Debt", "Savings Rate",
-  ].map((label) => ({ label, metric: financeMetricByLabel(label) }));
-
   const stageCounts = dashboard.venturePipeline.reduce<Record<string, number>>((counts, stage) => ({ ...counts, [stage.stage]: Number(stage.count || 0) }), {});
   const pipelineStages = ["Research", "Validation", "MVP", "Build", "Production", "Paying Clients", "Scale"].map((label) => ({ label, count: stageCounts[label] ?? 0 }));
   const activityItems = [
@@ -1792,192 +2058,104 @@ function ExecutiveCommandCenterShell({ dashboard }: { dashboard: DashboardViewMo
   const operationsCards = [
     { label: "Agent Health", value: dashboard.agentMetrics.metrics.length ? "Data" : "No data", tone: dashboard.agentMetrics.metrics.length ? "good" : "muted" },
     { label: "Automation Health", value: dashboard.engineeringMetrics.deploymentStatus.length ? "Data" : "No Metrics Yet", tone: dashboard.engineeringMetrics.deploymentStatus.length ? "good" : "muted" },
-    { label: "Notification Health", value: dashboard.notificationWatchdog.status || "No Activity Yet", tone: toneFromStatus(dashboard.notificationWatchdog.status) },
+    { label: "Notification Health", value: dashboard.notificationWatchdog.status || "No Activity Yet", tone: toneFromFinanceStatus(dashboard.notificationWatchdog.status) },
     { label: "Kanban Health", value: totalBoardItems ? `${totalBoardItems} items` : "No data", tone: blockedCount ? "bad" : totalBoardItems ? "good" : "muted" },
     { label: "API Health", value: dashboard.source === "dashboard-v2" ? "Live" : "Fallback", tone: dashboard.source === "dashboard-v2" ? "good" : "warn" },
   ];
 
+  const financeExec = dashboard.financialMetrics.executiveDashboard ?? {};
+  const financeHealth = financeRecord(financeRecord(financeExec).financial_health);
+  const financeScore = Number(financeHealth.score ?? 0);
+  const ventureStatus = businessVentures.some((venture) => Number(venture.data?.blocked_tasks || 0) > 0) ? "Watch" : businessVentures.some((venture) => venture.data) ? "Active" : "No Data Yet";
+  const careerStatus = dashboard.careerProgress.blockers.length ? "Watch" : dashboard.careerProgress.status || "Active";
+  const highestPriority = decisionCards[0]?.title || blockerCards[0]?.title || (dashboard.financialMetrics.sync?.sync_health === "error" ? "Reconnect bank" : "Review executive command center");
+  const decisionsRequired = Math.min(5, decisionCards.length + blockerCards.length + (dashboard.financialMetrics.sync?.sync_health === "error" ? 1 : 0));
+  const heroSentence = `Good Morning Yuu. ${decisionsRequired || 0} decision${decisionsRequired === 1 ? "" : "s"} require attention.`;
+  const decisionQueue = [
+    ...decisionCards.map((card) => ({ title: card.title, detail: card.impact, action: "Open Mission Control", tone: "warn" as const })),
+    ...blockerCards.map((card) => ({ title: card.title, detail: card.impact, action: card.action, tone: "bad" as const })),
+    ...(dashboard.financialMetrics.sync?.sync_health === "error" ? [{ title: "Reconnect bank", detail: "Finance sync requires attention.", action: "Open Finance", tone: "bad" as const }] : []),
+  ].slice(0, 5);
+  const workspaceSnapshots = [
+    { id: "finance-command", title: "Finance", status: financeHealth.rating || (dashboard.financialMetrics.metrics.length ? "Data available" : "No Metrics Yet"), trend: financeScore ? `${financeScore}/100 health` : "No trend yet", milestone: "Financial report and goals", risk: financeRecord(financeExec).alerts ? `${financeArray(financeRecord(financeExec).alerts).length} alerts` : "No actionable alerts", action: "Open Finance Workspace" },
+    { id: "venture-portfolio", title: "Ventures", status: ventureStatus, trend: `${businessVentures.filter((venture) => venture.data).length}/${businessVentures.length} registered active`, milestone: businessVentures.find((venture) => venture.data?.next_milestone)?.data?.next_milestone || "Review MVP roadmap", risk: blockedCount ? `${blockedCount} blockers` : "No critical blocker", action: "Open Ventures Workspace" },
+    { id: "career-development", title: "Career", status: careerStatus, trend: dashboard.careerProgress.milestones.length ? `${dashboard.careerProgress.milestones.length} progress metrics` : "No trend yet", milestone: dashboard.careerProgress.nextActions[0] || dashboard.careerProgress.priorities[0] || "Complete certification", risk: dashboard.careerProgress.blockers[0] || "No critical blocker", action: "Open Career Workspace" },
+  ];
+  const alertItems = [
+    ...blockerCards.map((card) => ({ title: card.title, detail: card.impact, tone: "bad" as const })),
+    ...escalationItems.map((item) => ({ title: "Security or notification issue", detail: item, tone: "warn" as const })),
+    ...financeArray(financeRecord(financeExec).alerts).map((item) => ({ title: String(item.title || "Finance alert"), detail: String(item.message || item.action || "Needs attention"), tone: toneFromFinanceStatus(String(item.severity || "warning")) })),
+  ].slice(0, 4);
+  const executiveActivity = activityItems.slice(0, 5);
+  const financeKpiSummary = [
+    { label: "Net Worth", value: financeKpi(financeExec, "net_worth").current, unit: "currency" as const },
+    { label: "Cash Position", value: financeKpi(financeExec, "cash_available").available_cash, unit: "currency" as const },
+    { label: "Emergency Fund", value: financeKpi(financeExec, "emergency_fund").progress_percent, unit: "percent" as const },
+    { label: "Runway", value: financeKpi(financeExec, "runway").months_remaining, unit: "months" as const },
+  ];
+  const todayLabel = new Date(Number(updated || Date.now() / 1000) * 1000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const openWorkspace = (targetId: string) => scrollToSection(targetId);
+
+  void sourceBackedContractMarkers;
+  void businessNavExpanded;
+  void QuickCaptureBar;
+  void quickCaptureActions;
+  void missionPriorities;
+  void workspaceSnapshots;
+
   return (
     <section id="dashboard-top" className="min-h-[calc(100vh-4rem)] w-full overflow-hidden border border-cyan-300/20 bg-[#02040a] text-slate-100 shadow-2xl shadow-cyan-950/30">
-      <div className={`grid min-h-[calc(100vh-4rem)] ${sidebarCollapsed ? "xl:grid-cols-[72px_1fr]" : "xl:grid-cols-[148px_1fr]"}`}>
-        <aside className={`border-b border-white/10 bg-[#030806]/95 p-2 xl:border-b-0 xl:border-r ${sidebarCollapsed ? "xl:p-1.5" : "xl:p-3"}`}>
-          <div className={`mb-3 rounded-xl border border-cyan-400/20 bg-cyan-400/10 ${sidebarCollapsed ? "p-2" : "p-3"}`}>
+      <div className={`grid min-h-[calc(100vh-4rem)] ${sidebarCollapsed ? "xl:grid-cols-[88px_1fr]" : "xl:grid-cols-[220px_1fr]"}`}>
+        <aside className={`border-b border-white/10 bg-[#030806]/95 p-2 xl:border-b-0 xl:border-r ${sidebarCollapsed ? "xl:p-2" : "xl:p-3"}`}>
+          <div className="mb-3 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 p-3">
             <div className="flex items-center justify-between gap-2">
-              <p className="text-[9px] font-semibold uppercase tracking-[0.32em] text-cyan-300">Hermes OS</p>
+              <p className="text-[9px] font-semibold uppercase tracking-[0.30em] text-cyan-300">Hermes OS</p>
               <button type="button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} className="rounded border border-cyan-300/25 px-1.5 py-0.5 text-[10px] text-cyan-100 hover:bg-cyan-300/10">{sidebarCollapsed ? "›" : "‹"}</button>
             </div>
-            {!sidebarCollapsed && <><h2 className="mt-1 text-lg font-semibold leading-tight text-white">Executive Command Center</h2><p className="mt-1 text-[10px] text-slate-400">Bloomberg Terminal + Linear + Notion + Jarvis · Founder operating intelligence · source-backed</p></>}
+            {!sidebarCollapsed && <><h2 className="mt-1 text-lg font-semibold leading-tight text-white">Executive Command Center</h2><p className="mt-1 text-[10px] text-slate-400">Live backend data · source-backed operating modules</p></>}
           </div>
-
-          {!sidebarCollapsed && <div className="mb-3 grid grid-cols-2 gap-1.5">
-            <MetricTile compact label="P0 Tasks" value={reviewCount} tone={reviewCount ? "warn" : "good"} />
-            <MetricTile compact label="Blocked" value={blockedCount} tone={blockedCount ? "bad" : "good"} />
-            <MetricTile compact label="Review" value={reviewCount} tone={reviewCount ? "warn" : "good"} />
-            <MetricTile compact label="Agents" value={dashboard.agentMetrics.metrics.length ? "Data" : "No Metrics Yet"} tone={dashboard.agentMetrics.metrics.length ? "good" : "muted"} />
-          </div>}
-
           <nav className="space-y-0.5 text-[11px]">
             {sidebar.map((item) => (
-              <div key={item.label} className="rounded-lg">
-                <button
-                  type="button"
-                  disabled={item.disabled}
-                  title={item.disabled ? "Not wired yet" : `Go to ${item.label}`}
-                  onClick={() => item.label === "Business Ventures" ? setBusinessNavExpanded((value) => !value) : scrollToSection(item.target)}
-                  className="flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left font-medium text-slate-300 transition hover:bg-cyan-500/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
-                >
-                  <span className="truncate">{sidebarCollapsed ? item.shortLabel : item.label}</span>
-                  {item.label === "Dashboard" ? <SignalDot tone="good" /> : item.label === "Business Ventures" ? <span aria-expanded={businessNavExpanded}>{businessNavExpanded ? "−" : "+"}</span> : null}
-                </button>
-                {item.label === "Business Ventures" && businessNavExpanded && !sidebarCollapsed && (
-                  <div className="mt-1 space-y-0.5 border-l border-cyan-400/25 pl-2 text-[10px] text-slate-500">
-                    <button type="button" onClick={() => scrollToSection("bureauos")} className="block w-full truncate rounded px-2 py-1 text-left text-slate-300 hover:bg-cyan-300/10">▼ BureauOS</button>
-                    {bureauApps.map((app) => <button type="button" onClick={() => scrollToSection("bureauos")} key={app.id || app.name} className="block w-full truncate rounded px-4 py-0.5 text-left hover:bg-cyan-300/10">- {app.name}</button>)}
-                    <button type="button" onClick={() => scrollToSection("venture-portfolio")} className="block w-full rounded px-2 py-0.5 text-left hover:bg-cyan-300/10">- Parlay Analyzer</button>
-                    <button type="button" onClick={() => scrollToSection("venture-portfolio")} className="block w-full rounded px-2 py-0.5 text-left hover:bg-cyan-300/10">- TrustBase</button>
-                  </div>
-                )}
-              </div>
+              <button key={item.label} type="button" disabled={item.disabled} title={item.disabled ? "Not wired yet" : `Open ${item.label} workspace`} onClick={() => item.disabled ? undefined : openWorkspace(item.target)} className="flex w-full items-center justify-between gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left font-medium text-slate-300 transition hover:border-cyan-300/20 hover:bg-cyan-500/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-45">
+                <span className="truncate">{sidebarCollapsed ? item.shortLabel : item.label}</span>{item.label === "Dashboard" ? <SignalDot tone="good" /> : null}
+              </button>
             ))}
           </nav>
-
-          {!sidebarCollapsed && <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-2.5">
-            <p className="text-[9px] uppercase tracking-[0.22em] text-slate-500">Current Focus</p>
-            {domainHealth.slice(0, 4).map((item) => {
-              const tone = toneFromStatus(item.status);
-              return <div key={item.label} className="mt-1.5 flex items-center justify-between text-[10px]"><span className="flex items-center gap-1.5"><SignalDot tone={tone} />{item.label}</span><span className={toneClasses(tone).text}>{item.trend}</span></div>;
-            })}
-            <p className="mt-2 text-[9px] text-slate-500">Last sync: {formatDate(updated)}</p>
+          {!sidebarCollapsed && <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+            <p className="text-[9px] uppercase tracking-[0.22em] text-slate-500">System Status</p>
+            {operationsCards.slice(0, 5).map((card) => <div key={card.label} className="mt-2 flex items-center justify-between text-[10px]"><span className="flex items-center gap-1.5"><SignalDot tone={card.tone as "good" | "warn" | "bad" | "muted"} />{card.label}</span><span className={toneClasses(card.tone as "good" | "warn" | "bad" | "muted").text}>{card.value}</span></div>)}
+            <button type="button" onClick={() => setActiveDrawer({ type: "diagnostics", items: backendIntegrationItems })} className="mt-3 w-full rounded-lg border border-white/10 px-2 py-1.5 text-[10px] text-cyan-100 hover:border-cyan-300/40 hover:bg-cyan-300/10">Open diagnostics</button>
           </div>}
         </aside>
 
-        <div className="grid min-h-[calc(100vh-4rem)] auto-rows-min grid-cols-1 gap-3 bg-[radial-gradient(circle_at_top_right,rgba(34,211,238,0.16),transparent_28%),radial-gradient(circle_at_top_left,rgba(168,85,247,0.14),transparent_30%),linear-gradient(180deg,#07101d,#02040a)] p-3 xl:grid-cols-12">
-          <div className="xl:col-span-4">
-            <ExecutivePanel eyebrow="Executive Brief" title="Good Morning Yuu" source="Kanban + Reports + Watchdog" updated={updated} className="h-full border-cyan-300/25 bg-[#0a1324]/95">
-              <p className="line-clamp-2 text-base text-slate-300">{dashboard.executiveBriefing.summary}</p>
-              <div className="mt-3 grid grid-cols-3 gap-2">
-                <MetricTile label="Decisions" value={reviewCount} tone={reviewCount ? "warn" : "good"} />
-                <MetricTile label="Blockers" value={blockedCount} tone={blockedCount ? "bad" : "good"} />
-                <MetricTile label="Movement" value={activityItems.length} tone={activityItems.length ? "good" : "muted"} />
-              </div>
-              <div className="mt-3 grid gap-2 md:grid-cols-3">
-                <div className="rounded-lg border border-white/10 bg-black/25 p-2"><p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">What changed</p><CompactFeed items={activityItems.map((item) => `${item.source}: ${item.text}`)} emptyLabel="No Activity Yet" max={2} /></div>
-                <div className="rounded-lg border border-white/10 bg-black/25 p-2"><p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">What matters</p><CompactFeed items={decisionItems.length ? decisionItems : missionPriorities} emptyLabel="No Data Yet" max={2} /></div>
-                <div className="rounded-lg border border-white/10 bg-black/25 p-2"><p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Next action</p><CompactFeed items={blockerItems.length ? blockerItems : [blockedCount ? "Review blockers" : "All systems operational"]} emptyLabel="All systems operational" max={2} /></div>
-              </div>
-            </ExecutivePanel>
+        <main className="min-h-[calc(100vh-4rem)] overflow-y-auto bg-[radial-gradient(circle_at_top_right,rgba(34,211,238,0.18),transparent_28%),radial-gradient(circle_at_top_left,rgba(168,85,247,0.14),transparent_30%),linear-gradient(180deg,#07101d,#02040a)] p-3">
+          <header className="mb-3 grid gap-3 rounded-2xl border border-white/10 bg-black/25 p-3 lg:grid-cols-[1.1fr_0.9fr_0.5fr] lg:items-center">
+            <div><p className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">Executive Brief</p><h1 className="mt-1 text-2xl font-bold text-white">{heroSentence}</h1><p className="mt-1 text-sm text-slate-300">Highest Priority Today: <span className="font-semibold text-white">{highestPriority}</span></p></div>
+            <div className="rounded-xl border border-cyan-300/15 bg-black/30 px-3 py-2 text-sm text-slate-300">Ask Hermes or search workspaces<span className="float-right text-slate-500">⌘K</span></div>
+            <div className="text-right text-xs text-slate-400"><div>{todayLabel}</div><div className="mt-1"><Badge className={statusTone(dashboard.source === "dashboard-v2" ? "healthy" : "warning")}>{dashboard.source}</Badge></div></div>
+          </header>
+
+          <div className="grid auto-rows-min grid-cols-12 gap-3">
+            <div className="col-span-12 xl:col-span-3"><ExecutivePanel eyebrow="Empire Health" title="Overall Operating Score" source="Dashboard API" updated={updated} className="h-full border-cyan-300/20 bg-black/35"><Gauge value={empireScore} label="Empire Health" tone={empireTone} /><div className="mt-3 grid grid-cols-2 gap-1.5">{domainHealth.slice(0, 6).map((domain) => <div key={domain.label} className="flex items-center justify-between rounded-lg border border-white/10 bg-black/25 px-2 py-1.5 text-[11px]"><span className="truncate">{domain.label}</span><span className={toneClasses(toneFromFinanceStatus(domain.status)).text}>{domain.trend}</span></div>)}</div></ExecutivePanel></div>
+            <div className="col-span-12 md:col-span-6 xl:col-span-3"><ExecutivePanel eyebrow="Decision Queue" title="Decisions Needed" source="Kanban review queue" updated={updated} className="h-full border-amber-300/20 bg-black/35">{decisionQueue.length ? <div className="space-y-2">{decisionQueue.map((item) => <button key={item.title} type="button" onClick={() => openWorkspace(item.action.includes("Finance") ? "finance-command" : "mission-control")} className={`flex w-full items-center justify-between gap-3 rounded-xl border p-2 text-left text-xs ${toneClasses(item.tone).border} ${toneClasses(item.tone).soft}`}><span><strong className="line-clamp-1 text-white">{item.title}</strong><span className="line-clamp-1 text-slate-300">{item.detail}</span></span><span className="shrink-0 text-[10px] text-white">Open</span></button>)}</div> : <EmptyState label="No executive decisions pending" detail="No operator approvals are currently requested by source systems." />}</ExecutivePanel></div>
+            <div className="col-span-12 md:col-span-6 xl:col-span-3"><ExecutivePanel eyebrow="Blockers" title="Current Blockers" source="Kanban + Notifications" updated={updated} className="h-full border-rose-300/20 bg-black/35">{blockerCards.length ? <CompactFeed items={blockerCards.map((card) => `${card.title} · ${card.impact}`)} emptyLabel="No blockers" max={4} /> : <div className="grid h-32 place-items-center rounded-xl border border-emerald-300/20 bg-emerald-300/10 text-sm font-semibold text-emerald-200">All systems operational</div>}</ExecutivePanel></div>
+            <div id="mission-control" className="col-span-12 xl:col-span-3"><ExecutivePanel eyebrow="Mission Control" title="P0 / P1 Operating Flow" source="Kanban" updated={updated} className="h-full bg-black/35"><div className="grid grid-cols-2 gap-2"><MetricTile compact label="P0/P1" value={missionRows.filter((row) => row.priority !== "P3").length} tone={blockedCount ? "bad" : reviewCount ? "warn" : "good"} /><MetricTile compact label="Review" value={reviewCount} tone={reviewCount ? "warn" : "good"} /><MetricTile compact label="Blocked" value={blockedCount} tone={blockedCount ? "bad" : "good"} /><MetricTile compact label="Completed" value={completedItems.length} tone={completedItems.length ? "good" : "muted"} /></div><div className="mt-3"><MissionControlRows tasks={missionRows.filter((row) => row.priority !== "P3").slice(0, 5)} onOpen={(task, priority) => setActiveDrawer({ type: "task", task, priority })} /></div></ExecutivePanel></div>
+
+            <div id="finance-command" className="col-span-12 xl:col-span-6"><ExecutivePanel eyebrow="Finance" title="Finance Command Center" source="Finance Registry via Dashboard API" updated={updated} className="h-full border-emerald-300/20 bg-black/35"><div className="mb-3 grid grid-cols-2 gap-2 md:grid-cols-4">{financeKpiSummary.map((item) => <MetricTile compact key={item.label} label={item.label} value={formatFinanceValue(item.value, item.unit)} tone="good" />)}</div><ExecutiveFinanceDashboard finance={dashboard.financialMetrics} syncing={syncingFinance} connectingBank={connectingBank} progressStep={financeProgressStep} onSync={handleFinanceSync} onConnectBank={handleConnectBank} />{financeToast && <div role="status" className={`mt-3 rounded-lg border p-2 text-xs ${financeToast.tone === "good" ? "border-emerald-300/25 bg-emerald-300/10 text-emerald-100" : "border-rose-300/25 bg-rose-300/10 text-rose-100"}`}>{financeToast.message}</div>}</ExecutivePanel></div>
+            <div id="venture-portfolio" className="col-span-12 xl:col-span-3"><ExecutivePanel eyebrow="Ventures" title="Business Ventures Overview" source="Portfolio registry" updated={updated} className="h-full bg-black/35"><VentureRows ventures={businessVentures.map((venture) => ({ ...venture, research: researchItems.find((item) => item.toLowerCase().includes(venture.displayName.toLowerCase())) }))} onOpen={(venture) => setActiveDrawer({ type: "venture", name: venture.displayName, data: venture.data, research: venture.research })} /></ExecutivePanel></div>
+            <div id="bureauos" className="col-span-12 xl:col-span-3"><ExecutivePanel eyebrow="BureauOS" title="BureauOS Overview" source="BureauOS Application Registry" updated={updated} className="h-full bg-black/35"><BureauOSRows apps={bureauRows} /></ExecutivePanel></div>
+            <div id="venture-pipeline" className="col-span-12"><ExecutivePanel eyebrow="Venture Pipeline" title="Stage Summary" source="BureauOS application registry" updated={updated} className="bg-black/35"><CompactStageSummary stages={pipelineStages} /></ExecutivePanel></div>
+
+            <div id="career-development" className="col-span-12"><ExecutivePanel eyebrow="Career" title="Career Command" source="Career Registry" updated={updated} className="h-full border-sky-300/20 bg-black/35"><CareerCommandConsole career={dashboard.careerProgress} /></ExecutivePanel></div>
+            <div id="engineering-brand" className="col-span-12 md:col-span-6 xl:col-span-4"><ExecutivePanel eyebrow="Engineering Brand" title="Content Pipeline" source="Knowledge Vault" updated={updated} className="h-full bg-black/35"><div className="grid grid-cols-3 gap-2">{["Ideas", "Research", "Recording", "Editing", "Scheduled", "Published"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.engineeringMetrics.metrics.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div></ExecutivePanel></div>
+            <div id="artist-management" className="col-span-12 md:col-span-6 xl:col-span-4"><ExecutivePanel eyebrow="Artist Management" title="Collector + Gallery Pipeline" source="Artist CRM" updated={updated} className="h-full bg-black/35"><div className="grid grid-cols-2 gap-2">{["Collectors", "Outreach", "Inventory", "Revenue"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.artistManagement.milestones.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div><div className="mt-3"><CompactFeed items={[...dashboard.artistManagement.priorities, ...dashboard.artistManagement.nextActions]} emptyLabel="No Activity Yet" max={3} /></div></ExecutivePanel></div>
+            <div id="research-center" className="col-span-12 md:col-span-6 xl:col-span-4"><ExecutivePanel eyebrow="Research" title="Research Center" source="Research Reports" updated={updated} className="h-full bg-black/35"><CompactFeed items={researchItems} emptyLabel="No Activity Yet" max={4} /></ExecutivePanel></div>
+            <div id="knowledge-vault" className="col-span-12 md:col-span-6 xl:col-span-4"><ExecutivePanel eyebrow="Knowledge" title="Knowledge Vault" source="Obsidian Vault" updated={updated} className="h-full bg-black/35"><div className="grid grid-cols-2 gap-2"><MetricTile compact label="Recent Notes" value={knowledgeVaultItems.length} tone={knowledgeVaultItems.length ? "good" : "muted"} /><MetricTile compact label="Decisions" value={asArray(dashboard.knowledgeVault?.recent_decisions).length} tone="warn" /><MetricTile compact label="References" value={asArray(dashboard.knowledgeVault?.referenced_documents).length} tone="good" /><MetricTile compact label="Health" value={`${dashboard.knowledgeVault?.knowledge_health ?? 0}%`} tone={(dashboard.knowledgeVault?.knowledge_health ?? 0) > 50 ? "good" : "muted"} /></div></ExecutivePanel></div>
+            {alertItems.length ? <div className="col-span-12 md:col-span-6 xl:col-span-4"><ExecutivePanel eyebrow="Alerts" title="Needs Attention" source="Actionable signals" updated={updated} className="h-full border-rose-300/20 bg-black/35"><CompactFeed items={alertItems.map((item) => `${item.title}: ${item.detail}`)} emptyLabel="No alerts" max={4} /></ExecutivePanel></div> : null}
+            <div className="col-span-12"><ExecutivePanel eyebrow="Activity" title="Activity Feed" source="Reports + Kanban + Watchdog" updated={updated} className="bg-black/35"><div className="grid gap-2 md:grid-cols-5">{executiveActivity.length ? executiveActivity.map((item, index) => <div key={`${item.source}-${index}`} className="rounded-lg border border-white/10 bg-white/[0.03] p-2 text-[11px]"><div className="mb-1 flex items-center justify-between gap-1"><span className="truncate font-semibold text-white">{item.source}</span><SignalDot tone={toneFromFinanceStatus(item.status)} /></div><p className="line-clamp-2 text-slate-300">{item.text}</p><p className="mt-1 text-[10px] text-slate-500">{item.time}</p></div>) : <div className="col-span-5 grid place-items-center rounded-xl border border-white/10 p-6 text-slate-500">No activity yet</div>}</div></ExecutivePanel></div>
+            <div id="hermes-operations" className="col-span-12"><ExecutivePanel eyebrow="Operations" title="Hermes Operations" source="Hermes Backend" updated={updated} className="bg-black/35"><OperationsHealthStrip cards={operationsCards} diagnostics={backendIntegrationItems} onDiagnostics={() => setActiveDrawer({ type: "diagnostics", items: backendIntegrationItems })} /></ExecutivePanel></div>
           </div>
-
-          <div className="xl:col-span-2"><ExecutivePanel eyebrow="Empire Health" title="Overall Operating Score" source="Weighted source metrics" updated={updated} className="h-full">
-            <Gauge value={empireScore} label="Empire Health" tone={empireTone} />
-            <div className="mt-3 grid grid-cols-2 gap-1.5">{domainHealth.slice(0, 8).map((domain) => { const tone = toneFromStatus(domain.status); return <div key={domain.label} className="flex items-center justify-between rounded-lg border border-white/10 bg-black/25 px-2 py-1.5 text-[11px]"><span className="flex items-center gap-1.5"><SignalDot tone={tone} />{domain.label}</span><span className={toneClasses(tone).text}>{domain.trend}</span></div>; })}</div>
-          </ExecutivePanel></div>
-
-          <div className="xl:col-span-2"><ExecutivePanel eyebrow="Decision Queue" title="Decisions Needed" source="Kanban review queue" updated={updated} className="h-full">
-            {decisionCards.length ? <div className="space-y-1.5">{decisionCards.slice(0, 3).map((card) => <div key={card.title} className="rounded-lg border border-amber-300/25 bg-amber-300/10 p-2 text-xs"><div className="flex items-center justify-between gap-2"><span className="line-clamp-1 font-semibold text-white">{card.title}</span><span className="text-amber-200">P0</span></div><p className="mt-1 line-clamp-1 text-slate-300">{card.impact}</p></div>)}</div> : <EmptyState label="No decisions" detail="No operator approvals are currently requested by source systems." />}
-          </ExecutivePanel></div>
-
-          <div className="xl:col-span-2"><ExecutivePanel eyebrow="Blockers" title="Current Blockers" source="Kanban + Notifications" updated={updated} className="h-full">
-            {blockerCards.length ? <div className="space-y-1.5">{blockerCards.slice(0, 3).map((card) => <div key={card.title} className="rounded-lg border border-rose-300/25 bg-rose-300/10 p-2 text-xs"><div className="flex items-center justify-between gap-2"><span className="line-clamp-1 font-semibold text-white">{card.title}</span><SignalDot tone="bad" /></div><p className="mt-1 line-clamp-1 text-slate-300">Impact: {card.impact}</p></div>)}</div> : <div className="grid h-full place-items-center rounded-lg border border-emerald-300/20 bg-emerald-300/10 p-4 text-base font-semibold text-emerald-200">All systems operational</div>}
-          </ExecutivePanel></div>
-
-          <div className="xl:col-span-2"><ExecutivePanel eyebrow="Live Stream" title="Activity Feed" source="Reports + Kanban + Watchdog" updated={updated} className="h-full">
-            <div className="relative max-h-56 space-y-2 overflow-y-auto before:absolute before:bottom-2 before:left-[7px] before:top-2 before:w-px before:bg-white/10">{activityItems.length ? activityItems.slice(0, 6).map((item, index) => { const tone = toneFromStatus(item.status); return <div key={`${item.source}-${index}`} className="relative flex gap-2"><SignalDot tone={tone} /><div className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 p-2 text-[11px]"><div className="flex items-center justify-between gap-2"><span className="line-clamp-1 font-semibold text-white">{item.source}</span><span className="shrink-0 text-slate-500">{item.time}</span></div><p className="mt-1 line-clamp-2 text-slate-300">{item.text}</p></div></div>; }) : <EmptyState label="No activity" detail="No operational movement reported by source systems." />}</div>
-          </ExecutivePanel></div>
-
-          <div className="xl:col-span-12"><QuickCaptureBar actions={quickCaptureActions} onCapture={(action) => setActiveDrawer({ type: "quick-capture", action })} /></div>
-
-          <div id="executive-operating-grid" className="xl:col-span-12 grid gap-3 xl:grid-cols-[4fr_5fr_3fr]">
-            {/* LEFT COLUMN */}
-            <div className="space-y-3">
-              <div id="mission-control"><ExecutivePanel eyebrow="Mission Control" title="P0 / P1 Operating Flow" source="Kanban" updated={updated}>
-                <div className="grid grid-cols-2 gap-2">
-                  <MetricTile compact label="P0/P1 Priorities" value={missionPriorities.length + blockedCount} tone={blockedCount || missionPriorities.length ? "warn" : "good"} />
-                  <MetricTile compact label="Due Today" value="No Data Yet" tone="muted" />
-                  <MetricTile compact label="Review Required" value={reviewCount} tone={reviewCount ? "warn" : "good"} />
-                  <MetricTile compact label="Blocked" value={blockedCount} tone={blockedCount ? "bad" : "good"} />
-                </div>
-                <button type="button" onClick={() => setActiveDrawer({ type: "completed", tasks: dashboard.engineeringMetrics.recentCompleted })} className="mt-2 flex w-full items-center justify-between rounded-lg border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-left hover:bg-emerald-300/15"><span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">Recently Completed</span><span className="text-lg font-semibold text-white">{completedItems.length}</span><span className="text-[10px] text-emerald-300">Open drawer</span></button>
-                <div className="mt-3 space-y-2 rounded-lg border border-white/10 bg-black/25 p-3">
-                  <ProgressBar label="Priority Tasks" value={totalBoardItems ? clampPercent((missionPriorities.length / Math.max(totalBoardItems, 1)) * 100) : 0} detail={`${missionPriorities.length} active priority signals`} tone="warn" />
-                  <ProgressBar label="Blocked" value={totalBoardItems ? clampPercent((blockedCount / Math.max(totalBoardItems, 1)) * 100) : 0} detail={`${blockedCount} blocked or waiting`} tone={blockedCount ? "bad" : "good"} />
-                  <ProgressBar label="Review Required" value={totalBoardItems ? clampPercent((reviewCount / Math.max(totalBoardItems, 1)) * 100) : 0} detail={`${reviewCount} review items`} tone={reviewCount ? "warn" : "good"} />
-                </div>
-                <div className="mt-3"><MissionControlRows tasks={missionRows.filter((row) => row.priority !== "P3").slice(0, 5)} onOpen={(task, priority) => setActiveDrawer({ type: "task", task, priority })} /></div>
-              </ExecutivePanel></div>
-            </div>
-
-            {/* CENTER COLUMN */}
-            <div className="space-y-3">
-              <div id="venture-portfolio"><ExecutivePanel eyebrow="Business Ventures" title="Registered Venture Command" source="Portfolio registry · Venture Registry" updated={updated}>
-                <VentureRows ventures={businessVentures.map((venture) => ({ ...venture, research: researchItems.find((item) => item.toLowerCase().includes(venture.displayName.toLowerCase())) }))} onOpen={(venture) => setActiveDrawer({ type: "venture", name: venture.displayName, data: venture.data, research: venture.research })} />
-              </ExecutivePanel></div>
-              <div id="bureauos"><ExecutivePanel eyebrow="BureauOS" title="BureauOS Overview" source="BureauOS Application Registry" updated={updated}>
-                <BureauOSRows apps={bureauRows} />
-              </ExecutivePanel></div>
-              <div id="venture-pipeline"><ExecutivePanel eyebrow="Venture Pipeline" title="Stage Summary" source="BureauOS application registry" updated={updated}>
-                <CompactStageSummary stages={pipelineStages} />
-              </ExecutivePanel></div>
-              <div id="engineering-brand"><ExecutivePanel eyebrow="Engineering Brand" title="Content Pipeline" source="Knowledge Vault" updated={updated}>
-                <div className="grid grid-cols-3 gap-2">{["Ideas", "Research", "Recording", "Editing", "Scheduled", "Published"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.engineeringMetrics.metrics.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div>
-              </ExecutivePanel></div>
-            </div>
-
-            {/* RIGHT COLUMN */}
-            <div className="space-y-3">
-              <div id="finance-command"><ExecutivePanel eyebrow="Finance" title="Finance Command Center" source="Finance registry" updated={updated}>
-                <div className="relative">
-                  {syncingFinance && <div className="absolute inset-0 z-10 grid place-items-center rounded-xl border border-cyan-300/20 bg-black/60 text-xs text-cyan-100"><span className="inline-flex items-center gap-2"><Spinner className="h-4 w-4" /> {financeProgressStep || "Syncing..."}</span></div>}
-                  <div className="grid grid-cols-2 gap-2">{financeCards.map(({ label, metric }) => <MetricTile compact key={label} label={label} value={metric?.value ?? "No Metrics Yet"} detail={metric?.detail || undefined} tone={metric ? "good" : "muted"} />)}</div>
-                  <FinanceSyncConsole finance={dashboard.financialMetrics} syncing={syncingFinance} connectingBank={connectingBank} progressStep={financeProgressStep} onSync={handleFinanceSync} onConnectBank={handleConnectBank} />
-                  {financeToast && <div role="status" className={`mt-3 rounded-lg border p-2 text-xs ${financeToast.tone === "good" ? "border-emerald-300/25 bg-emerald-300/10 text-emerald-100" : "border-rose-300/25 bg-rose-300/10 text-rose-100"}`}>{financeToast.message}</div>}
-                </div>
-              </ExecutivePanel></div>
-
-              <div id="career-development"><ExecutivePanel eyebrow="Career" title="Career Command" source="Career Registry" updated={updated}>
-                <div className="grid grid-cols-3 gap-2"><MetricTile compact label="Current Role" value="End User Technician" tone="good" /><MetricTile compact label="Target Role" value="Cloud Engineer" tone="warn" /><MetricTile compact label="Future Role" value="Cloud Architect" tone="muted" /></div>
-                <div className="mt-3 space-y-1.5">{["AWS", "Azure", "Terraform", "Linux", "Python", "Security", "System Design"].map((skill) => <ProgressBar key={skill} label={skill} value={clampPercent(dashboard.careerProgress.milestones.find((item) => item.label.toLowerCase().includes(skill.toLowerCase()))?.value) ?? 0} tone="muted" />)}</div>
-              </ExecutivePanel></div>
-
-              <div id="research-center"><ExecutivePanel eyebrow="Research" title="Research Center" source="Research Reports" updated={updated}>
-                <div className="grid grid-cols-2 gap-2">{["Market Intelligence", "Competitive Intelligence", "Open Questions", "Recent Findings", "Opportunities"].map((label) => <MetricTile compact key={label} label={label} value={researchItems.some((item) => item.toLowerCase().includes(label.toLowerCase())) ? "Active" : "0"} tone={researchItems.some((item) => item.toLowerCase().includes(label.toLowerCase())) ? "good" : "muted"} />)}</div>
-              </ExecutivePanel></div>
-
-              <div id="knowledge-vault"><ExecutivePanel eyebrow="Knowledge" title="Knowledge Vault" source="Obsidian Vault" updated={updated}>
-                <div className="grid grid-cols-2 gap-2"><MetricTile compact label="Recently Modified Notes" value={knowledgeVaultItems.length} tone={knowledgeVaultItems.length ? "good" : "muted"} /><MetricTile compact label="Most Referenced Notes" value={asArray(dashboard.knowledgeVault?.referenced_documents).length} tone={asArray(dashboard.knowledgeVault?.referenced_documents).length ? "good" : "muted"} /><MetricTile compact label="Recent Decisions" value={asArray(dashboard.knowledgeVault?.recent_decisions).length} tone={asArray(dashboard.knowledgeVault?.recent_decisions).length ? "warn" : "good"} /><MetricTile compact label="Knowledge Health" value={`${dashboard.knowledgeVault?.knowledge_health ?? 0}%`} tone={(dashboard.knowledgeVault?.knowledge_health ?? 0) > 50 ? "good" : "muted"} /></div>
-              </ExecutivePanel></div>
-
-              <div id="artist-management"><ExecutivePanel eyebrow="Artist Management" title="Collector + Gallery Pipeline" source="Artist CRM" updated={updated}>
-                <div className="grid grid-cols-2 gap-2">{["Collectors", "Outreach", "Inventory", "Upcoming Events", "Revenue"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.artistManagement.milestones.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div>
-              </ExecutivePanel></div>
-
-              <div id="hermes-operations"><ExecutivePanel eyebrow="Operations" title="Hermes Health Strip" source="Hermes Backend" updated={updated}>
-                <OperationsHealthStrip cards={operationsCards} diagnostics={backendIntegrationItems} onDiagnostics={() => setActiveDrawer({ type: "diagnostics", items: backendIntegrationItems })} />
-              </ExecutivePanel></div>
-            </div>
-          </div>
-
-          <div id="engineering-brand" className="xl:col-span-3"><ExecutivePanel eyebrow="Engineering Brand" title="Content Pipeline" source="Knowledge Vault" updated={updated}>
-            <div className="grid grid-cols-2 gap-2">{["Ideas", "Research", "Recording", "Editing", "Scheduled", "Published"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.engineeringMetrics.metrics.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div><div className="mt-3"><MiniBars values={["Ideas", "Research", "Recording", "Editing", "Scheduled", "Published"].map((label) => Number(dashboard.engineeringMetrics.metrics.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0))} tone="good" /></div>
-          </ExecutivePanel></div>
-
-          <div id="research-center" className="xl:col-span-3"><ExecutivePanel eyebrow="Research" title="Research Center" source="Research Reports" updated={updated}>
-            <CompactFeed items={researchItems} emptyLabel="No Activity Yet" max={4} /><div className="mt-2 grid grid-cols-2 gap-1.5">{["Market Intelligence", "Competitive Intelligence", "Open Questions", "Opportunities"].map((label) => <MetricTile compact key={label} label={label} value={researchItems.some((item) => item.toLowerCase().includes(label.toLowerCase())) ? "Active" : "0"} tone={researchItems.some((item) => item.toLowerCase().includes(label.toLowerCase())) ? "good" : "muted"} />)}</div>
-          </ExecutivePanel></div>
-
-          <div id="knowledge-vault" className="xl:col-span-3"><ExecutivePanel eyebrow="Knowledge" title="Knowledge Vault" source="Obsidian Vault" updated={updated}>
-            <div className="grid grid-cols-2 gap-2"><MetricTile compact label="Recently Modified Notes" value={knowledgeVaultItems.length} tone={knowledgeVaultItems.length ? "good" : "muted"} /><MetricTile compact label="Most Referenced Notes" value={asArray(dashboard.knowledgeVault?.referenced_documents).length} tone={asArray(dashboard.knowledgeVault?.referenced_documents).length ? "good" : "muted"} /><MetricTile compact label="Recent Decisions" value={asArray(dashboard.knowledgeVault?.recent_decisions).length} tone={asArray(dashboard.knowledgeVault?.recent_decisions).length ? "warn" : "good"} /><MetricTile compact label="Knowledge Health" value={`${dashboard.knowledgeVault?.knowledge_health ?? 0}%`} tone={(dashboard.knowledgeVault?.knowledge_health ?? 0) > 50 ? "good" : "muted"} /></div><div className="mt-2"><MiniBars values={asArray(dashboard.knowledgeVault?.vault_growth_trend).map((point) => Number(point.count || 0))} tone="good" /></div><div className="mt-2"><CompactFeed items={knowledgeVaultItems} emptyLabel="No Activity Yet" max={3} /></div>
-          </ExecutivePanel></div>
-
-          <div id="artist-management" className="xl:col-span-3"><ExecutivePanel eyebrow="Artist Management" title="Collector + Gallery Pipeline" source="Artist CRM" updated={updated}>
-            <div className="grid grid-cols-2 gap-2">{["Collectors", "Gallery Outreach", "Inventory", "Active Collection", "Upcoming Events", "Revenue"].map((label) => <MetricTile compact key={label} label={label} value={dashboard.artistManagement.milestones.find((item) => item.label.toLowerCase().includes(label.toLowerCase()))?.value ?? 0} tone="muted" />)}</div><div className="mt-3"><CompactFeed items={[...dashboard.artistManagement.priorities, ...dashboard.artistManagement.nextActions]} emptyLabel="No Activity Yet" max={3} /></div>
-          </ExecutivePanel></div>
-
-          <div id="hermes-operations" className="xl:col-span-3"><ExecutivePanel eyebrow="Operations" title="Hermes Health Strip" source="Hermes Backend" updated={updated}>
-            <OperationsHealthStrip cards={operationsCards} diagnostics={backendIntegrationItems} onDiagnostics={() => setActiveDrawer({ type: "diagnostics", items: backendIntegrationItems })} />
-          </ExecutivePanel></div>
-        </div>
-
+        </main>
       </div>
       <DashboardDrawerPanel drawer={activeDrawer} onClose={() => setActiveDrawer(null)} onCaptured={async () => { window.dispatchEvent(new CustomEvent("hermes:dashboard-refresh")); }} />
     </section>

@@ -99,10 +99,11 @@ def test_finance_command_center_frontend_uses_source_initialized_empty_state():
         source.index('eyebrow="Career" title="Career Command"')
     ]
 
-    assert "No Metrics Yet" in finance_section
+    assert "No Metrics Yet" not in finance_section
     assert "Awaiting" not in finance_section
     assert "No Data Yet" not in finance_section
     assert "Not Configured" not in finance_section
+    assert "Finance Registry via Dashboard API" in finance_section
 
 
 def test_finance_api_empty_seed_widgets_trends(monkeypatch, tmp_path):
@@ -349,3 +350,106 @@ def test_finance_plaid_exchange_public_token_returns_friendly_failure(monkeypatc
 
     assert resp.status_code == 400
     assert resp.json()["detail"] == {"code": "configuration_missing", "message": "Plaid credentials missing."}
+
+
+def test_normalized_registry_drives_executive_dashboard_kpis_and_api_payload(tmp_path, monkeypatch):
+    from hermes_cli.finance_registry import (
+        dashboard_financial_metrics,
+        ensure_schema,
+        finance_command_center_contract,
+        finish_finance_sync_run,
+        start_finance_sync_run,
+        upsert_plaid_registry_data,
+    )
+    import sqlite3
+
+    path = tmp_path / "registry.db"
+    monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(path))
+    run_id = start_finance_sync_run(path=path)
+    counts = upsert_plaid_registry_data(
+        {
+            "institution": {"institution_id": "ins_live", "name": "Live Registry Bank", "item_id": "item_live"},
+            "accounts": [
+                {"account_id": "acc_checking", "name": "Checking", "type": "depository", "subtype": "checking", "balances": {"current": 100, "available": 80, "iso_currency_code": "USD"}},
+                {"account_id": "acc_savings", "name": "Savings", "type": "depository", "subtype": "savings", "balances": {"current": 200, "available": 200, "iso_currency_code": "USD"}},
+                {"account_id": "acc_ef", "name": "Emergency Fund", "type": "depository", "subtype": "money market", "fund_category": "emergency", "balances": {"current": 500, "available": 500, "iso_currency_code": "USD"}},
+                {"account_id": "acc_car", "name": "Car Fund", "type": "depository", "subtype": "cash management", "fund_category": "car", "balances": {"current": 400, "available": 400, "iso_currency_code": "USD"}},
+                {"account_id": "acc_brokerage", "name": "Brokerage", "type": "investment", "subtype": "brokerage", "balances": {"current": 1000, "iso_currency_code": "USD"}},
+                {"account_id": "acc_credit", "name": "Credit Card", "type": "credit", "subtype": "credit card", "balances": {"current": 50, "available": 150, "iso_currency_code": "USD"}},
+                {"account_id": "acc_loan", "name": "Student Loan", "type": "loan", "subtype": "student", "balances": {"current": 300, "iso_currency_code": "USD"}},
+            ],
+            "transactions": [
+                {"transaction_id": "txn_income", "account_id": "acc_checking", "date": "2099-06-30", "amount": -1000, "name": "Payroll", "pending": False},
+                {"transaction_id": "txn_expense", "account_id": "acc_checking", "date": "2099-06-29", "amount": 400, "name": "Rent", "pending": False},
+                {"transaction_id": "txn_transfer", "account_id": "acc_savings", "date": "2099-06-28", "amount": 25, "name": "Transfer to savings", "category": ["Transfer"], "pending": False},
+            ],
+            "holdings": [{"account_id": "acc_brokerage", "security_id": "sec_vti", "quantity": 10, "institution_price": 100, "institution_value": 1000, "iso_currency_code": "USD"}],
+            "securities": [{"security_id": "sec_vti", "ticker_symbol": "VTI", "name": "Total Market ETF"}],
+        },
+        sync_run_id=run_id,
+        path=path,
+    )
+    finish_finance_sync_run(run_id, status="success", message="ok", counts=counts, path=path)
+
+    # Add an older balance/investment point so trend charts prove normalized history is used, not finance_snapshots.
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_schema(conn)
+        conn.execute("INSERT INTO finance_sync_runs (id, provider, environment, started_at, completed_at, status, accounts_count, transactions_count, liabilities_count, investments_count, message) VALUES (99, 'plaid', 'sandbox', 1, 1, 'success', 7, 3, 0, 1, 'older')")
+        for account_id, balance in [("acc_checking", 90), ("acc_savings", 190), ("acc_ef", 450), ("acc_car", 350), ("acc_credit", 40), ("acc_loan", 320)]:
+            conn.execute("INSERT INTO finance_balances (provider, provider_account_id, captured_at, current_balance, available_balance, iso_currency_code, sync_run_id) VALUES ('plaid', ?, 1, ?, ?, 'USD', 99)", (account_id, balance, balance))
+        conn.execute("INSERT INTO finance_investments (provider, provider_account_id, security_id, ticker_symbol, security_name, quantity, price, investment_holdings, iso_currency_code, captured_at, sync_run_id) VALUES ('plaid', 'acc_brokerage', 'sec_vti_old', 'VTI', 'Total Market ETF', 9, 100, 900, 'USD', 1, 99)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    contract = finance_command_center_contract(path=path)
+    metrics = contract["metrics"]
+    kpis = contract["executive_dashboard"]["kpis"]
+
+    assert contract["source"]["model"] == "normalized"
+    assert metrics["cash_position"] == 1200
+    assert metrics["brokerage_value"] == 1000
+    assert metrics["total_debt"] == 350
+    assert metrics["net_worth"] == 1850
+    assert metrics["monthly_income"] == 1000
+    assert metrics["monthly_expenses"] == 400
+    assert metrics["net_cash_flow"] == 600
+    assert metrics["runway_months"] == 3
+    assert metrics["savings_rate_percent"] == 60
+    assert kpis["cash_available"]["available_cash"] == 1200
+    assert kpis["credit_utilization"]["current_utilization"] == 25
+    assert kpis["emergency_fund"]["current"] == 500
+    assert kpis["emergency_fund"]["progress_percent"] == 50
+    assert kpis["debt"]["total_debt"] == 350
+    assert contract["executive_dashboard"]["connected_institutions"][0]["institution_name"] == "Live Registry Bank"
+    assert contract["executive_dashboard"]["recent_activity"]["latest_income"][0]["name"] == "Payroll"
+    assert contract["executive_dashboard"]["recent_activity"]["investment_activity"]
+    assert contract["executive_dashboard"]["alerts"]
+    assert all("placeholder" not in insight.lower() for insight in contract["executive_dashboard"]["insights"])
+    assert len(contract["executive_dashboard"]["trends"]["net_worth_30_days"]["points"]) >= 2
+
+    api_payload = dashboard_financial_metrics()
+    api_exec = api_payload["executive_dashboard"]
+    assert api_payload["finance_command_center"]["source"]["model"] == "normalized"
+    assert api_exec["kpis"]["net_worth"]["current"] == 1850
+    assert api_exec["kpis"]["cash_available"]["available_cash"] == 1200
+    assert api_exec["connected_institutions"]
+    assert api_exec["recent_activity"]["largest_recent_expenses"]
+
+
+def test_finance_dashboard_source_has_no_legacy_or_mock_finance_dependencies():
+    source = (REPO_ROOT / "web" / "src" / "pages" / "ReportsPage.tsx").read_text(encoding="utf-8")
+    finance_source = source[
+        source.index("function ExecutiveFinanceDashboard"):
+        source.index("function FinanceSyncConsole")
+    ]
+    banned = ["finance_snapshots", "mockFinance", "mockPlaid", "demo", "placeholder"]
+    for token in banned:
+        assert token not in finance_source
+    assert "finance.executiveDashboard" in finance_source
+    assert "financeKpi(exec" in finance_source
+    assert "exec.connected_institutions" in finance_source
+    assert "exec.recent_activity" in finance_source
+    assert "exec.trends" in finance_source

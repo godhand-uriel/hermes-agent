@@ -1321,10 +1321,11 @@ class TestWebServerEndpoints:
         assert data["financial_metrics"]["ai_usage_cost_usd"]["estimated"] == 0.42
         assert data["weekly_reports"]["latest"][0]["title"] == "Weekly Report"
         assert data["career_progress"]["status"] == "available"
-        assert data["career_progress"]["current_role"] == "End User Technician"
-        assert data["career_progress"]["target_role"] == "Cloud Engineer"
-        assert data["career_progress"]["future_role"] == "Cloud Architect"
-        assert len(data["career_progress"]["items"]) == 8
+        assert data["career_progress"]["current_role"] is None
+        assert data["career_progress"]["target_role"] is None
+        assert data["career_progress"]["future_role"] is None
+        assert data["career_progress"]["summary"] is None
+        assert len(data["career_progress"]["items"]) == 0
         assert data["artist_management"]["status"] == "available"
         assert len(data["artist_management"]["items"]) == 6
         assert data["artist_management"]["inventory"] == 0
@@ -1350,25 +1351,165 @@ class TestWebServerEndpoints:
         assert empty_data["executive_briefing"]["review_required_tasks"] == []
         assert empty_data["executive_briefing"]["completed_tasks"] == []
 
-    def test_dashboard_v2_reads_obsidian_operating_notes(self, tmp_path, monkeypatch):
+    def test_dashboard_v2_reads_extended_career_registry_as_single_source(self, tmp_path, monkeypatch):
+        registry_path = tmp_path / "career_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "current_role": "Support Engineer",
+                    "employer": "Registry Employer",
+                    "client": "Registry Client",
+                    "employment_type": "contract",
+                    "hourly_rate": 41,
+                    "annual_salary": 85280,
+                    "contract_to_perm_status": "eligible",
+                    "start_date": "2026-01-15",
+                    "department": "IT Operations",
+                    "target_role": "Cloud Engineer",
+                    "target_salary": 120000,
+                    "target_timeline": "12 months",
+                    "future_role": "Cloud Architect",
+                    "next_milestone": "Finish lab",
+                    "current_priority": "AZ-900",
+                    "current_blockers": [],
+                    "roadmap_progress_percent": 25,
+                    "today_tasks": ["Study identity module"],
+                    "study_streak_days": 4,
+                    "study_progress_percent": 35,
+                    "resume_status": "needs update",
+                    "linkedin_status": "needs input",
+                    "portfolio_status": "needs project",
+                    "interview_readiness": "not ready",
+                    "applications_sent": 0,
+                    "job_search_status": "not started",
+                    "compensation_notes": "target raise after certification",
+                    "next_income_lever": "complete certification",
+                    "source_connections": {
+                        "obsidian": {"status": "Connected", "notes_used": ["Career Development/First Job.md"]},
+                        "resume": {"status": "Not connected", "needed_user_action": "Provide latest resume."},
+                        "github": {"status": "Connected", "profile": "https://github.com/example"},
+                        "calendar": {"status": "Not connected", "needed_user_action": "Complete calendar OAuth."},
+                    },
+                    "source_evidence": [
+                        {"field": "current_role", "source": "Career Development/First Job.md:21", "value": "Support Engineer"}
+                    ],
+                    "portfolio_projects": [{"name": "registry-project", "url": "https://github.com/example/registry-project"}],
+                    "certifications": [
+                        {
+                            "name": "AZ-900",
+                            "provider": "Microsoft",
+                            "priority": "high",
+                            "status": "studying",
+                            "progress_percent": 35,
+                            "exam_date": "2026-08-01",
+                            "expiration_date": None,
+                        }
+                    ],
+                    "skills": [
+                        {
+                            "name": "Azure",
+                            "current_proficiency_percent": 20,
+                            "target_proficiency_percent": 70,
+                            "last_practiced": "2026-06-01",
+                            "next_task": "Build identity lab",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_CAREER_REGISTRY_PATH", str(registry_path))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "missing-vault"))
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        career = data["career_progress"]
+        assert career["source"]["path"] == str(registry_path)
+        assert career["employer"] == "Registry Employer"
+        assert career["hourly_rate"] == 41
+        assert career["annual_salary"] == 85280
+        assert career["target_salary"] == 120000
+        assert career["target_timeline"] == "12 months"
+        assert career["today_tasks"] == ["Study identity module"]
+        assert career["certifications"][0]["provider"] == "Microsoft"
+        assert career["certifications"][0]["status"] == "studying"
+        assert career["skills"][0]["next_task"] == "Build identity lab"
+        assert career["source_connections"]["obsidian"]["status"] == "Connected"
+        assert career["source_connections"]["resume"]["needed_user_action"] == "Provide latest resume."
+        assert career["source_connections"]["github"]["profile"] == "https://github.com/example"
+        assert career["source_connections"]["calendar"]["status"] == "Not connected"
+        assert career["source_evidence"][0]["source"] == "Career Development/First Job.md:21"
+        assert career["portfolio_projects"][0]["name"] == "registry-project"
+        assert data["dashboard_sources"]["career_registry"] == career
+        assert "career_progress" in data
+        assert "career_registry" in data["dashboard_sources"]
+
+    def test_dashboard_v2_career_registry_missing_fields_serialize_as_null_not_fabricated(self, tmp_path, monkeypatch):
+        registry_path = tmp_path / "career_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "current_role": "Only Real Role",
+                    "target_role": "Only Real Target",
+                    "future_role": "Only Real Future",
+                    "certifications": [{"name": "Real Cert", "progress_percent": 0}],
+                    "skills": [{"name": "Real Skill", "current_proficiency_percent": 5, "target_proficiency_percent": 50}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_CAREER_REGISTRY_PATH", str(registry_path))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "missing-vault"))
+
+        data = self.client.get("/api/dashboard/v2").json()
+        career = data["career_progress"]
+
+        assert career["current_role"] == "Only Real Role"
+        assert "employer" not in career or career["employer"] is None
+        assert "hourly_rate" not in career or career["hourly_rate"] is None
+        assert career["certifications"][0].get("provider") is None
+        assert career["certifications"][0].get("status") is None
+        assert career["skills"][0].get("next_task") is None
+        assert "End User Technician" not in json.dumps(career)
+
+    def test_dashboard_v2_career_command_reads_registry_not_obsidian_note_directly(self, tmp_path, monkeypatch):
         vault = tmp_path / "vault"
         career_note = vault / "Career Development" / "Career Development.md"
         artist_note = vault / "Business Ventures" / "Artist Management" / "Artist Management.md"
         career_note.parent.mkdir(parents=True)
         artist_note.parent.mkdir(parents=True)
+        registry_path = tmp_path / "career_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "current_role": "Registry-backed Role",
+                    "target_role": "Registry-backed Target",
+                    "future_role": "Registry-backed Future",
+                    "source_connections": {
+                        "obsidian": {"status": "Connected", "notes_used": ["Career Development/Career Development.md"]}
+                    },
+                    "source_evidence": [
+                        {"field": "current_role", "source": "Career Development/First Job.md:21", "value": "Registry-backed Role"}
+                    ],
+                    "certifications": [],
+                    "skills": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         career_note.write_text(
             "---\n"
             "dashboard_source: true\n"
             "dashboard_area: career_development\n"
             "source_type: obsidian_operating_note\n"
             "---\n\n"
-            "# Vision\n\nBuild durable career leverage.\n\n"
-            "# Current Phase\n\nCapability-building phase focused on cloud depth.\n\n"
-            "# Current Priorities\n\n- Finish CS coursework.\n- Ship portfolio proof.\n\n"
-            "# Blockers\n\n- Time constraints.\n\n"
-            "# Risks\n\n- Studying without shipping.\n\n"
-            "# Next Actions\n\n- Pick next portfolio project.\n\n"
-            "# KPIs\n\n- Courses completed.\n- Projects shipped.\n",
+            "# Vision\n\nThis note must not be parsed directly by Career Command.\n\n"
+            "# Current Phase\n\nObsidian-only phase.\n\n"
+            "# Current Priorities\n\n- Obsidian-only priority.\n",
             encoding="utf-8",
         )
         artist_note.write_text(
@@ -1383,23 +1524,26 @@ class TestWebServerEndpoints:
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(vault))
+        monkeypatch.setenv("HERMES_CAREER_REGISTRY_PATH", str(registry_path))
 
         resp = self.client.get("/api/dashboard/v2")
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["career_progress"]["status"] == "available"
-        assert data["career_progress"]["source"]["path"].endswith("Career Development/Career Development.md")
-        assert data["career_progress"]["phase"] == "Capability-building phase focused on cloud depth."
-        assert data["career_progress"]["summary"] == "Build durable career leverage."
-        assert data["career_progress"]["priorities"] == ["Finish CS coursework.", "Ship portfolio proof."]
-        assert data["career_progress"]["blockers"] == ["Time constraints."]
-        assert data["career_progress"]["risks"] == ["Studying without shipping."]
-        assert data["career_progress"]["next_actions"] == ["Pick next portfolio project."]
-        assert data["career_progress"]["kpis"] == ["Courses completed.", "Projects shipped."]
-        assert data["career_progress"]["items"][0] == {"label": "Current phase", "value": "Capability-building phase focused on cloud depth."}
+        career = data["career_progress"]
+        assert career["status"] == "available"
+        assert career["source"]["path"] == str(registry_path)
+        assert career["current_role"] == "Registry-backed Role"
+        assert career["target_role"] == "Registry-backed Target"
+        assert career["source_connections"]["obsidian"]["status"] == "Connected"
+        assert career["source_evidence"][0]["source"] == "Career Development/First Job.md:21"
+        assert "Obsidian-only phase" not in json.dumps(career)
 
         assert data["artist_management"]["status"] == "available"
+        assert data["artist_management"]["source"]["path"].endswith("Business Ventures/Artist Management/Artist Management.md")
+        assert data["artist_management"]["phase"] == "Foundation and positioning phase."
+        assert data["artist_management"]["summary"] == "Build a premium contemporary artist brand."
+        assert data["artist_management"]["items"][0] == {"label": "Current phase", "value": "Foundation and positioning phase."}
         assert data["artist_management"]["phase"] == "Foundation and positioning phase."
         assert data["artist_management"]["priorities"] == ["Define next collection."]
         assert data["artist_management"]["blockers"] == ["Collector pipeline needs review."]

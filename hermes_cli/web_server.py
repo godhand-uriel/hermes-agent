@@ -7109,30 +7109,42 @@ def _dashboard_registry_path(env_name: str, relative_path: str) -> Path:
 
 
 _DEFAULT_CAREER_REGISTRY: dict[str, Any] = {
-    "current_role": "End User Technician",
-    "target_role": "Cloud Engineer",
-    "future_role": "Cloud Architect",
-    "next_milestone": "Complete AWS Solutions Architect Associate study track",
-    "current_priority": "AWS Solutions Architect Associate",
+    "schema_version": 2,
+    "current_role": None,
+    "employer": None,
+    "client": None,
+    "employment_type": None,
+    "hourly_rate": None,
+    "annual_salary": None,
+    "contract_to_perm_status": None,
+    "start_date": None,
+    "department": None,
+    "conversion_target": None,
+    "target_role": None,
+    "future_role": None,
+    "target_salary": None,
+    "target_timeline": None,
+    "skill_gaps": [],
+    "next_milestone": None,
+    "current_priority": None,
     "current_blockers": [],
-    "roadmap_progress_percent": 18,
-    "certifications": [
-        {"name": "AWS Solutions Architect Associate", "progress_percent": 15, "target_completion_date": None},
-        {"name": "Terraform Associate", "progress_percent": 0, "target_completion_date": None},
-        {"name": "AZ-900", "progress_percent": 0, "target_completion_date": None},
-        {"name": "Linux+", "progress_percent": 0, "target_completion_date": None},
-        {"name": "Security+", "progress_percent": 0, "target_completion_date": None},
-    ],
-    "skills": [
-        {"name": "AWS", "current_proficiency_percent": 20, "target_proficiency_percent": 80},
-        {"name": "Azure", "current_proficiency_percent": 10, "target_proficiency_percent": 65},
-        {"name": "Terraform", "current_proficiency_percent": 10, "target_proficiency_percent": 75},
-        {"name": "Linux", "current_proficiency_percent": 35, "target_proficiency_percent": 80},
-        {"name": "Python", "current_proficiency_percent": 30, "target_proficiency_percent": 70},
-        {"name": "Security", "current_proficiency_percent": 25, "target_proficiency_percent": 70},
-        {"name": "Networking", "current_proficiency_percent": 30, "target_proficiency_percent": 75},
-        {"name": "System Design", "current_proficiency_percent": 15, "target_proficiency_percent": 70},
-    ],
+    "roadmap_progress_percent": None,
+    "today_tasks": [],
+    "weekly_plan": [],
+    "study_streak_days": None,
+    "study_progress_percent": None,
+    "resume_status": None,
+    "linkedin_status": None,
+    "portfolio_status": None,
+    "interview_readiness": None,
+    "applications_sent": None,
+    "job_search_status": None,
+    "compensation_notes": None,
+    "next_income_lever": None,
+    "certifications": [],
+    "skills": [],
+    "source_connections": {},
+    "source_evidence": [],
 }
 
 _DEFAULT_ENGINEERING_BRAND_REGISTRY: dict[str, Any] = {
@@ -7174,11 +7186,6 @@ def _load_dashboard_json_registry(env_name: str, relative_path: str, default_pay
 
 
 _DASHBOARD_OBSIDIAN_OPERATING_NOTES: dict[str, dict[str, str]] = {
-    "career_progress": {
-        "area": "career_development",
-        "label": "Career Development",
-        "relative_path": "Career Development/Career Development.md",
-    },
     "artist_management": {
         "area": "artist_management",
         "label": "Artist Management",
@@ -7339,9 +7346,15 @@ def _dashboard_career_registry_contract() -> dict[str, Any]:
         for item in certifications
         if isinstance(item, dict)
     ]
+    summary_parts = [
+        str(value)
+        for value in (payload.get("current_role"), payload.get("target_role"), payload.get("future_role"))
+        if value not in (None, "")
+    ]
     return {
+        **payload,
         "status": "available" if source.get("configured") else "unconfigured",
-        "summary": f"{payload.get('current_role')} → {payload.get('target_role')} → {payload.get('future_role')}",
+        "summary": " → ".join(summary_parts) if summary_parts else None,
         "current_role": payload.get("current_role"),
         "target_role": payload.get("target_role"),
         "future_role": payload.get("future_role"),
@@ -7522,25 +7535,11 @@ def _dashboard_health_score(response: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dashboard_collect_obsidian_operating_notes() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
-    career_registry = _dashboard_career_registry_contract()
-    notes: dict[str, dict[str, Any]] = {"career_progress": career_registry}
+    notes: dict[str, dict[str, Any]] = {"career_progress": _dashboard_career_registry_contract()}
     errors: list[dict[str, str]] = []
     for field, mapping in _DASHBOARD_OBSIDIAN_OPERATING_NOTES.items():
         note, error = _read_dashboard_operating_note(field, mapping)
-        if field == "career_progress":
-            if note.get("status") == "unconfigured":
-                note = career_registry
-            else:
-                # Keep Obsidian operating-note narrative while guaranteeing the
-                # source-backed career registry fields/metrics are always present.
-                note = {
-                    **career_registry,
-                    **note,
-                    "items": note.get("items") or career_registry.get("items") or [],
-                    "milestones": career_registry.get("milestones") or note.get("milestones") or [],
-                    "source": {**(note.get("source") or {}), "registry": career_registry.get("source"), "operating_note": note.get("source")},
-                }
-        elif field == "artist_management" and note.get("status") == "unconfigured":
+        if field == "artist_management" and note.get("status") == "unconfigured":
             note = _dashboard_artist_management_contract()
         notes[field] = note
         if error:

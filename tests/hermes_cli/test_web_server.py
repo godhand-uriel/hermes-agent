@@ -613,6 +613,82 @@ class TestWebServerEndpoints:
         assert config["dashboard"]["theme"] == "ember"
         assert config["dashboard"]["font"] == "jetbrains-mono"
 
+    def test_quick_capture_endpoints_write_sources_and_dashboard_refreshes(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        from hermes_cli import kanban_db
+
+        home = get_hermes_home()
+        vault = home / "ObsidianVault"
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(vault))
+
+        before = self.client.get("/api/dashboard/v2")
+        assert before.status_code == 200
+        before_total = before.json()["board_health"]["total_tasks"]
+
+        task_resp = self.client.post("/api/capture/task", json={
+            "title": "Quick Capture Task",
+            "description": "Captured from dashboard test",
+            "priority": 7,
+            "owner": "engineering_lab",
+            "due_date": "2026-07-01",
+        })
+        assert task_resp.status_code == 200
+        assert task_resp.json()["success"] is True
+        assert task_resp.json()["source_written"] is True
+        task_id = task_resp.json()["id"]
+        conn = kanban_db.connect()
+        try:
+            row = conn.execute("SELECT title, assignee, priority, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        finally:
+            conn.close()
+        assert row["title"] == "Quick Capture Task"
+        assert row["assignee"] == "engineering_lab"
+        assert row["priority"] == 7
+        assert "review-required" in row["body"]
+
+        research_resp = self.client.post("/api/capture/research", json={
+            "topic": "Quick Capture Research",
+            "research_area": "Dashboard Operations",
+            "notes": "Research registry write test",
+        })
+        assert research_resp.status_code == 200
+        research_path = home / "research" / "registry.json"
+        research_payload = json.loads(research_path.read_text())
+        assert any(item["topic"] == "Quick Capture Research" for item in research_payload["research"])
+
+        venture_resp = self.client.post("/api/capture/venture", json={
+            "venture_name": "Quick Capture Venture",
+            "description": "Venture registry write test",
+            "stage": "Validation",
+            "priority": 3,
+        })
+        assert venture_resp.status_code == 200
+        venture_path = home / "ventures" / "registry.json"
+        venture_payload = json.loads(venture_path.read_text())
+        assert any(item["name"] == "Quick Capture Venture" and item["stage"] == "Validation" for item in venture_payload["ventures"])
+
+        note_resp = self.client.post("/api/capture/note", json={"title": "Quick Capture Note", "content": "Note body"})
+        assert note_resp.status_code == 200
+        notes = list((vault / "Inbox").glob("*-quick-capture-note.md"))
+        assert notes and "Note body" in notes[0].read_text()
+
+        idea_resp = self.client.post("/api/capture/idea", json={"idea_text": "First idea"})
+        assert idea_resp.status_code == 200
+        second_idea_resp = self.client.post("/api/capture/idea", json={"idea_text": "Second idea"})
+        assert second_idea_resp.status_code == 200
+        inbox_text = (vault / "Inbox.md").read_text()
+        assert "First idea" in inbox_text
+        assert "Second idea" in inbox_text
+        assert inbox_text.count("## ") == 2
+
+        after = self.client.get("/api/dashboard/v2")
+        assert after.status_code == 200
+        after_data = after.json()
+        assert after_data["board_health"]["total_tasks"] == before_total + 1
+        assert after_data["board_health"]["review_required"] >= 1
+        assert after_data["knowledge_vault"]["total_notes"] >= 2
+        assert after_data["generated_reports"]["latest"]["research_capture"]["report"]["title"] == "Quick Capture Research"
+
 
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
@@ -1472,26 +1548,42 @@ class TestWebServerEndpoints:
 
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
         monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
-        reports_dir = tmp_path / "reports"
-        reports_dir.mkdir()
-        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
-        venture_registry = tmp_path / "venture_registry.json"
-        venture_registry.write_text(
+        registry_path = tmp_path / "venture-registry.json"
+        registry_path.write_text(
             json.dumps(
                 {
                     "ventures": [
-                        {"name": "BureauOS"},
-                        {"name": "Parlay Analyzer"},
-                        {"name": "Trust Base Social Platform"},
-                        {"name": "Frontend Streaming Platform"},
+                        {"id": "bureauos", "name": "BureauOS", "stage": "Validation", "confidence": 72, "next_milestone": "Select First MVP"},
+                        {"id": "parlay-analyzer", "name": "Parlay Analyzer", "stage": "Research", "confidence": 64, "next_milestone": "Define Core User Workflow"},
+                        {"id": "trustbase", "name": "TrustBase", "stage": "Research", "confidence": 68, "next_milestone": "Validate Trust Model", "aliases": ["Trust Base Social Platform"]},
+                        {"id": "frontend-streaming-platform", "name": "Frontend Streaming Platform", "stage": "Research", "confidence": 60},
                     ]
                 }
             ),
             encoding="utf-8",
         )
-        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(venture_registry))
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(registry_path))
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
         kanban_db.create_board("command-center-board")
         with kanban_db.connect_closing(board="command-center-board") as conn:
+            kanban_db.create_task(
+                conn,
+                title="Select first BureauOS MVP",
+                body="venture: BureauOS",
+                created_by="test",
+                tenant="bureauos",
+                initial_status="running",
+            )
+            kanban_db.create_task(
+                conn,
+                title="TrustBase onboarding undefined",
+                body="venture: TrustBase",
+                created_by="test",
+                tenant="trustbase",
+                initial_status="blocked",
+            )
             kanban_db.create_task(
                 conn,
                 title="Engineering Brand launch",
@@ -1536,15 +1628,21 @@ class TestWebServerEndpoints:
         assert [item["project"] for item in ventures] == [
             "BureauOS",
             "Parlay Analyzer",
-            "Trust Base Social Platform",
+            "TrustBase",
             "Frontend Streaming Platform",
         ]
         assert data["portfolio_health"]["projects"] == ventures
         assert data["portfolio_health"]["source"]["type"] == "registered_ventures"
         assert data["portfolio_health"]["total_projects"] == 4
+        by_name = {item["project"]: item for item in ventures}
+        assert by_name["BureauOS"]["active_tasks"] == 1
+        assert by_name["TrustBase"]["active_tasks"] == 1
+        assert by_name["TrustBase"]["blocked_tasks"] == 1
+        assert by_name["Parlay Analyzer"]["active_tasks"] == 0
         forbidden_values = {
             "Artist Management",
             "Engineering Brand",
+            "RegTech",
             "artist_management",
             "engineering_brand",
             "command-center-board",
@@ -1559,6 +1657,187 @@ class TestWebServerEndpoints:
             assert "assignee" not in item
             assert "board" not in item
             assert "tenant" not in item
+
+    def test_dashboard_v2_portfolio_reports_no_configured_ventures_without_registry(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(tmp_path / "missing-venture-registry.json"))
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["portfolio_ventures"] == []
+        assert data["portfolio_health"]["projects"] == []
+        assert data["portfolio_health"]["total_projects"] == 0
+        assert data["portfolio_health"]["source"]["type"] == "venture_registry"
+        assert data["portfolio_health"]["empty_message"] == "No ventures configured."
+
+    def test_dashboard_v2_source_registry_layer_exposes_registries_pipeline_and_brief(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        (reports_dir / "bureauos-ranking.md").write_text("# BureauOS ranking\n\nLatest source-backed report.", encoding="utf-8")
+
+        registry_path = tmp_path / "venture-registry.json"
+        registry_path.write_text(
+            json.dumps({
+                "ventures": [
+                    {
+                        "id": "bureauos",
+                        "name": "BureauOS",
+                        "stage": "Validation",
+                        "status": "active",
+                        "confidence": 74,
+                        "momentum": "up",
+                        "risk": "Validation sample size",
+                        "next_milestone": "Approve MVP",
+                        "decision_needed": "Approve BureauOS MVP",
+                        "blocking_issue": "Need first app selection",
+                        "latest_activity": "Registry updated",
+                        "latest_research": "BureauOS ranking",
+                        "revenue_status": "pre-revenue",
+                        "owner": "command_center",
+                        "updated_at": "2026-06-19T00:00:00Z",
+                    },
+                    {"id": "parlay-analyzer", "name": "Parlay Analyzer", "stage": "Research", "status": "active", "confidence": 61},
+                    {"id": "trustbase", "name": "TrustBase", "stage": "MVP Definition", "status": "active", "confidence": 67, "aliases": ["Trust Base Social Platform"]},
+                    {"id": "regtech-denial-suite", "name": "RegTech Denial Suite", "stage": "Research"},
+                    {"id": "engineering-brand", "name": "Engineering Brand", "stage": "Production"},
+                    {"id": "artist-management", "name": "Artist Management", "stage": "Production"},
+                    {"id": "research-office", "name": "Research Office", "stage": "Scale"},
+                    {"id": "frontend-streaming-platform", "name": "Frontend Streaming Platform", "stage": "Research"},
+                ]
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(registry_path))
+
+        app_registry_path = tmp_path / "bureauos-apps.json"
+        app_registry_path.write_text(
+            json.dumps({
+                "applications": [
+                    {"name": "DMV Navigator", "parent_venture": "BureauOS", "stage": "Validation", "confidence": 80, "risk": "DMV scope", "next_action": "Interview users", "next_milestone": "MVP spec", "latest_research": "DMV workflows", "blocking_issue": "Need state target", "last_activity": "Updated brief", "updated_at": "2026-06-19"},
+                    {"name": "Veteran Benefits Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 65},
+                    {"name": "Insurance Denial Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 58},
+                    {"name": "Tenant Rights Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 55},
+                    {"name": "Small Business Compliance Navigator", "parent_venture": "BureauOS", "stage": "Research", "confidence": 52},
+                    {"name": "RegTech Licensing Navigator", "parent_venture": "BureauOS", "stage": "Research"},
+                ]
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_BUREAUOS_APPLICATION_REGISTRY_PATH", str(app_registry_path))
+
+        kanban_db.create_board("command-center-board")
+        with kanban_db.connect_closing(board="command-center-board") as conn:
+            review_task_id = kanban_db.create_task(conn, title="Approve BureauOS MVP", body="venture: BureauOS", assignee="command_center", created_by="test", tenant="bureauos", initial_status="running")
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_task_id,))
+            conn.commit()
+            kanban_db.create_task(conn, title="Blocked TrustBase validation", body="venture: TrustBase", assignee="research_office", created_by="test", tenant="trustbase", initial_status="blocked")
+
+        resp = self.client.get("/api/dashboard/v2")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert [item["name"] for item in data["venture_registry"]["ventures"]] == [
+            "BureauOS",
+            "Parlay Analyzer",
+            "TrustBase",
+            "Frontend Streaming Platform",
+        ]
+        assert [item["name"] for item in data["bureauos_application_registry"]["applications"]] == [
+            "DMV Navigator",
+            "Veteran Benefits Navigator",
+            "Insurance Denial Navigator",
+            "Tenant Rights Navigator",
+            "Small Business Compliance Navigator",
+        ]
+        assert data["venture_pipeline"]["stages"] == [
+            {"stage": "Research", "count": 4},
+            {"stage": "Validation", "count": 1},
+            {"stage": "MVP", "count": 0},
+            {"stage": "Build", "count": 0},
+            {"stage": "Production", "count": 0},
+            {"stage": "Paying Clients", "count": 0},
+            {"stage": "Scale", "count": 0},
+        ]
+        brief = data["executive_brief_source"]
+        assert brief["decisions_needed"]
+        assert brief["blockers"]
+        assert brief["risks"]
+        assert brief["next_actions"]
+        assert brief["source"]["sources"] == ["kanban", "reports", "notifications", "venture_registry", "bureauos_application_registry"]
+        serialized_sources = json.dumps(data["dashboard_sources"], sort_keys=True)
+        for forbidden in ["RegTech", "Engineering Brand", "Artist Management", "Research Office"]:
+            assert forbidden not in serialized_sources
+
+    def test_venture_portfolio_rank_report_ranks_registered_ventures_not_cards(self, tmp_path, monkeypatch):
+        import hermes_cli.kanban_db as kanban_db
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+        registry_path = tmp_path / "venture-registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "ventures": [
+                        {"id": "bureauos", "name": "BureauOS", "stage": "Validation", "confidence": 72},
+                        {"id": "parlay-analyzer", "name": "Parlay Analyzer", "stage": "Research", "confidence": 64},
+                        {"id": "trustbase", "name": "TrustBase", "stage": "Research", "confidence": 68, "aliases": ["Trust Base Social Platform"]},
+                        {"id": "frontend-streaming-platform", "name": "Frontend Streaming Platform", "stage": "Research", "confidence": 60},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(registry_path))
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir()
+        monkeypatch.setenv("HERMES_REPORTS_DIR", str(reports_dir))
+        (reports_dir / "latest-venture-portfolio-rank.json").write_text(
+            json.dumps(
+                {
+                    "type": "venture_portfolio_rank",
+                    "ventures": [
+                        {"rank": 1, "name": "Compile the current venture portfolio inventory"},
+                        {"rank": 2, "name": "Define the venture audit scoring framework"},
+                        {"rank": 3, "name": "Engineering YouTube Page"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        kanban_db.create_board("command-center-board")
+        with kanban_db.connect_closing(board="command-center-board") as conn:
+            kanban_db.create_task(conn, title="Compile the current venture portfolio inventory", created_by="test", tenant="operations", initial_status="running")
+            kanban_db.create_task(conn, title="Define the venture audit scoring framework", created_by="test", tenant="operations", initial_status="running")
+            kanban_db.create_task(conn, title="Engineering YouTube Page", created_by="test", tenant="engineering_brand", initial_status="running")
+            kanban_db.create_task(conn, title="BureauOS MVP", body="venture: BureauOS", created_by="test", tenant="bureauos", initial_status="blocked")
+
+        resp = self.client.get("/api/reports/generated/latest/venture_portfolio_rank")
+
+        assert resp.status_code == 200
+        data = self._assert_json_response_is_not_spa_html(resp)
+        assert data["status"] == "available"
+        report = data["report"]
+        assert report["source"]["type"] == "venture_registry"
+        ranked_names = [item["name"] for item in report["ventures"]]
+        assert ranked_names == [
+            "BureauOS",
+            "Parlay Analyzer",
+            "TrustBase",
+            "Frontend Streaming Platform",
+        ]
+        serialized = json.dumps(report, sort_keys=True)
+        assert "Compile the current venture portfolio inventory" not in serialized
+        assert "Define the venture audit scoring framework" not in serialized
+        assert "Engineering YouTube Page" not in serialized
+        assert report["ventures"][0]["blocked_tasks"] == 1
 
     def test_generated_report_exposes_telegram_readable_summary(self, tmp_path, monkeypatch):
         reports_dir = tmp_path / "generated-reports"
@@ -1603,6 +1882,21 @@ class TestWebServerEndpoints:
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
         monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "empty-obsidian-vault"))
+        registry_path = tmp_path / "venture-registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "ventures": [
+                        {"id": "bureauos", "name": "BureauOS", "stage": "Validation", "confidence": 72},
+                        {"id": "parlay-analyzer", "name": "Parlay Analyzer", "stage": "Research", "confidence": 64},
+                        {"id": "trustbase", "name": "TrustBase", "stage": "Research", "confidence": 68, "aliases": ["Trust Base Social Platform"]},
+                        {"id": "frontend-streaming-platform", "name": "Frontend Streaming Platform", "stage": "Research", "confidence": 60},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(registry_path))
         kanban_db.init_db(board="default")
         conn = kanban_db.connect(board="default")
         try:
@@ -1673,21 +1967,6 @@ class TestWebServerEndpoints:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
-        venture_registry = tmp_path / "venture_registry_summary.json"
-        venture_registry.write_text(
-            json.dumps(
-                {
-                    "ventures": [
-                        {"name": "BureauOS"},
-                        {"name": "Parlay Analyzer"},
-                        {"name": "Trust Base Social Platform"},
-                        {"name": "Frontend Streaming Platform"},
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("HERMES_VENTURE_REGISTRY_PATH", str(venture_registry))
         (reports_dir / "weekly-report.md").write_text(
             "# Weekly Report\n\nProject: Hermes dashboard\n\nDeployment status: healthy\n",
             encoding="utf-8",
@@ -1754,13 +2033,19 @@ class TestWebServerEndpoints:
         assert data["career_progress"]["status"] == "available"
         assert data["career_progress"]["summary"] == "End User Technician → Cloud Engineer → Cloud Architect"
         assert data["career_progress"]["items"]
+        assert data["career_progress"]["current_role"] == "End User Technician"
+        assert data["career_progress"]["target_role"] == "Cloud Engineer"
+        assert data["career_progress"]["future_role"] == "Cloud Architect"
+        assert len(data["career_progress"]["items"]) == 8
         assert data["artist_management"]["status"] == "available"
         assert data["artist_management"]["summary"] == "Artist management source registry"
         assert data["artist_management"]["items"]
+        assert len(data["artist_management"]["items"]) == 6
+        assert data["artist_management"]["inventory"] == 0
         assert [item["project"] for item in data["portfolio_ventures"]] == [
             "BureauOS",
             "Parlay Analyzer",
-            "Trust Base Social Platform",
+            "TrustBase",
             "Frontend Streaming Platform",
         ]
         assert data["portfolio_health"]["source"]["type"] == "registered_ventures"
@@ -1999,7 +2284,8 @@ class TestWebServerEndpoints:
         assert statuses["evening_report"]["error"] == "cron timed out"
         assert statuses["weekly_executive_review"]["status"] == "available"
         assert statuses["monthly_executive_review"]["status"] == "available"
-        assert statuses["venture_portfolio_rank"]["status"] == "available"
+        assert statuses["venture_portfolio_rank"]["status"] == "missing"
+        assert statuses["venture_portfolio_rank"]["error"] == "No ventures configured."
         assert statuses["blocked_tasks_review"]["status"] == "available"
 
         missing_resp = self.client.get("/api/reports/generated/latest/not-a-type")

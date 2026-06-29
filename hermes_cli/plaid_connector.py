@@ -218,20 +218,29 @@ class PlaidConnector:
             },
         )
 
-    def exchange_public_token(self, public_token: str, *, store: bool = True) -> dict[str, Any]:
+    def exchange_public_token(self, public_token: str, *, store: bool = True, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not public_token or not public_token.strip():
+            raise PlaidConfigurationError("Plaid public token is required.")
         result = self._post("/item/public_token/exchange", {"public_token": public_token})
         access_token = result.get("access_token")
+        metadata = metadata or {}
+        raw_institution = metadata.get("institution")
+        institution: dict[str, Any] = raw_institution if isinstance(raw_institution, dict) else {}
+        institution_id = str(institution.get("institution_id") or metadata.get("institution_id") or "sandbox")
+        institution_name = str(institution.get("name") or metadata.get("institution_name") or "Plaid Sandbox")
         if store and access_token:
             store_access_token(
                 access_token=access_token,
                 item_id=result.get("item_id"),
-                institution_id="sandbox",
-                institution_name="Plaid Sandbox",
+                institution_id=institution_id,
+                institution_name=institution_name,
                 products=list(self.config.products),
             )
         safe = dict(result)
         if "access_token" in safe:
             safe["access_token"] = "[ENCRYPTED_AND_STORED]" if store else "[REDACTED]"
+        safe["environment"] = self.config.environment
+        safe["institution"] = {"institution_id": institution_id, "name": institution_name}
         return safe
 
     def fetch_accounts(self, access_token: str) -> dict[str, Any]:

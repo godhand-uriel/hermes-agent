@@ -19,7 +19,9 @@ from hermes_cli.plaid_connector import (
     PlaidConnector,
     decrypt_access_token,
     encrypt_access_token,
+    list_stored_access_tokens,
     load_access_token,
+    plaid_config_from_env,
     store_access_token,
 )
 
@@ -112,7 +114,7 @@ def test_encrypted_token_storage_round_trip(monkeypatch, tmp_path):
     assert load_access_token(institution_id="ins_sandbox", path=path) == token
     conn = _conn(path)
     try:
-        stored = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='ins_sandbox'").fetchone()["encrypted_access_token"]
+        stored = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='sandbox:ins_sandbox'").fetchone()["encrypted_access_token"]
         assert stored != token
         assert token not in stored
     finally:
@@ -122,6 +124,36 @@ def test_encrypted_token_storage_round_trip(monkeypatch, tmp_path):
 def test_missing_token_handling(tmp_path):
     with pytest.raises(PlaidConfigurationError):
         load_access_token(path=tmp_path / "registry.db")
+
+
+def test_production_configuration_uses_production_url_without_code_changes(monkeypatch, tmp_path):
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-prod")
+    monkeypatch.setenv("PLAID_SECRET", "secret-prod")
+    cfg = plaid_config_from_env()
+    assert cfg.environment == "production"
+    assert cfg.base_url == "https://production.plaid.com"
+
+    store_access_token(access_token="access-production-token", item_id="item_prod", institution_id="ins_prod", institution_name="Production Bank", environment="production", path=tmp_path / "registry.db")
+    store_access_token(access_token="access-sandbox-token", item_id="item_sandbox", institution_id="ins_prod", institution_name="Sandbox Bank", environment="sandbox", path=tmp_path / "registry.db")
+    prod_tokens = list_stored_access_tokens(environment="production", path=tmp_path / "registry.db")
+    sandbox_tokens = list_stored_access_tokens(environment="sandbox", path=tmp_path / "registry.db")
+    assert [row["institution_id"] for row in prod_tokens] == ["production:ins_prod"]
+    assert [row["institution_id"] for row in sandbox_tokens] == ["sandbox:ins_prod"]
+    assert load_access_token(institution_id="ins_prod", environment="production", path=tmp_path / "registry.db") == "access-production-token"
+
+
+def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.delenv("PLAID_ENV", raising=False)
+    monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.setenv("HERMES_PLAID_ENV_FILE", str(env_file))
+    cfg = plaid_config_from_env()
+    assert cfg.environment == "production"
+    assert cfg.client_id == "file-client"
 
 
 def test_plaid_sandbox_sync_with_mock_transport(monkeypatch, tmp_path):
@@ -168,5 +200,5 @@ def test_plaid_sync_failure_records_error(monkeypatch, tmp_path):
     from hermes_cli.finance_registry import latest_finance_sync_status
 
     status = latest_finance_sync_status(path=tmp_path / "registry.db")
-    assert status["sync_health"] == "degraded"
+    assert status["sync_health"] == "error"
     assert status["errors"]

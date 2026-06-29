@@ -8,8 +8,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 from hermes_cli.finance_registry import (
     FINANCE_EMPTY_MESSAGE,
     calculate_finance_metrics,
+    configure_finance_sync_schedule,
+    enqueue_finance_sync,
     finance_command_center_contract,
     finance_history,
+    finance_sync_schedule,
     insert_finance_snapshot,
     seed_default_finance_registry,
 )
@@ -56,6 +59,17 @@ def test_finance_registry_empty_state_uses_source_not_initialized(tmp_path):
     assert "Awaiting" not in str(contract)
     assert "No Data" not in str(contract)
     assert "Not Configured" not in str(contract)
+
+
+def test_finance_sync_schedule_and_queue_support_required_cadences(tmp_path):
+    path = tmp_path / "finance.db"
+    assert finance_sync_schedule(path=path)["cadence"] == "manual"
+    schedule = configure_finance_sync_schedule(cadence="every_6_hours", path=path)
+    assert schedule["enabled"] is True
+    assert schedule["interval_seconds"] == 21600
+    queued = enqueue_finance_sync(institution_id="sandbox:ins_1", path=path)
+    assert queued["status"] == "queued"
+    assert queued["max_attempts"] == 3
 
 
 def test_finance_registry_seed_and_history_are_source_backed(tmp_path):
@@ -323,7 +337,7 @@ def test_finance_plaid_exchange_public_token_stores_encrypted_and_refreshes_dash
 
     conn = sqlite3.connect(db_path)
     try:
-        encrypted = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='ins_1'").fetchone()[0]
+        encrypted = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='sandbox:ins_1'").fetchone()[0]
     finally:
         conn.close()
     assert encrypted

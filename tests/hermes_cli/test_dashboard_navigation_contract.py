@@ -9,23 +9,56 @@ def _reports_source() -> str:
     return REPORTS_PAGE.read_text(encoding="utf-8")
 
 
-def test_dashboard_executive_area_cards_route_to_named_sections_not_sessions():
+def _command_center_source() -> str:
     src = _reports_source()
-    expected_targets = {
-        "Career Development": "#career-development",
-        "BureauOS": "#bureauos",
-        "Engineering Brand": "#engineering-brand",
-        "Artist Management": "#artist-management",
-        "Venture Portfolio": "#venture-portfolio",
-        "Hermes Operations": "#hermes-operations",
-    }
-    for label, target in expected_targets.items():
+    return src[src.index("function ExecutiveCommandCenterShell"):src.index("export default function ReportsPage")]
+
+
+def test_dashboard_workspace_navigation_opens_named_sections_not_sessions():
+    src = _command_center_source()
+    for label in [
+        'label: "Dashboard"',
+        'label: "Mission Control"',
+        'label: "Finance"',
+        'label: "Ventures"',
+        'label: "BureauOS"',
+        'label: "Parlay Analyzer"',
+        'label: "TrustBase"',
+        'label: "Career Development"',
+        'label: "Research"',
+        'label: "Knowledge Vault"',
+        'label: "Artist Management"',
+        'label: "Engineering Brand"',
+        'label: "Hermes Operations"',
+        'label: "Settings"',
+    ]:
         assert label in src
-        assert target in src
-    # The reports dashboard itself must not hard-code Sessions as a fallback for
-    # dashboard cards; cards that leave the page should point at explicit pages.
+    assert "Open ${item.label} workspace" in src
+    assert "openWorkspace(item.target)" in src
     assert 'href="/sessions"' not in src
     assert "href={`/sessions" not in src
+
+
+def test_dashboard_workspace_buttons_route_to_real_sections_or_drawers():
+    src = _command_center_source()
+    for expected in [
+        "dashboard-top",
+        "mission-control",
+        "finance-command",
+        "venture-portfolio",
+        "bureauos",
+        "career-development",
+        "research-center",
+        "knowledge-vault",
+        "engineering-brand",
+        "artist-management",
+        "hermes-operations",
+        "setActiveDrawer({ type: \"task\"",
+        "setActiveDrawer({ type: \"venture\"",
+        "setActiveDrawer({ type: \"diagnostics\"",
+    ]:
+        assert expected in src
+    assert "Open Workspace" not in src
 
 
 def test_dashboard_task_report_board_and_profile_cards_have_explicit_destinations():
@@ -34,7 +67,7 @@ def test_dashboard_task_report_board_and_profile_cards_have_explicit_destination
     assert "reportDetailHref" in src
     assert "boardHref(project.project)" in src
     assert "profileHref(task.assignee)" in src
-    assert "selectedReport" in src
+    assert "generatedReportDetailHref(entry.type)" in src
 
 
 def test_kanban_plugin_accepts_task_and_board_deep_links():

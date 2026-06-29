@@ -8533,6 +8533,14 @@ def _friendly_finance_sync_error(exc: Exception) -> tuple[int, str, str]:
         return 423, "registry_locked", "Try again shortly."
     if "timeout" in text or "timed out" in text:
         return 504, "network_timeout", "Retry later."
+    if "rate" in text and "limit" in text:
+        return 429, "rate_limited", "Retry later."
+    if "item_login_required" in text or "expired" in text or "revoked" in text:
+        return 409, "reconnect_required", "Reconnect financial institution."
+    if "institution" in text and ("unavailable" in text or "down" in text):
+        return 503, "institution_unavailable", "Retry later."
+    if "oauth" in text:
+        return 409, "oauth_interrupted", "Reconnect financial institution."
     return 500, "sync_failed", "Sync Failed"
 
 

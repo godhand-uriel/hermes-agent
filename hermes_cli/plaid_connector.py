@@ -34,10 +34,39 @@ from hermes_cli.finance_registry import (
 
 PLAID_BASE_URLS = {
     "sandbox": "https://sandbox.plaid.com",
+    "production": "https://production.plaid.com",
 }
 DEFAULT_PRODUCTS = ("transactions", "liabilities", "investments")
 DEFAULT_COUNTRY_CODES = ("US",)
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+
+def _load_plaid_env_file() -> None:
+    """Load optional Plaid-only env file without overriding process env.
+
+    Set HERMES_PLAID_ENV_FILE to .env.sandbox or .env.production when running
+    locally. Existing process environment values win so deployments can inject
+    secrets through their normal secret manager. The file is parsed as simple
+    KEY=VALUE lines and is never exposed to the frontend.
+    """
+    env_file = os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()
+    if not env_file:
+        return
+    path = Path(env_file).expanduser()
+    if not path.exists():
+        raise PlaidConfigurationError(f"Plaid env file does not exist: {path}")
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise PlaidSecurityError(f"Plaid env file must not be group/world-readable: {path}")
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('\"').strip("'")
+        if key.startswith("PLAID_") and key not in os.environ:
+            os.environ[key] = value
 
 
 class PlaidConfigurationError(RuntimeError):
@@ -58,15 +87,17 @@ class PlaidConfig:
 
     @property
     def base_url(self) -> str:
-        if self.environment != "sandbox":
-            raise PlaidSecurityError("Only PLAID_ENV=sandbox is allowed until sandbox sync, encryption, mapping, and tests are complete.")
-        return PLAID_BASE_URLS[self.environment]
+        try:
+            return PLAID_BASE_URLS[self.environment]
+        except KeyError as exc:
+            raise PlaidSecurityError("PLAID_ENV must be sandbox or production.") from exc
 
 
 def plaid_config_from_env() -> PlaidConfig:
+    _load_plaid_env_file()
     env = os.environ.get("PLAID_ENV", "sandbox").strip().lower() or "sandbox"
-    if env != "sandbox":
-        raise PlaidSecurityError("Production Plaid access is disabled for this implementation. Set PLAID_ENV=sandbox.")
+    if env not in PLAID_BASE_URLS:
+        raise PlaidSecurityError("PLAID_ENV must be sandbox or production.")
     client_id = os.environ.get("PLAID_CLIENT_ID", "").strip()
     secret = os.environ.get("PLAID_SECRET", "").strip()
     if not client_id or not secret:
@@ -122,8 +153,22 @@ def decrypt_access_token(encrypted_token: str) -> str:
     return _load_or_create_fernet().decrypt(encrypted_token.encode("ascii")).decode("utf-8")
 
 
-def store_access_token(*, access_token: str, item_id: str | None = None, institution_id: str = "sandbox", institution_name: str = "Plaid Sandbox", products: list[str] | None = None, path: Path | None = None) -> None:
+def _registry_institution_id(environment: str, institution_id: str) -> str:
+    env = (environment or "sandbox").strip().lower() or "sandbox"
+    raw = (institution_id or env).strip()
+    return raw if raw.startswith(f"{env}:") else f"{env}:{raw}"
+
+
+def _display_institution_id(registry_id: str) -> str:
+    if ":" in registry_id:
+        return registry_id.split(":", 1)[1]
+    return registry_id
+
+
+def store_access_token(*, access_token: str, item_id: str | None = None, institution_id: str = "sandbox", institution_name: str = "Plaid Sandbox", products: list[str] | None = None, environment: str = "sandbox", path: Path | None = None) -> None:
     encrypted = encrypt_access_token(access_token)
+    environment = (environment or "sandbox").strip().lower() or "sandbox"
+    registry_institution_id = _registry_institution_id(environment, institution_id)
     now = int(time.time())
     conn = _connect(path)
     try:
@@ -140,25 +185,28 @@ def store_access_token(*, access_token: str, item_id: str | None = None, institu
                 products=excluded.products,
                 updated_at=excluded.updated_at
             """,
-            (institution_id, institution_name, item_id, encrypted, json.dumps(products or list(DEFAULT_PRODUCTS)), now, now),
+            (registry_institution_id, institution_name, item_id, encrypted, json.dumps(products or list(DEFAULT_PRODUCTS)), now, now),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def load_access_token(*, institution_id: str | None = None, path: Path | None = None) -> str:
+def load_access_token(*, institution_id: str | None = None, environment: str | None = None, path: Path | None = None) -> str:
     conn = _connect(path)
     try:
         ensure_schema(conn)
         if institution_id:
+            lookup = _registry_institution_id(environment or os.environ.get("PLAID_ENV", "sandbox"), institution_id)
             row = conn.execute(
-                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND institution_id=? AND status='active'",
-                (institution_id,),
+                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND institution_id IN (?, ?) AND status='active' ORDER BY updated_at DESC LIMIT 1",
+                (lookup, institution_id),
             ).fetchone()
         else:
+            prefix = f"{(environment or os.environ.get('PLAID_ENV', 'sandbox')).strip().lower()}:%" if environment else "%"
             row = conn.execute(
-                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL ORDER BY updated_at DESC LIMIT 1"
+                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND institution_id LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                (prefix,),
             ).fetchone()
         if not row or not row["encrypted_access_token"]:
             raise PlaidConfigurationError("No encrypted Plaid access token is stored. Run hermes finance plaid exchange-token first.")
@@ -167,11 +215,49 @@ def load_access_token(*, institution_id: str | None = None, path: Path | None = 
         conn.close()
 
 
-def remove_stored_access_tokens(*, path: Path | None = None) -> int:
+
+def list_stored_access_tokens(*, environment: str | None = None, path: Path | None = None) -> list[dict[str, Any]]:
     conn = _connect(path)
     try:
         ensure_schema(conn)
-        cur = conn.execute("UPDATE finance_institutions SET encrypted_access_token=NULL, status='removed', updated_at=? WHERE provider='plaid' AND encrypted_access_token IS NOT NULL", (int(time.time()),))
+        if environment:
+            pattern = f"{environment.strip().lower()}:%"
+            rows = conn.execute(
+                "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND institution_id LIKE ? ORDER BY updated_at DESC",
+                (pattern,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL ORDER BY updated_at DESC"
+            ).fetchall()
+        return [
+            {
+                "institution_id": row["institution_id"],
+                "display_institution_id": _display_institution_id(str(row["institution_id"])),
+                "institution_name": row["institution_name"],
+                "item_id": row["item_id"],
+                "products": json.loads(row["products"] or "[]"),
+                "access_token": decrypt_access_token(row["encrypted_access_token"]),
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def remove_stored_access_tokens(*, institution_id: str | None = None, environment: str | None = None, path: Path | None = None) -> int:
+    conn = _connect(path)
+    try:
+        ensure_schema(conn)
+        params: list[Any] = [int(time.time())]
+        where = "provider='plaid' AND encrypted_access_token IS NOT NULL"
+        if institution_id:
+            where += " AND institution_id=?"
+            params.append(_registry_institution_id(environment or os.environ.get("PLAID_ENV", "sandbox"), institution_id))
+        elif environment:
+            where += " AND institution_id LIKE ?"
+            params.append(f"{environment.strip().lower()}:%")
+        cur = conn.execute(f"UPDATE finance_institutions SET encrypted_access_token=NULL, status='removed', updated_at=? WHERE {where}", params)
         conn.commit()
         return int(cur.rowcount or 0)
     finally:
@@ -206,11 +292,11 @@ class PlaidConnector:
             msg = str(detail.get("error_message") or detail.get("display_message") or raw)
             raise RuntimeError(f"Plaid request failed for {endpoint}: {msg}") from exc
 
-    def create_link_token(self, *, user_id: str = "hermes-finance-sandbox") -> dict[str, Any]:
+    def create_link_token(self, *, user_id: str = "hermes-finance") -> dict[str, Any]:
         return self._post(
             "/link/token/create",
             {
-                "client_name": "Hermes Finance Registry Sandbox",
+                "client_name": "Hermes Finance Registry",
                 "country_codes": list(self.config.country_codes),
                 "language": "en",
                 "user": {"client_user_id": user_id},
@@ -235,6 +321,7 @@ class PlaidConnector:
                 institution_id=institution_id,
                 institution_name=institution_name,
                 products=list(self.config.products),
+                environment=self.config.environment,
             )
         safe = dict(result)
         if "access_token" in safe:
@@ -258,48 +345,67 @@ class PlaidConnector:
     def fetch_investments(self, access_token: str) -> dict[str, Any]:
         return self._post("/investments/holdings/get", {"access_token": access_token})
 
-    def disconnect(self, access_token: str | None = None) -> dict[str, Any]:
-        token = access_token or load_access_token()
+    def disconnect(self, access_token: str | None = None, *, institution_id: str | None = None) -> dict[str, Any]:
+        token = access_token or load_access_token(institution_id=institution_id, environment=self.config.environment)
         result = self._post("/item/remove", {"access_token": token})
-        removed = remove_stored_access_tokens()
+        removed = remove_stored_access_tokens(institution_id=institution_id, environment=self.config.environment)
         return {"plaid": result, "stored_tokens_removed": removed}
 
-    def sync_to_finance_registry(self, *, access_token: str | None = None, path: Path | None = None) -> dict[str, Any]:
+    def _fetch_registry_payload(self, token: str, *, institution_hint: dict[str, Any] | None = None) -> dict[str, Any]:
         import datetime as dt
 
-        token = access_token or load_access_token(path=path)
+        accounts_payload = self.fetch_accounts(token)
+        balances_payload = self.fetch_balances(token)
+        end_date = dt.date.today()
+        start_date = end_date - dt.timedelta(days=90)
+        tx_payload = self.fetch_transactions(token, start_date=start_date.isoformat(), end_date=end_date.isoformat())
+        liabilities_payload = self.fetch_liabilities(token) if "liabilities" in self.config.products else {}
+        investments_payload = self.fetch_investments(token) if "investments" in self.config.products else {}
+        accounts = balances_payload.get("accounts") or accounts_payload.get("accounts") or []
+        item = accounts_payload.get("item") or balances_payload.get("item") or {}
+        hint = institution_hint or {}
+        institution_id = item.get("institution_id") or hint.get("display_institution_id") or self.config.environment
+        registry_institution_id = _registry_institution_id(self.config.environment, str(institution_id))
+        return {
+            "products": list(self.config.products),
+            "institution": {
+                "institution_id": registry_institution_id,
+                "name": item.get("institution_name") or hint.get("institution_name") or f"Plaid {self.config.environment.capitalize()}",
+                "item_id": item.get("item_id") or hint.get("item_id"),
+            },
+            "accounts": accounts,
+            "transactions": tx_payload.get("transactions") or [],
+            "liabilities": liabilities_payload.get("liabilities") or {},
+            "holdings": investments_payload.get("holdings") or [],
+            "securities": investments_payload.get("securities") or [],
+        }
+
+    def sync_to_finance_registry(self, *, access_token: str | None = None, path: Path | None = None) -> dict[str, Any]:
         sync_run_id = start_finance_sync_run(provider="plaid", environment=self.config.environment, path=path)
-        try:
-            accounts_payload = self.fetch_accounts(token)
-            balances_payload = self.fetch_balances(token)
-            end_date = dt.date.today()
-            start_date = end_date - dt.timedelta(days=90)
-            tx_payload = self.fetch_transactions(token, start_date=start_date.isoformat(), end_date=end_date.isoformat())
-            liabilities_payload = self.fetch_liabilities(token) if "liabilities" in self.config.products else {}
-            investments_payload = self.fetch_investments(token) if "investments" in self.config.products else {}
-            accounts = balances_payload.get("accounts") or accounts_payload.get("accounts") or []
-            item = accounts_payload.get("item") or balances_payload.get("item") or {}
-            institution_id = item.get("institution_id") or "sandbox"
-            registry_payload = {
-                "products": list(self.config.products),
-                "institution": {
-                    "institution_id": institution_id,
-                    "name": item.get("institution_name") or "Plaid Sandbox",
-                    "item_id": item.get("item_id"),
-                },
-                "accounts": accounts,
-                "transactions": tx_payload.get("transactions") or [],
-                "liabilities": liabilities_payload.get("liabilities") or {},
-                "holdings": investments_payload.get("holdings") or [],
-                "securities": investments_payload.get("securities") or [],
-            }
-            counts = upsert_plaid_registry_data(registry_payload, sync_run_id=sync_run_id, path=path)
-            finish_finance_sync_run(sync_run_id, status="success", message="Plaid sandbox sync complete", counts=counts, path=path)
-            return {"status": "success", "sync_run_id": sync_run_id, "counts": counts, "registry": str(path or finance_registry_path())}
-        except Exception as exc:
-            record_finance_sync_error(sync_run_id, exc.__class__.__name__, str(exc), path=path)
-            finish_finance_sync_run(sync_run_id, status="failed", message=str(exc)[:1000], path=path)
-            raise
+        total_counts = {"institutions": 0, "accounts": 0, "transactions": 0, "balances": 0, "liabilities": 0, "investments": 0}
+        failures: list[str] = []
+        tokens = [{"access_token": access_token, "institution_id": None}] if access_token else list_stored_access_tokens(environment=self.config.environment, path=path)
+        if not tokens:
+            finish_finance_sync_run(sync_run_id, status="failed", message="No encrypted Plaid access token is stored.", path=path)
+            raise PlaidConfigurationError("No encrypted Plaid access token is stored. Run hermes finance plaid exchange-token first.")
+        for token_info in tokens:
+            token = str(token_info.get("access_token") or "")
+            try:
+                registry_payload = self._fetch_registry_payload(token, institution_hint=token_info)
+                counts = upsert_plaid_registry_data(registry_payload, sync_run_id=sync_run_id, path=path)
+                for key, value in counts.items():
+                    total_counts[key] = total_counts.get(key, 0) + int(value or 0)
+            except Exception as exc:
+                failures.append(exc.__class__.__name__)
+                record_finance_sync_error(sync_run_id, exc.__class__.__name__, str(exc), path=path)
+        if failures and total_counts["accounts"] == 0:
+            message = "Plaid sync failed; no registry changes were applied."
+            finish_finance_sync_run(sync_run_id, status="failed", message=message, counts=total_counts, path=path)
+            raise RuntimeError(message)
+        status = "partial" if failures else "success"
+        message = f"Plaid {self.config.environment} sync {status}"
+        finish_finance_sync_run(sync_run_id, status=status, message=message, counts=total_counts, path=path)
+        return {"status": status, "sync_run_id": sync_run_id, "counts": total_counts, "failures": failures, "registry": str(path or finance_registry_path())}
 
 
 def create_link_token(**kwargs: Any) -> dict[str, Any]:
@@ -349,6 +455,7 @@ __all__ = [
     "fetch_liabilities",
     "fetch_transactions",
     "latest_finance_sync_status",
+    "list_stored_access_tokens",
     "load_access_token",
     "plaid_config_from_env",
     "remove_stored_access_tokens",

@@ -740,6 +740,16 @@ def _find_progress(text: str) -> int | None:
     )
 
 
+def _find_udemy_progress(text: str) -> tuple[int | None, bool]:
+    """Return Udemy progress and whether an explicit progress/start signal was visible."""
+    progress = _find_progress(text)
+    if progress is not None:
+        return progress, True
+    if re.search(r"\bSTART\s+COURSE\b", text, flags=re.IGNORECASE):
+        return 0, True
+    return None, False
+
+
 def _find_status(text: str, progress: int | None) -> str | None:
     status = _first_match([r"(?:status|state)\s*[:\-]\s*([A-Za-z _-]{3,40})"], text)
     if status:
@@ -1004,6 +1014,7 @@ UDEMY_COURSE_CARD_SELECTOR = ", ".join([
     "[class*='learning-course']",
     "a[href*='/course/']",
     "a[href*='/learn/']",
+    "a[href*='course-dashboard-redirect']",
 ])
 UDEMY_COURSE_CONTAINER_RE = r"(?:course-card|course-list|enrolled-course|learning-card|my-course|learning-course)"
 UDEMY_COURSE_DIAGNOSTIC_CONTAINER_RE = r"(?:course-card|course-list|enrolled-course|learning-card|my-course|learning-course|container|progress)"
@@ -1087,6 +1098,12 @@ def _absolute_udemy_url(url: str | None) -> str | None:
     if url.startswith("/"):
         return f"https://www.udemy.com{url}"
     return f"https://www.udemy.com/{url}"
+
+
+def _first_udemy_course_href(fragment: str) -> str | None:
+    for match in re.finditer(r"<a\b[^>]+href\s*=\s*(['\"])([^'\"]*(?:/course/|/learn/|course-dashboard-redirect)[^'\"]*)\1", fragment, flags=re.IGNORECASE | re.DOTALL):
+        return match.group(2)
+    return None
 
 
 def _page_url(page: Any) -> str:
@@ -1212,11 +1229,11 @@ def _split_udemy_course_cards(html: str) -> list[str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else min(len(html), match.start() + 10000)
         fragment = html[match.start():end]
         text = _strip_html(fragment)
-        if re.search(r"/course/|/learn/|%\s*complete|\bcomplete\b|\blectures\b|\bmin left\b|\bhours?\b", fragment + " " + text, flags=re.IGNORECASE):
+        if re.search(r"/course/|/learn/|course-dashboard-redirect|%\s*complete|\bSTART\s+COURSE\b|\bcomplete\b|\blectures\b|\bmin left\b|\bhours?\b", fragment + " " + text, flags=re.IGNORECASE):
             cards.append(fragment)
     if cards:
         return cards
-    link_matches = list(re.finditer(r"<a\b[^>]+href\s*=\s*(['\"])([^'\"]*(?:/course/|/learn/)[^'\"]*)\1[^>]*>.*?</a>", html, flags=re.IGNORECASE | re.DOTALL))
+    link_matches = list(re.finditer(r"<a\b[^>]+href\s*=\s*(['\"])([^'\"]*(?:/course/|/learn/|course-dashboard-redirect)[^'\"]*)\1[^>]*>.*?</a>", html, flags=re.IGNORECASE | re.DOTALL))
     for match in link_matches:
         start = max(0, match.start() - 1800)
         end = min(len(html), match.end() + 2200)
@@ -1225,7 +1242,7 @@ def _split_udemy_course_cards(html: str) -> list[str]:
 
 
 def _udemy_course_link_count(html: str) -> int:
-    return len(re.findall(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/)" , html, flags=re.IGNORECASE))
+    return len(re.findall(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/|course-dashboard-redirect)" , html, flags=re.IGNORECASE))
 
 
 _UDEMY_NAVIGATION_HEADINGS = {
@@ -1393,16 +1410,19 @@ def _udemy_no_courses_diagnostics(html: str, page: Any | None = None) -> dict[st
 
 def _extract_udemy_course(card: str) -> dict[str, Any]:
     text = _strip_html(card)
-    url = _absolute_udemy_url(_html_attr(card, "href"))
+    url = _absolute_udemy_url(_first_udemy_course_href(card) or _html_attr(card, "href"))
     title = (
         _html_attr(card, "data-course-title")
         or _first_html_text(card, ("data-purpose-course-title", "h3", "h4"))
         or _first_match([r"(?:Course|Title)\s*[:\-]\s*([^|\n]+?)(?: Instructor| Progress|$)"], text)
     )
     if not title:
-        anchor = re.search(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/)[^'\"]*\1[^>]*>(.*?)</a>", card, flags=re.IGNORECASE | re.DOTALL)
+        anchor = re.search(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/|course-dashboard-redirect)[^'\"]*\1[^>]*>(.*?)</a>", card, flags=re.IGNORECASE | re.DOTALL)
         title = _strip_html(anchor.group(2)) if anchor else None
-    progress = normalize_percent(_html_attr(card, "data-progress") or _html_attr(card, "aria-valuenow") or _find_progress(text))
+    progress = normalize_percent(_html_attr(card, "data-progress") or _html_attr(card, "aria-valuenow"))
+    progress_visible = progress is not None
+    if progress is None:
+        progress, progress_visible = _find_udemy_progress(text)
     lectures = re.search(r"(\d+)\s*/\s*(\d+)\s+(?:lectures|lessons|items)", text, flags=re.IGNORECASE)
     completed_lectures = int(lectures.group(1)) if lectures else None
     total_lectures = int(lectures.group(2)) if lectures else None
@@ -1420,6 +1440,7 @@ def _extract_udemy_course(card: str) -> dict[str, Any]:
         "title": title.strip() if title else None,
         "course_url": url,
         "progress_percent": progress,
+        "progress_visible": progress_visible,
         "completed_lectures": completed_lectures,
         "total_lectures": total_lectures,
         "last_accessed": last_accessed,
@@ -1438,11 +1459,24 @@ def parse_udemy_learning_html(html: str, *, now: str | None = None, evidence_url
         extracted = _extract_udemy_course(card)
         title = extracted.get("title")
         progress = normalize_percent(extracted.get("progress_percent"))
+        progress_visible = bool(extracted.get("progress_visible"))
         url = extracted.get("course_url")
-        if not title or progress is None:
+        if not title or not progress_visible:
             manual_review.append({
                 "source": UDEMY_SOURCE,
                 "confidence": 0.35 if title else 0.2,
+                "last_updated": timestamp,
+                "message": "Udemy course card was ambiguous; title or explicit progress was missing, so no progress was imported.",
+                "evidence_url": url,
+                "evidence_path": url,
+                "course_title": title,
+                "extracted_text_preview": extracted.get("raw_text"),
+            })
+            continue
+        if progress is None:
+            manual_review.append({
+                "source": UDEMY_SOURCE,
+                "confidence": 0.35,
                 "last_updated": timestamp,
                 "message": "Udemy course card was ambiguous; title or explicit progress was missing, so no progress was imported.",
                 "evidence_url": url,
@@ -1462,7 +1496,7 @@ def parse_udemy_learning_html(html: str, *, now: str | None = None, evidence_url
             "id": stable_id("course", UDEMY_PROVIDER_NAME, title),
             "name": title,
             "provider": UDEMY_PROVIDER_NAME,
-            "status": "completed" if progress == 100 else "in_progress" if progress > 0 else None,
+            "status": "completed" if progress == 100 else "in_progress" if progress > 0 else "not_started" if progress == 0 else None,
             "progress_percent": progress,
             "completed_lectures": extracted.get("completed_lectures"),
             "total_lectures": extracted.get("total_lectures"),
@@ -1617,8 +1651,25 @@ def apply_udemy_courses_to_learning_registry(courses: list[dict[str, Any]], *, m
     registry["providers"] = sorted(provider_map.values(), key=lambda item: item["name"])
     registry["courses"] = _merge_records_preserving_confirmed(registry.get("courses", []), imported_courses)
     registry["certifications"] = _merge_records_preserving_confirmed(registry.get("certifications", []), certifications)
+    imported_titles = {str(course.get("name") or "") for course in imported_courses if course.get("name")}
+    stale_progress_messages = {
+        "Udemy course card was ambiguous; title or explicit progress was missing, so no progress was imported.",
+        "Udemy course imported from heading, but progress percentage was not visible.",
+    }
     registry.setdefault("manual_review", [])
-    registry["manual_review"] = [*(item for item in registry.get("manual_review", []) if isinstance(item, dict)), *(manual_review or [])]
+    registry["manual_review"] = [
+        *(
+            item
+            for item in registry.get("manual_review", [])
+            if isinstance(item, dict)
+            and not (
+                str(item.get("source") or "") in {UDEMY_SOURCE, UDEMY_HEADING_FALLBACK_SOURCE}
+                and str(item.get("message") or "") in stale_progress_messages
+                and (not item.get("course_title") or str(item.get("course_title")) in imported_titles)
+            )
+        ),
+        *(manual_review or []),
+    ]
     registry.setdefault("source_evidence", [])
     existing_evidence = {(item.get("source"), item.get("field"), item.get("evidence_path"), str(item.get("value"))) for item in registry["source_evidence"] if isinstance(item, dict)}
     for course in imported_courses:

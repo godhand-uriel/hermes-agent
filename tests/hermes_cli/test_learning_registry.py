@@ -18,6 +18,7 @@ from hermes_cli.learning_registry import (
     sync_obsidian_learning_registry,
     sync_udemy_browser_learning,
     udemy_browser_status,
+    stable_id,
 )
 
 
@@ -670,6 +671,97 @@ def test_udemy_progress_text_extraction_variants(tmp_path: Path) -> None:
 
     assert report["courses_imported"] == 1
     assert registry["courses"][0]["progress_percent"] == 63
+
+
+def test_udemy_course_card_parses_percent_complete_and_start_course_status(tmp_path: Path) -> None:
+    learning_path = tmp_path / "learning_registry.json"
+    career_path = tmp_path / "career_registry.json"
+    html = """
+    <main>
+      <section data-purpose="enrolled-course-card" class="my-course-card">
+        <a href="/course-dashboard-redirect/?course_id=2776760"><h3>100 Days of Code™: The Complete Python Pro Bootcamp</h3></a>
+        <div class="course-progress">7% complete</div>
+      </section>
+      <section data-purpose="enrolled-course-card" class="my-course-card">
+        <a href="/course-dashboard-redirect/?course_id=1456464"><h3>CompTIA CySA+ (CS0-002) Complete Course & Practice Exam</h3></a>
+        <button>START COURSE</button>
+      </section>
+    </main>
+    """
+
+    report = import_udemy_browser_html(html, learning_path=learning_path, career_path=career_path, now="2026-06-30T00:00:00Z")
+    registry = json.loads(learning_path.read_text(encoding="utf-8"))
+    by_name = {course["name"]: course for course in registry["courses"]}
+
+    assert report["source"] == "udemy_browser"
+    assert report["courses_imported"] == 2
+    assert by_name["100 Days of Code™: The Complete Python Pro Bootcamp"]["progress_percent"] == 7
+    assert by_name["100 Days of Code™: The Complete Python Pro Bootcamp"]["status"] == "in_progress"
+    assert by_name["CompTIA CySA+ (CS0-002) Complete Course & Practice Exam"]["progress_percent"] == 0
+    assert by_name["CompTIA CySA+ (CS0-002) Complete Course & Practice Exam"]["status"] == "not_started"
+    assert all(course["source"] == "udemy_browser" for course in registry["courses"])
+    assert registry["manual_review"] == []
+
+
+def test_udemy_browser_progress_update_replaces_heading_fallback_record_and_prunes_missing_progress_review(tmp_path: Path) -> None:
+    learning_path = tmp_path / "learning_registry.json"
+    career_path = tmp_path / "career_registry.json"
+    title = "CompTIA Linux+ (XK0-006) Complete Course & Exam"
+    course_id = stable_id("course", "Udemy", title)
+    learning_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_updated": "2026-06-30T00:00:00Z",
+                "sources": {},
+                "providers": [],
+                "certifications": [],
+                "courses": [
+                    {
+                        "id": course_id,
+                        "name": title,
+                        "provider": "Udemy",
+                        "source": "udemy_browser_heading_fallback",
+                        "progress_percent": None,
+                        "status": None,
+                        "confidence": 0.65,
+                        "last_updated": "2026-06-30T00:00:00Z",
+                        "imported_at": "2026-06-30T00:00:00Z",
+                    }
+                ],
+                "modules": [],
+                "study_sessions": [],
+                "manual_review": [
+                    {
+                        "source": "udemy_browser_heading_fallback",
+                        "message": "Udemy course imported from heading, but progress percentage was not visible.",
+                        "course_title": title,
+                    }
+                ],
+                "source_evidence": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    html = f"""
+    <section data-purpose="enrolled-course-card" class="my-course-card">
+      <a href="/course-dashboard-redirect/?course_id=4658902"><h3>{title}</h3></a>
+      <button>START COURSE</button>
+    </section>
+    """
+
+    import_udemy_browser_html(html, learning_path=learning_path, career_path=career_path, now="2026-06-30T01:00:00Z")
+    registry = json.loads(learning_path.read_text(encoding="utf-8"))
+
+    assert len(registry["courses"]) == 1
+    assert registry["courses"][0]["id"] == course_id
+    assert registry["courses"][0]["source"] == "udemy_browser"
+    assert registry["courses"][0]["progress_percent"] == 0
+    assert registry["courses"][0]["status"] == "not_started"
+    assert registry["manual_review"] == []
+    assert registry["certifications"][0]["name"] == "Linux+"
+    assert registry["certifications"][0]["progress_percent"] == 0
+    assert registry["certifications"][0]["status"] == "not_started"
 
 
 def test_udemy_heading_fallback_imports_courses_without_fabricating_progress(tmp_path: Path) -> None:

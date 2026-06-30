@@ -14,6 +14,7 @@ import re
 import subprocess
 import time
 from io import StringIO
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -104,6 +105,13 @@ def empty_learning_registry(*, now: str | None = None) -> dict[str, Any]:
                 "confidence": 1.0,
                 "last_updated": timestamp,
                 "needed_user_action": "Export AWS Skill Builder completion/progress evidence or provide screenshots/PDF.",
+            },
+            "udemy_browser": {
+                "status": "Not connected",
+                "source": "browser_connector",
+                "confidence": 0.0,
+                "last_updated": timestamp,
+                "needed_user_action": "Run `hermes learning browser-connect udemy`, log in manually, then run browser-sync.",
             },
             "manual": {
                 "status": "Allowed",
@@ -971,6 +979,1029 @@ def import_learning_evidence(path: Path, *, provider: str, learning_path: Path |
         "manual_review_count": len(manual_review),
         "extraction": extraction,
         "last_updated": timestamp,
+    }
+
+
+UDEMY_SOURCE = "udemy_browser"
+UDEMY_HEADING_FALLBACK_SOURCE = "udemy_browser_heading_fallback"
+UDEMY_PROVIDER_NAME = "Udemy"
+UDEMY_LOGIN_URL = "https://www.udemy.com/join/login-popup/"
+UDEMY_MY_LEARNING_URL = "https://www.udemy.com/home/my-courses/learning/"
+UDEMY_MY_LEARNING_URLS = [
+    "https://www.udemy.com/home/my-courses/learning/",
+    "https://www.udemy.com/home/my-courses/",
+    "https://www.udemy.com/home/my-courses/learning/?p=1",
+]
+UDEMY_COURSE_CARD_SELECTOR = ", ".join([
+    "[data-purpose*='course-card']",
+    "[data-purpose*='course-list']",
+    "[data-purpose*='enrolled-course']",
+    "[data-purpose*='learning-card']",
+    "[data-purpose*='progress']",
+    "[data-testid*='course-card']",
+    "[class*='course-card']",
+    "[class*='my-course']",
+    "[class*='learning-course']",
+    "a[href*='/course/']",
+    "a[href*='/learn/']",
+])
+UDEMY_COURSE_CONTAINER_RE = r"(?:course-card|course-list|enrolled-course|learning-card|my-course|learning-course)"
+UDEMY_COURSE_DIAGNOSTIC_CONTAINER_RE = r"(?:course-card|course-list|enrolled-course|learning-card|my-course|learning-course|container|progress)"
+DEFAULT_UDEMY_CDP_URL = "http://127.0.0.1:9222"
+
+
+def udemy_session_state_path() -> Path:
+    configured = os.environ.get("HERMES_UDEMY_BROWSER_STATE_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "browser_sessions" / "udemy_storage_state.json"
+
+
+def _chmod_0600(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # POSIX permissions are best-effort on non-POSIX filesystems.
+        pass
+
+
+def _safe_cdp_url_for_output(cdp_url: str) -> str:
+    """Return a CDP URL safe for JSON/log output by dropping credentials/query/fragment."""
+    try:
+        parts = urlsplit(cdp_url)
+    except ValueError:
+        return "<invalid-cdp-url>"
+    hostname = parts.hostname or ""
+    if not hostname:
+        return cdp_url.split("?", 1)[0].split("#", 1)[0]
+    netloc = hostname
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme or "http", netloc, parts.path or "", "", ""))
+
+
+def _strip_html(value: str) -> str:
+    value = re.sub(r"<script\b.*?</script>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<style\b.*?</style>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = value.replace("&amp;", "&").replace("&nbsp;", " ").replace("&#x27;", "'").replace("&quot;", '"')
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _redact_udemy_debug_text(value: Any, *, limit: int = 160) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[REDACTED_EMAIL]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)\b(cookie|token|session|auth|bearer|password|passwd|secret)\b\s*[:=]\s*\S+", r"\1=[REDACTED]", text)
+    text = re.sub(r"(?i)(access[_-]?token|id[_-]?token|refresh[_-]?token|client[_-]?secret)=([^&\s]+)", r"\1=[REDACTED]", text)
+    text = re.sub(r"\b(?:\d[ -]*?){13,19}\b", "[REDACTED_CARD]", text)
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _html_attr(fragment: str, name: str) -> str | None:
+    match = re.search(rf"\b{name}\s*=\s*(['\"])(.*?)\1", fragment, flags=re.IGNORECASE | re.DOTALL)
+    return match.group(2).strip() if match else None
+
+
+def _first_html_text(fragment: str, selectors: tuple[str, ...]) -> str | None:
+    for selector in selectors:
+        if selector in {"h3", "h4"}:
+            match = re.search(rf"<{selector}\b[^>]*>(.*?)</{selector}>", fragment, flags=re.IGNORECASE | re.DOTALL)
+        elif selector == "data-purpose-course-title":
+            match = re.search(r"<[^>]+data-purpose\s*=\s*(['\"])[^'\"]*course-title[^'\"]*\1[^>]*>(.*?)</[^>]+>", fragment, flags=re.IGNORECASE | re.DOTALL)
+        else:
+            match = None
+        if match:
+            text = _strip_html(match.group(2) if selector == "data-purpose-course-title" else match.group(1))
+            if text:
+                return text
+    return None
+
+
+def _absolute_udemy_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("/"):
+        return f"https://www.udemy.com{url}"
+    return f"https://www.udemy.com/{url}"
+
+
+def _page_url(page: Any) -> str:
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def _page_title(page: Any) -> str:
+    title_fn = getattr(page, "title", None)
+    if callable(title_fn):
+        try:
+            return _redact_udemy_debug_text(title_fn(), limit=120)
+        except Exception:
+            return ""
+    return ""
+
+
+def _is_udemy_learning_url(url: str) -> bool:
+    return "udemy.com/home/my-courses" in url
+
+
+def _is_udemy_url(url: str) -> bool:
+    return "udemy.com" in url
+
+
+def _find_udemy_learning_page(context: Any) -> Any | None:
+    pages = list(getattr(context, "pages", []) or [])
+    for page in pages:
+        if _is_udemy_learning_url(_page_url(page)):
+            return page
+    for page in pages:
+        if _is_udemy_url(_page_url(page)):
+            return page
+    return None
+
+
+def _wait_for_udemy_course_cards(page: Any, *, timeout: int = 10000) -> bool:
+    wait_for_selector = getattr(page, "wait_for_selector", None)
+    if not callable(wait_for_selector):
+        return False
+    try:
+        wait_for_selector(UDEMY_COURSE_CARD_SELECTOR, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _is_udemy_login_page(url: str, html: str) -> bool:
+    lowered_url = url.casefold()
+    lowered_html = html.casefold()
+    if any(marker in lowered_url for marker in ("/join/login", "/join/signup", "/user/login")):
+        return True
+    login_markers = ("data-purpose=\"login-form\"", "data-purpose='login-form'", "name=\"email\"", "name='email'", "name=\"password\"", "name='password'")
+    if "udemy" in lowered_html and any(marker in lowered_html for marker in login_markers):
+        return True
+    return False
+
+
+def _udemy_sync_error(error: str, message: str, *, remote: bool, cdp_url: str | None = None, state_path: Path | None = None, diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {
+        "success": False,
+        "error": error,
+        "message": message,
+        "remote": remote,
+        "cdp_url": _safe_cdp_url_for_output(cdp_url) if remote and cdp_url else None,
+        "session_state_path": None if remote else str(state_path) if state_path else None,
+        "password_stored": False,
+        "screenshots_saved": False,
+    }
+    if diagnostics:
+        result.update(diagnostics)
+    return result
+
+
+def _navigate_udemy_learning_page(page: Any) -> None:
+    for url in UDEMY_MY_LEARNING_URLS:
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:  # noqa: BLE001 - tolerate Udemy aborting document navigation after a usable page commit.
+            current_url = _page_url(page)
+            if "ERR_ABORTED" in str(exc) and (_is_udemy_learning_url(current_url) or _is_udemy_url(current_url)):
+                pass
+            elif _is_udemy_learning_url(current_url):
+                pass
+            else:
+                continue
+        if _wait_for_udemy_course_cards(page, timeout=10000):
+            return
+
+
+def _read_udemy_learning_html(page: Any, *, remote: bool, cdp_url: str | None = None, state_path: Path | None = None) -> tuple[str | None, dict[str, Any] | None]:
+    _wait_for_udemy_course_cards(page, timeout=10000)
+    html = page.content()
+    page_url = _page_url(page)
+    if _is_udemy_login_page(page_url, html):
+        return None, _udemy_sync_error(
+            "udemy_not_logged_in",
+            "Udemy is showing a login page. Log into Udemy in your Chrome/Edge session, then rerun `hermes learning browser-sync udemy --remote`.",
+            remote=remote,
+            cdp_url=cdp_url,
+            state_path=state_path,
+        )
+    if not _split_udemy_course_cards(html) and not _extract_udemy_heading_candidates(html):
+        return None, _udemy_sync_error(
+            "no_udemy_courses_detected",
+            "Hermes connected to Udemy but could not extract course cards on My Learning. Run with --debug-dom for safe DOM clues.",
+            remote=remote,
+            cdp_url=cdp_url,
+            state_path=state_path,
+            diagnostics=_udemy_no_courses_diagnostics(html, page),
+        )
+    return html, None
+
+
+def _split_udemy_course_cards(html: str) -> list[str]:
+    # Prefer modern Udemy data/class markers; fall back to link-centered chunks.
+    marker_re = rf"<(?P<tag>article|li|section|div)\b[^>]*(?:data-purpose|data-testid|class|aria-label)\s*=\s*(['\"])[^'\"]*{UDEMY_COURSE_CONTAINER_RE}[^'\"]*\2[^>]*>"
+    matches = list(re.finditer(marker_re, html, flags=re.IGNORECASE))
+    cards: list[str] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else min(len(html), match.start() + 10000)
+        fragment = html[match.start():end]
+        text = _strip_html(fragment)
+        if re.search(r"/course/|/learn/|%\s*complete|\bcomplete\b|\blectures\b|\bmin left\b|\bhours?\b", fragment + " " + text, flags=re.IGNORECASE):
+            cards.append(fragment)
+    if cards:
+        return cards
+    link_matches = list(re.finditer(r"<a\b[^>]+href\s*=\s*(['\"])([^'\"]*(?:/course/|/learn/)[^'\"]*)\1[^>]*>.*?</a>", html, flags=re.IGNORECASE | re.DOTALL))
+    for match in link_matches:
+        start = max(0, match.start() - 1800)
+        end = min(len(html), match.end() + 2200)
+        cards.append(html[start:end])
+    return cards
+
+
+def _udemy_course_link_count(html: str) -> int:
+    return len(re.findall(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/)" , html, flags=re.IGNORECASE))
+
+
+_UDEMY_NAVIGATION_HEADINGS = {
+    "my learning",
+    "all courses",
+    "my lists",
+    "wishlist",
+    "certifications",
+    "archived",
+    "learning tools",
+    "schedule learning time",
+    "explore top skills and certifications",
+    "in-demand careers",
+    "web development",
+    "it certifications",
+    "leadership",
+}
+
+_UDEMY_HEADING_FALLBACK_BLOCKLIST = {
+    *_UDEMY_NAVIGATION_HEADINGS,
+    "new & featured",
+    "certifications by skill",
+    "data science",
+    "communication",
+    "business analytics & intelligence",
+    "about",
+    "discover udemy",
+    "udemy for business",
+    "legal & accessibility",
+    "cookie preferences",
+    "your privacy",
+    "strictly necessary cookies",
+    "sale of personal information",
+    "cookie list",
+}
+
+_UDEMY_COURSE_LIKE_TITLE_RE = re.compile(
+    r"\b(?:course|bootcamp|practice\s+exam|exam|certified|certification|getting\s+certified|"
+    r"comptia|network\+|security\+|cysa\+|linux\+|ccna|aws|solutions\s+architect|python|"
+    r"n10-\d+|cs0-\d+|sy0-\d+|xk0-\d+|200-301)\b",
+    flags=re.IGNORECASE,
+)
+
+_UDEMY_COURSE_LIST_STOP_HEADINGS = {
+    "learning tools",
+    "schedule learning time",
+    "explore top skills and certifications",
+    "in-demand careers",
+    "web development",
+    "it certifications",
+    "new & featured",
+    "certifications by skill",
+    "discover udemy",
+    "udemy for business",
+    "legal & accessibility",
+    "your privacy",
+    "cookie preferences",
+}
+
+
+def _is_udemy_navigation_heading(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title or "").strip().casefold()
+    return normalized in _UDEMY_HEADING_FALLBACK_BLOCKLIST
+
+
+def _is_udemy_heading_candidate(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title or "").strip()
+    return bool(normalized) and not _is_udemy_navigation_heading(normalized)
+
+
+def _extract_udemy_my_learning_course_region(html: str) -> str:
+    """Return the bounded My Learning course-list region used by heading fallback."""
+    heading_re = re.compile(r"<h(?P<level>[1-6])\b[^>]*>(?P<text>.*?)</h[1-6]>", flags=re.IGNORECASE | re.DOTALL)
+    headings = list(heading_re.finditer(html))
+    start: int | None = None
+    for match in headings:
+        title = _strip_html(match.group("text")).casefold()
+        if title == "all courses":
+            start = match.end()
+            break
+        if start is None and title == "my learning":
+            start = match.end()
+    if start is None:
+        return ""
+
+    end = len(html)
+    structural_stop = re.search(
+        r"<(?:footer|nav)\b|\brole\s*=\s*(['\"])contentinfo\1|\b(?:id|class|data-purpose)\s*=\s*(['\"])[^'\"]*(?:footer|cookie|privacy|category|marketing)[^'\"]*\2",
+        html[start:],
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if structural_stop:
+        end = min(end, start + structural_stop.start())
+
+    for match in headings:
+        if match.start() <= start:
+            continue
+        level = int(match.group("level"))
+        title = re.sub(r"\s+", " ", _strip_html(match.group("text"))).strip().casefold()
+        if level <= 2 and title in _UDEMY_COURSE_LIST_STOP_HEADINGS:
+            end = min(end, match.start())
+            break
+    return html[start:end]
+
+
+def _udemy_heading_has_course_signal(title: str, fragment: str) -> bool:
+    text = _strip_html(fragment)
+    haystack = f"{title} {text}"
+    if _UDEMY_COURSE_LIKE_TITLE_RE.search(title):
+        return True
+    if re.search(r"<button\b[^>]*(?:aria-label\s*=\s*(['\"])[^'\"]*(?:rating|star|review)[^'\"]*\1)[^>]*>|<button\b[^>]*>.*?(?:rating|star|review).*?</button>", fragment, flags=re.IGNORECASE | re.DOTALL):
+        return True
+    if re.search(UDEMY_COURSE_DIAGNOSTIC_CONTAINER_RE, fragment, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:instructor|progress|%\s*(?:complete|completed)?|lectures?|lessons?|course\s+content)\b", haystack, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:all courses|in progress|completed|archived)\b", text, flags=re.IGNORECASE) and _UDEMY_COURSE_LIKE_TITLE_RE.search(haystack):
+        return True
+    return False
+
+
+def _extract_udemy_heading_candidates(html: str) -> list[dict[str, Any]]:
+    if _udemy_course_link_count(html) > 0:
+        return []
+    region = _extract_udemy_my_learning_course_region(html)
+    if not region:
+        return []
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    heading_re = re.compile(r"<h[2-4]\b[^>]*>(.*?)</h[2-4]>", flags=re.IGNORECASE | re.DOTALL)
+    for match in heading_re.finditer(region):
+        title = _strip_html(match.group(1))
+        if not _is_udemy_heading_candidate(title):
+            continue
+        key = slug(title)
+        if key in seen:
+            continue
+        start = max(0, match.start() - 1200)
+        end = min(len(region), match.end() + 1800)
+        fragment = region[start:end]
+        if not _udemy_heading_has_course_signal(title, fragment):
+            continue
+        seen.add(key)
+        candidates.append({"title": title, "progress_percent": normalize_percent(_find_progress(_strip_html(fragment))), "raw_text": _strip_html(fragment)[:1000]})
+    return candidates
+
+
+def _udemy_heading_candidate_count(html: str) -> int:
+    return len(_extract_udemy_heading_candidates(html))
+
+
+def _udemy_candidate_container_count(html: str) -> int:
+    return len(re.findall(rf"<(?P<tag>article|li|section|div)\b[^>]*(?:data-purpose|data-testid|class|aria-label)\s*=\s*(['\"])[^'\"]*{UDEMY_COURSE_DIAGNOSTIC_CONTAINER_RE}[^'\"]*\2", html, flags=re.IGNORECASE))
+
+
+def _udemy_no_courses_diagnostics(html: str, page: Any | None = None) -> dict[str, Any]:
+    return {
+        "current_url": _safe_cdp_url_for_output(_page_url(page)) if page is not None else None,
+        "title": _page_title(page) if page is not None else None,
+        "course_link_count": _udemy_course_link_count(html),
+        "candidate_container_count": _udemy_candidate_container_count(html),
+        "heading_candidate_count": _udemy_heading_candidate_count(html),
+        "recommendation": "run --debug-dom",
+    }
+
+def _extract_udemy_course(card: str) -> dict[str, Any]:
+    text = _strip_html(card)
+    url = _absolute_udemy_url(_html_attr(card, "href"))
+    title = (
+        _html_attr(card, "data-course-title")
+        or _first_html_text(card, ("data-purpose-course-title", "h3", "h4"))
+        or _first_match([r"(?:Course|Title)\s*[:\-]\s*([^|\n]+?)(?: Instructor| Progress|$)"], text)
+    )
+    if not title:
+        anchor = re.search(r"<a\b[^>]+href\s*=\s*(['\"])[^'\"]*(?:/course/|/learn/)[^'\"]*\1[^>]*>(.*?)</a>", card, flags=re.IGNORECASE | re.DOTALL)
+        title = _strip_html(anchor.group(2)) if anchor else None
+    progress = normalize_percent(_html_attr(card, "data-progress") or _html_attr(card, "aria-valuenow") or _find_progress(text))
+    lectures = re.search(r"(\d+)\s*/\s*(\d+)\s+(?:lectures|lessons|items)", text, flags=re.IGNORECASE)
+    completed_lectures = int(lectures.group(1)) if lectures else None
+    total_lectures = int(lectures.group(2)) if lectures else None
+    if progress is None and completed_lectures is not None and total_lectures:
+        progress = normalize_percent((completed_lectures / total_lectures) * 100)
+    instructor = _first_match([r"Instructor\s*[:\-]\s*([^|]+?)(?: Progress| Last accessed| Certificate| \d+\s*%|$)", r"By\s+([^|]+?)(?: Progress| Last accessed|$)"], text)
+    last_accessed = _first_match([r"Last accessed\s*[:\-]\s*([^|]+?)(?: Certificate| Instructor|$)", r"Accessed\s*[:\-]\s*([^|]+?)(?: Certificate|$)"], text)
+    certificate_url = None
+    cert_match = re.search(r"<a\b[^>]+href\s*=\s*(['\"])([^'\"]*(?:certificate|completion)[^'\"]*)\1", card, flags=re.IGNORECASE)
+    if cert_match:
+        certificate_url = _absolute_udemy_url(cert_match.group(2))
+    elif re.search(r"\b(certificate|certification of completion)\b", text, flags=re.IGNORECASE) and progress == 100:
+        certificate_url = url
+    return {
+        "title": title.strip() if title else None,
+        "course_url": url,
+        "progress_percent": progress,
+        "completed_lectures": completed_lectures,
+        "total_lectures": total_lectures,
+        "last_accessed": last_accessed,
+        "certificate_url": certificate_url,
+        "instructor": instructor,
+        "raw_text": text[:1000],
+    }
+
+
+def parse_udemy_learning_html(html: str, *, now: str | None = None, evidence_url: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    timestamp = now or utc_now()
+    courses: list[dict[str, Any]] = []
+    manual_review: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for card in _split_udemy_course_cards(html):
+        extracted = _extract_udemy_course(card)
+        title = extracted.get("title")
+        progress = normalize_percent(extracted.get("progress_percent"))
+        url = extracted.get("course_url")
+        if not title or progress is None:
+            manual_review.append({
+                "source": UDEMY_SOURCE,
+                "confidence": 0.35 if title else 0.2,
+                "last_updated": timestamp,
+                "message": "Udemy course card was ambiguous; title or explicit progress was missing, so no progress was imported.",
+                "evidence_url": url,
+                "evidence_path": url,
+                "course_title": title,
+                "extracted_text_preview": extracted.get("raw_text"),
+            })
+            continue
+        key = slug(url or title)
+        if key in seen:
+            continue
+        seen.add(key)
+        confidence = 0.9 if url else 0.75
+        if extracted.get("completed_lectures") is not None and extracted.get("total_lectures") is not None:
+            confidence = max(confidence, 0.92)
+        courses.append({
+            "id": stable_id("course", UDEMY_PROVIDER_NAME, title),
+            "name": title,
+            "provider": UDEMY_PROVIDER_NAME,
+            "status": "completed" if progress == 100 else "in_progress" if progress > 0 else None,
+            "progress_percent": progress,
+            "completed_lectures": extracted.get("completed_lectures"),
+            "total_lectures": extracted.get("total_lectures"),
+            "last_studied": extracted.get("last_accessed"),
+            "last_accessed": extracted.get("last_accessed"),
+            "certificate_url": extracted.get("certificate_url"),
+            "instructor": extracted.get("instructor"),
+            "course_url": url,
+            "source": UDEMY_SOURCE,
+            "confidence": confidence,
+            "last_updated": timestamp,
+            "imported_at": timestamp,
+            "evidence_path": url or f"udemy:{slug(title)}",
+            "evidence_url": url,
+        })
+    if not courses and _udemy_course_link_count(html) == 0:
+        fallback_evidence_url = evidence_url or UDEMY_MY_LEARNING_URL
+        for extracted in _extract_udemy_heading_candidates(html):
+            title = str(extracted.get("title") or "").strip()
+            if not title:
+                continue
+            key = slug(title)
+            if key in seen:
+                continue
+            seen.add(key)
+            progress = normalize_percent(extracted.get("progress_percent"))
+            if progress is None:
+                manual_review.append({
+                    "source": UDEMY_HEADING_FALLBACK_SOURCE,
+                    "confidence": 0.65,
+                    "last_updated": timestamp,
+                    "message": "Udemy course imported from heading, but progress percentage was not visible.",
+                    "course_title": title,
+                    "evidence_url": fallback_evidence_url,
+                    "evidence_path": fallback_evidence_url,
+                    "extracted_text_preview": extracted.get("raw_text"),
+                })
+            courses.append({
+                "id": stable_id("course", UDEMY_PROVIDER_NAME, title),
+                "name": title,
+                "provider": UDEMY_PROVIDER_NAME,
+                "status": "completed" if progress == 100 else "in_progress" if progress and progress > 0 else None,
+                "progress_percent": progress,
+                "completed_lectures": None,
+                "total_lectures": None,
+                "last_studied": None,
+                "last_accessed": None,
+                "certificate_url": None,
+                "instructor": None,
+                "course_url": None,
+                "source": UDEMY_HEADING_FALLBACK_SOURCE,
+                "confidence": 0.65,
+                "last_updated": timestamp,
+                "imported_at": timestamp,
+                "evidence_path": fallback_evidence_url,
+                "evidence_url": fallback_evidence_url,
+            })
+    return courses, manual_review
+
+
+def _udemy_certification_for_course(title: str) -> str | None:
+    normalized = title.casefold()
+    if "comptia security+" in normalized or "security+" in normalized or "sy0-" in normalized:
+        return "Security+"
+    if "comptia linux+" in normalized or "linux+" in normalized or "xk0-" in normalized:
+        return "Linux+"
+    if "comptia network+" in normalized or "network+" in normalized or "n10-" in normalized:
+        return "Network+"
+    if "comptia cysa+" in normalized or "cysa+" in normalized or "cs0-" in normalized:
+        return "CySA+"
+    if "cisco ccna" in normalized or "ccna" in normalized or "200-301" in normalized:
+        return "CCNA"
+    has_aws = "aws" in normalized or "amazon web services" in normalized
+    has_saa = any(token in normalized for token in ("saa", "solutions architect associate", "solution architect associate"))
+    if has_aws and has_saa:
+        return "AWS Solutions Architect Associate"
+    return None
+
+
+def _udemy_certification_provider(cert_name: str) -> str:
+    if cert_name in {"Security+", "Linux+", "Network+", "CySA+"}:
+        return "CompTIA"
+    if cert_name == "CCNA":
+        return "Cisco"
+    if cert_name == "AWS Solutions Architect Associate":
+        return "AWS"
+    return UDEMY_PROVIDER_NAME
+
+
+def _merge_records_preserving_confirmed(existing: list[Any], imported: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {item["id"]: item for item in existing if isinstance(item, dict) and item.get("id")}
+    for item in imported:
+        old = merged.get(item["id"])
+        if old:
+            old_source = str(old.get("source") or "")
+            old_confirmed = bool(old.get("manual_confirmed") or old.get("confirmed")) or old_source in {"manual", "manual_import", "obsidian"}
+            old_updated = str(old.get("last_updated") or "")
+            new_updated = str(item.get("last_updated") or "")
+            if old_confirmed and old_updated and new_updated and old_updated > new_updated:
+                continue
+            merged[item["id"]] = {**old, **item}
+        else:
+            merged[item["id"]] = item
+    return sorted(merged.values(), key=lambda row: str(row.get("name") or row.get("id") or ""))
+
+
+def apply_udemy_courses_to_learning_registry(courses: list[dict[str, Any]], *, manual_review: list[dict[str, Any]] | None = None, learning_path: Path | None = None, career_path: Path | None = None, now: str | None = None) -> dict[str, Any]:
+    timestamp = now or utc_now()
+    learning_path = learning_path or learning_registry_path()
+    registry = load_json(learning_path, empty_learning_registry(now=timestamp))
+    imported_courses = [{**course, "last_updated": course.get("last_updated") or timestamp, "imported_at": course.get("imported_at") or timestamp} for course in courses]
+    certifications: list[dict[str, Any]] = []
+    cert_seen: set[str] = set()
+    for course in imported_courses:
+        cert_name = _udemy_certification_for_course(str(course.get("name") or ""))
+        if not cert_name:
+            if any(keyword in str(course.get("name") or "").casefold() for keyword in ("aws", "cert", "exam")):
+                (manual_review or []).append({
+                    "source": UDEMY_SOURCE,
+                    "confidence": 0.45,
+                    "last_updated": timestamp,
+                    "message": "Udemy course may relate to a certification, but the title did not clearly map to a supported certification.",
+                    "course_title": course.get("name"),
+                    "evidence_url": course.get("course_url"),
+                    "evidence_path": course.get("evidence_path"),
+                })
+            continue
+        cert_provider = _udemy_certification_provider(cert_name)
+        cert_id = stable_id("cert", cert_provider, cert_name)
+        if cert_id in cert_seen:
+            continue
+        cert_seen.add(cert_id)
+        course_source = str(course.get("source") or UDEMY_SOURCE)
+        certifications.append({
+            "id": cert_id,
+            "name": cert_name,
+            "provider": cert_provider,
+            "status": course.get("status"),
+            "progress_percent": course.get("progress_percent"),
+            "last_studied": course.get("last_studied"),
+            "next_action": None if course.get("progress_percent") == 100 else f"Continue Udemy course: {course.get('name')}",
+            "source": course_source,
+            "confidence": min(0.9, float(course.get("confidence") or 0.8)),
+            "last_updated": course.get("last_updated") or timestamp,
+            "imported_at": course.get("imported_at") or timestamp,
+            "evidence_path": course.get("evidence_path"),
+            "evidence_url": course.get("evidence_url"),
+            "linked_course_id": course.get("id"),
+        })
+    provider_map = {slug(item.get("name")): item for item in registry.get("providers", []) if isinstance(item, dict)}
+    add_provider(provider_map, UDEMY_PROVIDER_NAME, source=UDEMY_SOURCE, confidence=max([float(course.get("confidence") or 0) for course in imported_courses], default=0.0), now=timestamp, evidence_path=(imported_courses[0].get("evidence_path") if imported_courses else None))
+    registry["providers"] = sorted(provider_map.values(), key=lambda item: item["name"])
+    registry["courses"] = _merge_records_preserving_confirmed(registry.get("courses", []), imported_courses)
+    registry["certifications"] = _merge_records_preserving_confirmed(registry.get("certifications", []), certifications)
+    registry.setdefault("manual_review", [])
+    registry["manual_review"] = [*(item for item in registry.get("manual_review", []) if isinstance(item, dict)), *(manual_review or [])]
+    registry.setdefault("source_evidence", [])
+    existing_evidence = {(item.get("source"), item.get("field"), item.get("evidence_path"), str(item.get("value"))) for item in registry["source_evidence"] if isinstance(item, dict)}
+    for course in imported_courses:
+        course_source = str(course.get("source") or UDEMY_SOURCE)
+        for field in ("progress_percent", "course_url", "completed_lectures", "total_lectures", "certificate_url", "instructor"):
+            value = course.get(field)
+            if value in (None, ""):
+                continue
+            key = (course_source, field, course.get("evidence_path"), str(value))
+            if key in existing_evidence:
+                continue
+            registry["source_evidence"].append({
+                "field": field,
+                "value": value,
+                "source": course_source,
+                "confidence": course.get("confidence", 0.8),
+                "last_updated": timestamp,
+                "evidence_path": course.get("evidence_path"),
+                "evidence_url": course.get("evidence_url"),
+                "course_id": course.get("id"),
+            })
+            existing_evidence.add(key)
+    sources = registry.setdefault("sources", {})
+    source_names = sorted({str(course.get("source") or UDEMY_SOURCE) for course in imported_courses} | {str(item.get("source") or UDEMY_SOURCE) for item in (manual_review or []) if isinstance(item, dict)} | {UDEMY_SOURCE})
+    for source_name in source_names:
+        source_courses = [course for course in imported_courses if str(course.get("source") or UDEMY_SOURCE) == source_name]
+        source_reviews = [item for item in (manual_review or []) if isinstance(item, dict) and str(item.get("source") or UDEMY_SOURCE) == source_name]
+        sources[source_name] = {
+            "status": "Connected" if source_courses else "Needs review",
+            "source": source_name,
+            "confidence": max([float(course.get("confidence") or 0) for course in source_courses], default=0.0),
+            "last_updated": timestamp,
+            "last_sync": timestamp,
+            "session_state_path": str(udemy_session_state_path()),
+            "courses_imported": len(source_courses),
+            "manual_review_count": len(source_reviews),
+        }
+    registry["learning_streak"] = compute_learning_streak(registry.get("study_sessions", []), now=timestamp)
+    registry["study_recommendations"] = build_recommendations(registry, now=timestamp)
+    registry["last_updated"] = timestamp
+    write_json(learning_path, registry)
+    update_career_registry_with_learning_summary(registry, career_path, now=timestamp)
+    return registry
+
+
+def import_udemy_browser_html(html: str, *, learning_path: Path | None = None, career_path: Path | None = None, now: str | None = None, evidence_url: str | None = None) -> dict[str, Any]:
+    timestamp = now or utc_now()
+    courses, manual_review = parse_udemy_learning_html(html, now=timestamp, evidence_url=evidence_url)
+    registry = apply_udemy_courses_to_learning_registry(courses, manual_review=manual_review, learning_path=learning_path, career_path=career_path, now=timestamp)
+    report_source = UDEMY_HEADING_FALLBACK_SOURCE if courses and all(course.get("source") == UDEMY_HEADING_FALLBACK_SOURCE for course in courses) else UDEMY_SOURCE
+    return {
+        "source": report_source,
+        "courses_imported": len(courses),
+        "manual_review_count": len(manual_review),
+        "learning_registry_path": str(learning_path or learning_registry_path()),
+        "career_registry_path": str(career_path or career_registry_path()),
+        "last_updated": timestamp,
+        "course_titles": [course.get("name") for course in courses],
+        "certifications": [cert.get("name") for cert in registry.get("certifications", []) if isinstance(cert, dict) and cert.get("source") in {UDEMY_SOURCE, UDEMY_HEADING_FALLBACK_SOURCE}],
+    }
+
+
+def _safe_dom_debug_from_html(html: str, *, page: Any | None = None) -> dict[str, Any]:
+    def _texts(pattern: str, limit: int = 20) -> list[str]:
+        values: list[str] = []
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+            value = _redact_udemy_debug_text(_strip_html(match.group(1)), limit=120)
+            if value and value not in values:
+                values.append(value)
+            if len(values) >= limit:
+                break
+        return values
+
+    candidates = []
+    for card in _split_udemy_course_cards(html)[:12]:
+        candidates.append({
+            "text": _redact_udemy_debug_text(_strip_html(card), limit=220),
+            "class": _redact_udemy_debug_text(_html_attr(card, "class") or "", limit=120),
+            "data_purpose": _redact_udemy_debug_text(_html_attr(card, "data-purpose") or "", limit=120),
+            "aria_label": _redact_udemy_debug_text(_html_attr(card, "aria-label") or "", limit=120),
+        })
+    return {
+        "success": True,
+        "provider": "udemy",
+        "debug_dom": True,
+        "current_url": _safe_cdp_url_for_output(_page_url(page)) if page is not None else None,
+        "title": _page_title(page) if page is not None else None,
+        "headings": _texts(r"<h[1-4]\b[^>]*>(.*?)</h[1-4]>", 20),
+        "buttons": _texts(r"<button\b[^>]*>(.*?)</button>", 30),
+        "links": _texts(r"<a\b[^>]*>(.*?)</a>", 40),
+        "candidate_containers": candidates,
+        "course_link_count": _udemy_course_link_count(html),
+        "candidate_container_count": _udemy_candidate_container_count(html),
+        "password_stored": False,
+        "screenshots_saved": False,
+        "storage_read": False,
+        "cookies_read": False,
+    }
+
+
+def _safe_udemy_dom_debug(page: Any) -> dict[str, Any]:
+    evaluate = getattr(page, "evaluate", None)
+    if callable(evaluate):
+        try:
+            data = evaluate(
+                r"""
+                () => {
+                  const txt = (v, n=160) => (v || '').replace(/\s+/g, ' ').trim().slice(0, n);
+                  const arr = (sel, n=30) => Array.from(document.querySelectorAll(sel)).filter(e => e.offsetParent !== null).slice(0, n).map(e => txt(e.innerText || e.textContent || e.getAttribute('aria-label') || '', 160)).filter(Boolean);
+                  const candidates = Array.from(document.querySelectorAll('[data-purpose], [data-testid], [class], [aria-label], a[href*="/course/"], a[href*="/learn/"]')).filter(e => {
+                    const s = `${e.getAttribute('data-purpose')||''} ${e.getAttribute('data-testid')||''} ${e.className||''} ${e.getAttribute('aria-label')||''} ${e.getAttribute('href')||''} ${e.innerText||''}`.toLowerCase();
+                    return /course-card|course-list|enrolled-course|learning-card|my-course|learning-course|progress|\/course\/|\/learn\/|% complete|lectures|min left|hours?/.test(s);
+                  }).slice(0, 12).map(e => ({
+                    text: txt(e.innerText || e.textContent || '', 220),
+                    class: txt(typeof e.className === 'string' ? e.className : '', 120),
+                    data_purpose: txt(e.getAttribute('data-purpose') || '', 120),
+                    aria_label: txt(e.getAttribute('aria-label') || '', 120)
+                  }));
+                  return {headings: arr('h1,h2,h3,h4', 20), buttons: arr('button,[role="button"]', 30), links: arr('a[href]', 40), candidate_containers: candidates, title: document.title || ''};
+                }
+                """
+            )
+            html = page.content()
+            safe = _safe_dom_debug_from_html(html, page=page)
+            if isinstance(data, dict):
+                for key in ("headings", "buttons", "links"):
+                    safe[key] = [_redact_udemy_debug_text(item, limit=160) for item in data.get(key, []) if _redact_udemy_debug_text(item, limit=160)]
+                safe["candidate_containers"] = [
+                    {k: _redact_udemy_debug_text(v, limit=220 if k == "text" else 120) for k, v in item.items() if k in {"text", "class", "data_purpose", "aria_label"}}
+                    for item in data.get("candidate_containers", [])[:12]
+                    if isinstance(item, dict)
+                ]
+                safe["title"] = _redact_udemy_debug_text(data.get("title") or safe.get("title"), limit=120)
+            return safe
+        except Exception:
+            pass
+    return _safe_dom_debug_from_html(page.content(), page=page)
+
+
+def debug_udemy_browser_dom(*, state_path: Path | None = None, headless: bool = True, remote: bool = False, cdp_url: str = DEFAULT_UDEMY_CDP_URL, html_override: str | None = None) -> dict[str, Any]:
+    if html_override is not None:
+        return _safe_dom_debug_from_html(html_override)
+    state_path = state_path or udemy_session_state_path()
+    if not remote and not state_path.exists():
+        return {"success": False, "error": "missing_session", "message": "Run `hermes learning browser-connect udemy` first.", "session_state_path": str(state_path), "password_stored": False, "screenshots_saved": False}
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": "playwright_not_installed", "message": "Install Playwright and Chromium to use Udemy browser debug.", "details": type(exc).__name__, "session_state_path": None if remote else str(state_path), "password_stored": False, "screenshots_saved": False}
+    with sync_playwright() as pw:
+        if remote:
+            try:
+                browser = pw.chromium.connect_over_cdp(cdp_url)
+            except Exception as exc:  # noqa: BLE001
+                return _cdp_connection_error(cdp_url, exc)
+            try:
+                page, _context = _remote_cdp_page(browser, prefer_udemy_learning=True)
+                if not _is_udemy_learning_url(_page_url(page)):
+                    _navigate_udemy_learning_page(page)
+                report = _safe_udemy_dom_debug(page)
+                report.update({"remote": True, "cdp_url": _safe_cdp_url_for_output(cdp_url), "session_state_path": None})
+                return report
+            finally:
+                _close_remote_cdp_connection(browser)
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(storage_state=str(state_path))
+        page = context.new_page()
+        _navigate_udemy_learning_page(page)
+        report = _safe_udemy_dom_debug(page)
+        browser.close()
+        report.update({"remote": False, "cdp_url": None, "session_state_path": str(state_path)})
+        return report
+
+
+def _cdp_connection_error(cdp_url: str, exc: Exception) -> dict[str, Any]:
+    safe_cdp_url = _safe_cdp_url_for_output(cdp_url)
+    return {
+        "success": False,
+        "error": "cdp_connection_failed",
+        "message": (
+            f"Could not connect to Chrome/Edge at {safe_cdp_url}. Start Chrome or Edge with "
+            "--remote-debugging-port=9222 and, if Hermes runs on a VPS, create an SSH tunnel: "
+            "ssh -L 9222:127.0.0.1:9222 yuu@<VPS_IP>."
+        ),
+        "details": type(exc).__name__,
+        "cdp_url": safe_cdp_url,
+        "remote": True,
+        "password_stored": False,
+        "screenshots_saved": False,
+    }
+
+
+def _remote_cdp_page(browser: Any, *, prefer_udemy_learning: bool = False) -> Any:
+    contexts = list(getattr(browser, "contexts", []) or [])
+    context = contexts[0] if contexts else browser.new_context()
+    if prefer_udemy_learning:
+        udemy_page = _find_udemy_learning_page(context)
+        if udemy_page is not None:
+            return udemy_page, context
+    pages = list(getattr(context, "pages", []) or [])
+    return (pages[0] if pages else context.new_page()), context
+
+
+def _close_remote_cdp_connection(browser: Any) -> None:
+    # Playwright's CDP connection is external to Hermes. Best effort only; never
+    # close contexts/pages because those belong to the user's local browser session.
+    disconnect = getattr(browser, "disconnect", None)
+    if callable(disconnect):
+        try:
+            disconnect()
+        except Exception:
+            pass
+
+
+def connect_udemy_browser_session(*, state_path: Path | None = None, headless: bool = False, remote: bool = False, cdp_url: str = DEFAULT_UDEMY_CDP_URL) -> dict[str, Any]:
+    state_path = state_path or udemy_session_state_path()
+    if not remote:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error": "playwright_not_installed",
+            "message": "Install Playwright in the Hermes venv, then run `python -m playwright install chromium`.",
+            "details": str(exc),
+            "session_state_path": str(state_path),
+            "password_stored": False,
+        }
+    with sync_playwright() as pw:
+        if remote:
+            try:
+                browser = pw.chromium.connect_over_cdp(cdp_url)
+            except Exception as exc:  # noqa: BLE001
+                return _cdp_connection_error(cdp_url, exc)
+            try:
+                page, _context = _remote_cdp_page(browser)
+                page.goto(UDEMY_LOGIN_URL, wait_until="domcontentloaded")
+                print("Udemy login page opened in your remote Chrome/Edge session. Log in locally, then press Enter here. Passwords, cookies, session tokens, and screenshots are never logged by Hermes.")
+                input()
+            finally:
+                _close_remote_cdp_connection(browser)
+            return {
+                "success": True,
+                "provider": "udemy",
+                "remote": True,
+                "cdp_url": _safe_cdp_url_for_output(cdp_url),
+                "session_exists": False,
+                "session_state_path": None,
+                "file_mode": None,
+                "password_stored": False,
+                "screenshots_saved": False,
+                "message": "Connected to remote Chrome/Edge through Playwright CDP. No Udemy password, cookies, session tokens, screenshots, or browser storage state were stored by Hermes.",
+            }
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(storage_state=str(state_path) if state_path.exists() else None)
+        page = context.new_page()
+        page.goto(UDEMY_LOGIN_URL, wait_until="domcontentloaded")
+        print("Udemy login page opened. Log in manually in the browser window, then press Enter here to save cookie/session state. Passwords are never read or stored.")
+        input()
+        context.storage_state(path=str(state_path))
+        browser.close()
+    _chmod_0600(state_path)
+    return {
+        "success": True,
+        "provider": "udemy",
+        "remote": False,
+        "session_exists": state_path.exists(),
+        "session_state_path": str(state_path),
+        "file_mode": oct(state_path.stat().st_mode & 0o777) if state_path.exists() else None,
+        "password_stored": False,
+        "screenshots_saved": False,
+        "message": "Udemy browser session saved. Only Playwright cookie/storage state was written; no username or password was stored.",
+    }
+
+
+def sync_udemy_browser_learning(*, state_path: Path | None = None, learning_path: Path | None = None, career_path: Path | None = None, now: str | None = None, html_override: str | None = None, headless: bool = True, remote: bool = False, cdp_url: str = DEFAULT_UDEMY_CDP_URL, debug_dom: bool = False) -> dict[str, Any]:
+    timestamp = now or utc_now()
+    state_path = state_path or udemy_session_state_path()
+    html = html_override
+    evidence_url = UDEMY_MY_LEARNING_URL if html_override is not None else None
+    if html is None:
+        if not remote and not state_path.exists():
+            return {"success": False, "error": "missing_session", "message": "Run `hermes learning browser-connect udemy` first.", "session_state_path": str(state_path)}
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": "playwright_not_installed", "message": "Install Playwright and Chromium to use Udemy browser sync.", "details": str(exc), "session_state_path": str(state_path)}
+        with sync_playwright() as pw:
+            if remote:
+                try:
+                    browser = pw.chromium.connect_over_cdp(cdp_url)
+                except Exception as exc:  # noqa: BLE001
+                    return _cdp_connection_error(cdp_url, exc)
+                try:
+                    page, _context = _remote_cdp_page(browser, prefer_udemy_learning=True)
+                    existing_html = page.content() if _is_udemy_learning_url(_page_url(page)) else ""
+                    if not _split_udemy_course_cards(existing_html):
+                        _navigate_udemy_learning_page(page)
+                    if debug_dom:
+                        report = _safe_udemy_dom_debug(page)
+                        report.update({"remote": True, "cdp_url": _safe_cdp_url_for_output(cdp_url), "session_state_path": None})
+                        return report
+                    html, sync_error = _read_udemy_learning_html(page, remote=True, cdp_url=cdp_url)
+                    evidence_url = _safe_cdp_url_for_output(_page_url(page))
+                    if sync_error:
+                        return sync_error
+                finally:
+                    _close_remote_cdp_connection(browser)
+            else:
+                browser = pw.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=str(state_path))
+                page = context.new_page()
+                _navigate_udemy_learning_page(page)
+                if debug_dom:
+                    report = _safe_udemy_dom_debug(page)
+                    browser.close()
+                    report.update({"remote": False, "cdp_url": None, "session_state_path": str(state_path)})
+                    return report
+                html, sync_error = _read_udemy_learning_html(page, remote=False, state_path=state_path)
+                evidence_url = _safe_cdp_url_for_output(_page_url(page))
+                if sync_error:
+                    browser.close()
+                    return sync_error
+                context.storage_state(path=str(state_path))
+                browser.close()
+                _chmod_0600(state_path)
+    if debug_dom and html is not None:
+        report = _safe_dom_debug_from_html(html)
+        report.update({"remote": remote, "cdp_url": _safe_cdp_url_for_output(cdp_url) if remote else None, "session_state_path": None if remote else str(state_path)})
+        return report
+    if html is None:
+        return _udemy_sync_error(
+            "no_udemy_courses_detected",
+            "Hermes connected to Udemy but could not read Udemy My Learning page content.",
+            remote=remote,
+            cdp_url=cdp_url,
+            state_path=state_path,
+        )
+    if _is_udemy_login_page("", html):
+        return _udemy_sync_error(
+            "udemy_not_logged_in",
+            "Udemy is showing a login page. Log into Udemy in your Chrome/Edge session, then rerun `hermes learning browser-sync udemy --remote`.",
+            remote=remote,
+            cdp_url=cdp_url,
+            state_path=state_path,
+        )
+    if not _split_udemy_course_cards(html) and not _extract_udemy_heading_candidates(html):
+        return _udemy_sync_error(
+            "no_udemy_courses_detected",
+            "Hermes connected to Udemy but could not extract course cards on My Learning. Run with --debug-dom for safe DOM clues.",
+            remote=remote,
+            cdp_url=cdp_url,
+            state_path=state_path,
+            diagnostics=_udemy_no_courses_diagnostics(html),
+        )
+    report = import_udemy_browser_html(html, learning_path=learning_path, career_path=career_path, now=timestamp, evidence_url=evidence_url)
+    report.update({"success": True, "remote": remote, "cdp_url": _safe_cdp_url_for_output(cdp_url) if remote else None, "session_state_path": None if remote else str(state_path), "password_stored": False, "screenshots_saved": False})
+    return report
+
+
+def udemy_browser_status(*, learning_path: Path | None = None, state_path: Path | None = None, remote: bool = False, cdp_url: str = DEFAULT_UDEMY_CDP_URL) -> dict[str, Any]:
+    learning_path = learning_path or learning_registry_path()
+    state_path = state_path or udemy_session_state_path()
+    registry = load_json(learning_path, empty_learning_registry())
+    sources = registry.get("sources") if isinstance(registry.get("sources"), dict) else {}
+    udemy = sources.get(UDEMY_SOURCE) if isinstance(sources.get(UDEMY_SOURCE), dict) else {}
+    courses = [course for course in registry.get("courses", []) if isinstance(course, dict) and course.get("source") == UDEMY_SOURCE]
+    manual_review = [item for item in registry.get("manual_review", []) if isinstance(item, dict) and item.get("source") == UDEMY_SOURCE]
+    return {
+        "provider": "udemy",
+        "remote": remote,
+        "cdp_url": _safe_cdp_url_for_output(cdp_url) if remote else None,
+        "session_exists": False if remote else state_path.exists(),
+        "session_state_path": None if remote else str(state_path),
+        "session_file_mode": None if remote else oct(state_path.stat().st_mode & 0o777) if state_path.exists() else None,
+        "last_sync": udemy.get("last_sync") or udemy.get("last_updated"),
+        "courses_imported": len(courses),
+        "errors": udemy.get("errors", []),
+        "manual_review_count": len(manual_review),
+        "learning_registry_path": str(learning_path),
+        "password_stored": False,
+        "screenshots_saved": False,
     }
 
 def update_career_registry_with_learning_summary(learning_registry: dict[str, Any], career_path: Path | None = None, *, now: str | None = None) -> dict[str, Any]:

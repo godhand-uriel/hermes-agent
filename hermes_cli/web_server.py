@@ -7322,17 +7322,302 @@ def _registry_progress_metric(label: str, value: Any, detail: str | None = None)
     return {"label": label, "value": _coerce_float(value) if _coerce_float(value) is not None else value, "detail": detail}
 
 
+_CERTIFICATION_ALIASES: dict[str, tuple[str, ...]] = {
+    "AWS Solutions Architect Associate": ("aws solutions architect associate", "aws certified solutions architect associate", "aws saa", "saa"),
+    "Security+": ("security+", "security plus", "comptia security+", "sy0-701"),
+    "Linux+": ("linux+", "linux plus", "comptia linux+", "xk0-006"),
+    "Network+": ("network+", "network plus", "comptia network+", "n10-009"),
+    "CySA+": ("cysa+", "cysa plus", "comptia cysa+", "cs0-002"),
+    "CCNA": ("ccna", "cisco ccna", "200-301"),
+}
+_CERTIFICATION_ROADMAP_ORDER = ["AWS Solutions Architect Associate", "Security+", "Linux+", "Network+", "CySA+", "CCNA"]
+_SKILL_MATRIX_TARGETS: dict[str, int] = {
+    "AWS": 80,
+    "Azure": 65,
+    "Linux": 80,
+    "Networking": 75,
+    "Security": 70,
+    "Windows/Desktop Support": 70,
+    "Microsoft 365": 65,
+    "Python": 70,
+    "PowerShell": 65,
+    "SQL": 55,
+    "Git": 65,
+    "Terraform": 75,
+    "Docker": 60,
+    "Kubernetes": 55,
+}
+
+
+def _career_norm(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _cert_canonical_name(value: Any) -> str:
+    normalized = _career_norm(value)
+    for canonical, aliases in _CERTIFICATION_ALIASES.items():
+        if normalized == _career_norm(canonical) or any(alias and _career_norm(alias) in normalized for alias in aliases):
+            return canonical
+    return str(value or "").strip()
+
+
+def _career_load_learning_registry() -> tuple[dict[str, Any], dict[str, Any]]:
+    return _load_dashboard_json_registry("HERMES_LEARNING_REGISTRY_PATH", "learning_registry.json", {"certifications": [], "courses": [], "sources": {}, "source_evidence": []})
+
+
+def _career_learning_maps(learning: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    certs: dict[str, dict[str, Any]] = {}
+    courses_by_id: dict[str, dict[str, Any]] = {}
+    for course in learning.get("courses") if isinstance(learning.get("courses"), list) else []:
+        if isinstance(course, dict) and course.get("id"):
+            courses_by_id[str(course["id"])] = course
+    for item in learning.get("certifications") if isinstance(learning.get("certifications"), list) else []:
+        if isinstance(item, dict):
+            canonical = _cert_canonical_name(item.get("name"))
+            if canonical:
+                certs[canonical] = item
+    return certs, courses_by_id
+
+
+def _career_completed_certifications(certifications: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    completed: dict[str, dict[str, Any]] = {}
+    for cert in certifications:
+        canonical = _cert_canonical_name(cert.get("name"))
+        if canonical and str(cert.get("status") or "").casefold() in {"completed", "certified", "verified", "active"}:
+            completed[canonical] = cert
+    return completed
+
+
+def _build_career_certification_roadmap(payload: dict[str, Any], learning: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_certs = payload.get("certifications")
+    registry_certs = [item for item in raw_certs if isinstance(item, dict)] if isinstance(raw_certs, list) else []
+    learning_certs, courses_by_id = _career_learning_maps(learning)
+    completed = _career_completed_certifications(registry_certs)
+    registry_by_name = {_cert_canonical_name(item.get("name")): item for item in registry_certs if item.get("name")}
+    if not registry_by_name and not learning_certs:
+        return []
+    names = list(dict.fromkeys([*_CERTIFICATION_ROADMAP_ORDER, *registry_by_name.keys(), *learning_certs.keys()]))
+    active_priority = _cert_canonical_name(payload.get("current_priority") or payload.get("current_certification_priority"))
+    if active_priority in names:
+        names = [active_priority, *[name for name in names if name != active_priority]]
+    roadmap: list[dict[str, Any]] = []
+    for name in names:
+        if not name:
+            continue
+        registry_item = registry_by_name.get(name, {})
+        learning_item = learning_certs.get(name, {})
+        linked_course = courses_by_id.get(str(learning_item.get("linked_course_id"))) if learning_item.get("linked_course_id") else None
+        course_progress = _coerce_float((linked_course or learning_item).get("progress_percent"))
+        is_completed = name in completed
+        if is_completed:
+            status = "completed"
+        elif learning_item:
+            status = str(learning_item.get("status") or ("not_started" if (course_progress or 0) == 0 else "in_progress"))
+        else:
+            status = registry_item.get("status")
+        progress = 100 if is_completed else course_progress if course_progress is not None else _coerce_float(registry_item.get("progress_percent"))
+        source = "resume" if is_completed else learning_item.get("source") or registry_item.get("source") or "registry"
+        if source == "udemy_browser":
+            source = "Udemy"
+        roadmap.append({
+            **registry_item,
+            "name": name,
+            "status": status,
+            "certification_status": "verified" if is_completed else status,
+            "course_status": learning_item.get("status"),
+            "progress_percent": progress if progress is not None else 0,
+            "course_progress_percent": course_progress,
+            "course": (linked_course or {}).get("name"),
+            "learning_provider": (linked_course or {}).get("provider") or ("Udemy" if learning_item.get("source") == "udemy_browser" else learning_item.get("source")),
+            "source": source,
+            "source_evidence": [item for item in [registry_item.get("source_path") or registry_item.get("evidence_path"), learning_item.get("evidence_path")] if item],
+            "computed": True,
+            "confidence": max(float(registry_item.get("confidence") or 0.8 if registry_item else 0), float(learning_item.get("confidence") or 0)),
+            "priority": "current" if name == active_priority else registry_item.get("priority"),
+            "next_action": "Finish remaining AWS SAA material/review" if name == active_priority and name == "AWS Solutions Architect Associate" else learning_item.get("next_action") or registry_item.get("next_action"),
+        })
+    return roadmap
+
+
+def _build_career_learning_summary(payload: dict[str, Any], learning: dict[str, Any], roadmap: list[dict[str, Any]]) -> dict[str, Any]:
+    existing = payload.get("learning_summary") if isinstance(payload.get("learning_summary"), dict) else {}
+    active = _cert_canonical_name(payload.get("current_priority") or payload.get("current_certification_priority") or existing.get("primary_certification"))
+    primary = next((item for item in roadmap if _cert_canonical_name(item.get("name")) == active), None) or (roadmap[0] if roadmap else {})
+    secondary = [
+        {"name": item.get("name"), "progress_percent": item.get("course_progress_percent"), "source": item.get("learning_provider") or item.get("source"), "status": item.get("course_status") or item.get("status")}
+        for item in roadmap
+        if item is not primary and item.get("course_progress_percent") is not None
+    ]
+    seen_secondary = {_career_norm(item.get("name")) for item in secondary if item.get("name")}
+    raw_courses = learning.get("courses")
+    learning_courses = raw_courses if isinstance(raw_courses, list) else []
+    for course in learning_courses:
+        if not isinstance(course, dict) or not course.get("name"):
+            continue
+        course_name = str(course.get("name"))
+        if any(_cert_canonical_name(course_name) == _cert_canonical_name(item.get("name")) for item in roadmap):
+            continue
+        if _career_norm(course_name) in seen_secondary:
+            continue
+        secondary.append({
+            "name": course_name,
+            "progress_percent": _coerce_float(course.get("progress_percent")),
+            "source": course.get("provider") or course.get("source"),
+            "status": course.get("status"),
+        })
+        seen_secondary.add(_career_norm(course_name))
+    next_task = "Finish remaining AWS SAA material/review" if _cert_canonical_name(primary.get("name")) == "AWS Solutions Architect Associate" else primary.get("next_action") or existing.get("next_learning_task")
+    return {
+        **existing,
+        "primary_certification": primary.get("name"),
+        "primary_active_learning_target": primary.get("name"),
+        "learning_provider": primary.get("learning_provider") or "Udemy",
+        "course": primary.get("course"),
+        "certification_progress": primary.get("course_progress_percent") if primary.get("course_progress_percent") is not None else primary.get("progress_percent"),
+        "course_progress_percent": primary.get("course_progress_percent"),
+        "next_learning_task": next_task,
+        "next_recommendation": next_task,
+        "secondary_learning_items": secondary,
+        "provider_connections": existing.get("provider_connections") or learning.get("sources") or {},
+        "source": "learning_registry",
+        "computed": True,
+    }
+
+
+def _build_career_study_plan(payload: dict[str, Any], learning_summary: dict[str, Any]) -> list[str]:
+    if _cert_canonical_name(learning_summary.get("primary_certification")) == "AWS Solutions Architect Associate":
+        return [
+            "Finish AWS SAA remaining Udemy content/review.",
+            "Complete AWS SAA practice questions.",
+            "Update Obsidian AWS SAA note after study.",
+        ]
+    existing = payload.get("today_tasks")
+    return [str(item) for item in existing if item] if isinstance(existing, list) else []
+
+
+def _skill_has_evidence(skill: dict[str, Any], technical_stack: list[str], learning_summary: dict[str, Any]) -> bool:
+    sources = skill.get("sources") if isinstance(skill.get("sources"), list) else []
+    name = str(skill.get("name") or "")
+    secondary = learning_summary.get("secondary_learning_items") if isinstance(learning_summary.get("secondary_learning_items"), list) else []
+    return bool(sources or skill.get("verified_by_resume") or any(_career_norm(name) in _career_norm(item) or _career_norm(item) in _career_norm(name) for item in technical_stack) or any(_career_norm(name) in _career_norm(row.get("name")) for row in secondary if isinstance(row, dict)))
+
+
+def _build_career_skill_matrix(payload: dict[str, Any], learning_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_skills = payload.get("skills")
+    existing = [item for item in raw_skills if isinstance(item, dict)] if isinstance(raw_skills, list) else []
+    if not existing and not payload.get("target_role") and not payload.get("future_role") and not payload.get("current_role"):
+        return []
+    by_norm = {_career_norm(item.get("name")): item for item in existing if item.get("name")}
+    technical_stack = [str(item) for item in payload.get("technical_stack_evidence", [])] if isinstance(payload.get("technical_stack_evidence"), list) else []
+    raw_projects = payload.get("portfolio_projects")
+    projects = raw_projects if isinstance(raw_projects, list) else []
+    for project in projects:
+        if isinstance(project, dict):
+            for key in ("primary_language", "language", "stack"):
+                value = project.get(key)
+                if isinstance(value, str) and value.strip():
+                    technical_stack.append(value)
+            technical_stack.append("Git")
+    raw_source_connections = payload.get("source_connections")
+    source_connections = raw_source_connections if isinstance(raw_source_connections, dict) else {}
+    if projects or payload.get("github_profile") or isinstance(source_connections.get("github"), dict):
+        technical_stack.append("Git")
+    rows: list[dict[str, Any]] = []
+    aliases = {
+        "Windows/Desktop Support": ("windows", "desktop", "operating systems", "troubleshooting"),
+        "Microsoft 365": ("microsoft365", "microsoft", "office365", "enterprise software", "user management"),
+        "PowerShell": ("powershell",),
+        "SQL": ("sql", "database administration", "database"),
+        "Terraform": ("terraform", "infrastructure as code", "iac"),
+        "Docker": ("docker", "containers", "containerized workloads"),
+        "Kubernetes": ("kubernetes", "k8s", "containerized workloads"),
+    }
+    for name, target in _SKILL_MATRIX_TARGETS.items():
+        keys = [_career_norm(name), *[_career_norm(alias) for alias in aliases.get(name, (name,))]]
+        skill = next((by_norm.get(key) for key in keys if by_norm.get(key)), {})
+        evidence = _skill_has_evidence(skill, technical_stack, learning_summary)
+        current = _coerce_float(skill.get("current_proficiency_percent"))
+        if current is None and evidence:
+            current = 30 if name in {"Windows/Desktop Support", "PowerShell", "Git"} else 20
+        target_value = _coerce_float(skill.get("target_proficiency_percent")) or target
+        gap = max(0, target_value - current) if current is not None else None
+        evidence_sources = []
+        if skill.get("verified_by_resume") or skill.get("sources") or skill.get("source"):
+            evidence_sources.append("resume")
+        if any(_career_norm(name) in _career_norm(item) or _career_norm(item) in _career_norm(name) for item in technical_stack):
+            evidence_sources.append("github")
+        if name in {"AWS", "Security", "Networking", "Linux"}:
+            evidence_sources.append("learning_registry")
+        rows.append({
+            **skill,
+            "name": name,
+            "current_proficiency_percent": current,
+            "target_proficiency_percent": target_value,
+            "gap_percent": gap,
+            "current_evidence": sorted(set(evidence_sources)) or ["target_role_requirement"],
+            "next_task": skill.get("next_task") or ("Finish AWS SAA labs/review" if name == "AWS" else f"Add proficiency evidence for {name}"),
+            "computed": True,
+        })
+    return rows
+
+
+def _build_career_risks(payload: dict[str, Any], roadmap: list[dict[str, Any]], learning_summary: dict[str, Any], skill_matrix: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    risks: list[dict[str, Any]] = []
+    aws = next((item for item in roadmap if _cert_canonical_name(item.get("name")) == "AWS Solutions Architect Associate"), {})
+    if _coerce_float(aws.get("course_progress_percent")) and float(aws.get("course_progress_percent") or 0) >= 90 and not (aws.get("exam_date") or aws.get("target_completion_date")):
+        risks.append({"label": "AWS SAA exam not scheduled", "value": "AWS SAA course is nearly complete but exam date is missing.", "severity": "warn", "source": "learning_registry+career_registry"})
+    if payload.get("target_salary") in (None, ""):
+        risks.append({"label": "Target salary missing", "value": "Target salary missing.", "severity": "warn", "source": "career_registry.target_salary"})
+    if not payload.get("interview_readiness"):
+        risks.append({"label": "Interview readiness missing", "value": "Interview readiness needs assessment.", "severity": "warn", "source": "career_registry.interview_readiness"})
+    connections = payload.get("source_connections") if isinstance(payload.get("source_connections"), dict) else {}
+    if (connections.get("linkedin") or {}).get("status") != "Connected":
+        risks.append({"label": "LinkedIn not connected", "value": "LinkedIn source not connected.", "severity": "warn", "source": "career_registry.source_connections.linkedin"})
+    providers = learning_summary.get("provider_connections") if isinstance(learning_summary.get("provider_connections"), dict) else {}
+    if (providers.get("microsoft_learn") or {}).get("status") != "Connected":
+        risks.append({"label": "Microsoft Learn not connected", "value": "Microsoft Learn source not connected.", "severity": "warn", "source": "learning_summary.provider_connections.microsoft_learn"})
+    if payload.get("applications_sent") in (None, ""):
+        risks.append({"label": "Applications not tracked", "value": "Job applications not tracked.", "severity": "warn", "source": "career_registry.applications_sent"})
+    weak = [item["name"] for item in skill_matrix if item.get("current_proficiency_percent") is None]
+    if weak:
+        risks.append({"label": "Skill evidence incomplete", "value": f"Some skill levels lack proficiency evidence: {', '.join(weak[:4])}.", "severity": "warn", "source": "career_registry.skills"})
+    return risks
+
+
+def _build_job_readiness(payload: dict[str, Any]) -> dict[str, Any]:
+    connections = payload.get("source_connections") if isinstance(payload.get("source_connections"), dict) else {}
+    github = connections.get("github") if isinstance(connections.get("github"), dict) else {}
+    linkedin = connections.get("linkedin") if isinstance(connections.get("linkedin"), dict) else {}
+    projects = payload.get("portfolio_projects") if isinstance(payload.get("portfolio_projects"), list) else []
+    return {
+        "resume": payload.get("resume_status") or "Needs input: resume_status",
+        "github": "connected/repositories found" if github.get("status") == "Connected" or projects else "Needs input: GitHub connection",
+        "linkedin": "not connected" if linkedin.get("status") != "Connected" else "connected",
+        "portfolio": "partial, based on GitHub" if projects else payload.get("portfolio_readiness") or "needs input",
+        "interview": payload.get("interview_readiness") or "needs assessment",
+        "applications": "needs input" if payload.get("applications_sent") in (None, "") else payload.get("applications_sent"),
+        "source": "career_registry.source_connections",
+        "computed": True,
+    }
+
+
 def _dashboard_career_registry_contract() -> dict[str, Any]:
     payload, source = _load_dashboard_json_registry("HERMES_CAREER_REGISTRY_PATH", "career_registry.json", _DEFAULT_CAREER_REGISTRY)
-    raw_certifications = payload.get("certifications")
-    certifications = raw_certifications if isinstance(raw_certifications, list) else []
-    raw_skills = payload.get("skills")
-    skills = raw_skills if isinstance(raw_skills, list) else []
+    learning, learning_source = _career_load_learning_registry()
+    certification_roadmap = _build_career_certification_roadmap(payload, learning)
+    learning_summary = _build_career_learning_summary(payload, learning, certification_roadmap)
+    study_plan = _build_career_study_plan(payload, learning_summary)
+    skill_matrix = _build_career_skill_matrix(payload, learning_summary)
+    career_risks = _build_career_risks(payload, certification_roadmap, learning_summary, skill_matrix)
+    job_readiness = _build_job_readiness(payload)
+    certifications = certification_roadmap
+    raw_output_skills = payload.get("skills") if isinstance(payload.get("skills"), list) else []
+    skills = skill_matrix
     skill_metrics = [
         _registry_progress_metric(
             str(item.get("name") or "Skill"),
             item.get("current_proficiency_percent", 0),
-            f"Target {item.get('target_proficiency_percent', 0)}%",
+            f"Target {item.get('target_proficiency_percent', 0)}%; evidence: {', '.join(item.get('current_evidence') or [])}",
         )
         for item in skills
         if isinstance(item, dict)
@@ -7341,7 +7626,7 @@ def _dashboard_career_registry_contract() -> dict[str, Any]:
         _registry_progress_metric(
             str(item.get("name") or "Certification"),
             item.get("progress_percent", 0),
-            f"Target {item.get('target_completion_date') or 'not scheduled'}",
+            f"Status {item.get('certification_status') or item.get('status')}; course {item.get('course_progress_percent')}%",
         )
         for item in certifications
         if isinstance(item, dict)
@@ -7351,6 +7636,7 @@ def _dashboard_career_registry_contract() -> dict[str, Any]:
         for value in (payload.get("current_role"), payload.get("target_role"), payload.get("future_role"))
         if value not in (None, "")
     ]
+    active_priority = learning_summary.get("primary_certification") or payload.get("current_priority") or payload.get("current_certification_priority")
     return {
         **payload,
         "status": "available" if source.get("configured") else "unconfigured",
@@ -7360,14 +7646,22 @@ def _dashboard_career_registry_contract() -> dict[str, Any]:
         "future_role": payload.get("future_role"),
         "next_milestone": payload.get("next_milestone"),
         "current_priority": payload.get("current_priority"),
+        "current_certification_priority": active_priority,
         "blockers": payload.get("current_blockers") or [],
-        "next_actions": [payload.get("next_milestone")] if payload.get("next_milestone") else [],
+        "next_actions": study_plan or ([payload.get("next_milestone")] if payload.get("next_milestone") else []),
         "priorities": [payload.get("current_priority")] if payload.get("current_priority") else [],
         "items": skill_metrics,
         "milestones": [*skill_metrics, *certification_metrics, _registry_progress_metric("Roadmap Progress", payload.get("roadmap_progress_percent", 0))],
         "certifications": certifications,
-        "skills": skills,
-        "source": source,
+        "certification_roadmap": certification_roadmap,
+        "learning_summary": learning_summary,
+        "today_tasks": study_plan,
+        "study_plan": study_plan,
+        "career_risks": career_risks,
+        "skills": raw_output_skills,
+        "skill_matrix": skill_matrix,
+        "job_readiness": job_readiness,
+        "source": {**source, "learning_registry": learning_source},
     }
 
 

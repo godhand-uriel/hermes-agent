@@ -1197,8 +1197,6 @@ function MetricTile({ label, value, detail, tone = "muted", compact = false }: {
 
 type CareerRecord = Record<string, unknown>;
 
-const CAREER_SKILL_AREAS = ["Microsoft 365 / Azure", "Networking", "Windows support", "Linux", "Cloud fundamentals", "Security", "Scripting / automation", "Troubleshooting"];
-
 function careerRecord(note: OperatingNoteViewModel): CareerRecord {
   return (note.raw && typeof note.raw === "object" ? note.raw : {}) as CareerRecord;
 }
@@ -1249,6 +1247,15 @@ function careerArray(record: CareerRecord, key: string): CareerRecord[] {
   return Array.isArray(value) ? value.filter((item): item is CareerRecord => item != null && typeof item === "object") as CareerRecord[] : [];
 }
 
+function careerObject(record: CareerRecord, key: string): CareerRecord {
+  const value = record[key];
+  return value != null && typeof value === "object" && !Array.isArray(value) ? value as CareerRecord : {};
+}
+
+function careerNestedText(record: CareerRecord, objectKey: string, valueKey: string): string | null {
+  return careerText(careerObject(record, objectKey)[valueKey]);
+}
+
 function careerPercent(value: unknown): number | null {
   return clampPercent(typeof value === "number" || typeof value === "string" ? value : null);
 }
@@ -1262,16 +1269,6 @@ function careerLevel(value: unknown): string {
   return "Starter";
 }
 
-function careerSkillMatches(area: string, name: string): boolean {
-  const a = area.toLowerCase();
-  const n = name.toLowerCase();
-  if (a.includes("microsoft") || a.includes("azure")) return n.includes("microsoft") || n.includes("365") || n.includes("azure") || n.includes("entra");
-  if (a.includes("cloud")) return n.includes("cloud") || n.includes("aws") || n.includes("azure");
-  if (a.includes("scripting")) return n.includes("script") || n.includes("automation") || n.includes("python") || n.includes("powershell") || n.includes("bash");
-  if (a.includes("windows")) return n.includes("windows") || n.includes("desktop") || n.includes("endpoint");
-  return n.includes(a.split(" ")[0]);
-}
-
 function currency(value: number | null): string | null {
   if (value == null) return null;
   return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
@@ -1279,13 +1276,39 @@ function currency(value: number | null): string | null {
 
 function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
   const record = careerRecord(career);
-  const certifications = careerArray(record, "certifications");
+  const certificationRoadmap = careerArray(record, "certification_roadmap");
+  const certifications = certificationRoadmap.length ? certificationRoadmap : careerArray(record, "certifications");
   const skills = careerArray(record, "skills");
   const currentCertName = careerValue(record, ["current_certification_priority", "current_priority", "certification_priority"]);
-  const currentCert = certifications.find((item) => careerText(item.name) === currentCertName) ?? certifications[0];
-  const currentCertProgress = careerPercent(currentCert?.progress_percent) ?? careerPercent(record.roadmap_progress_percent);
-  const currentHourlyPay = careerNumber(record, ["current_hourly_pay", "current_pay_rate", "pay_rate", "hourly_pay"]);
-  const estimatedAnnual = currentHourlyPay == null ? null : currentHourlyPay * 2080;
+  const currentCert = certifications.find((item) => careerText(item.name) === currentCertName || careerText(item.priority) === "current") ?? certifications[0];
+  const currentCertProgress = careerPercent(currentCert?.course_progress_percent ?? currentCert?.progress_percent ?? currentCert?.progress) ?? careerPercent(record.roadmap_progress_percent ?? record.study_progress_percent);
+  const roadmapItems = certifications.slice(0, 6).map((item) => {
+    const name = careerText(item.name) ?? careerMissing("certification_roadmap[].name");
+    const certStatus = careerText(item.certification_status) ?? careerText(item.status) ?? careerMissing(`certification_roadmap[].certification_status for ${name}`);
+    const courseProgress = careerPercent(item.course_progress_percent);
+    const progress = courseProgress ?? careerPercent(item.progress_percent);
+    const provider = careerText(item.learning_provider) ?? careerText(item.source) ?? careerMissing(`certification_roadmap[].source for ${name}`);
+    return `${name}: ${progress == null ? "Needs input" : `${Math.round(progress)}%`} · cert ${certStatus} · course source ${provider}`;
+  });
+  const learningSummary = careerObject(record, "learning_summary");
+  const learningPrimaryCertification = careerText(learningSummary.primary_certification) ?? careerText(currentCert?.name) ?? currentCertName ?? careerMissing("learning_summary.primary_certification");
+  const learningProgress = careerPercent(learningSummary.certification_progress) ?? currentCertProgress;
+  const learningStreak = careerText(learningSummary.study_streak_days) ?? careerMissing("learning_summary.study_streak_days");
+  const learningTodayTask = careerText(learningSummary.next_learning_task) ?? careerText(currentCert?.next_action) ?? careerMissing("learning_summary.next_learning_task");
+  const learningWeeklyHours = careerText(learningSummary.weekly_study_hours) ?? careerMissing("learning_summary.weekly_study_hours");
+  const learningRisk = careerText(learningSummary.learning_risk) ?? careerMissing("learning_summary.learning_risk");
+  const learningNextRecommendation = careerText(learningSummary.next_recommendation) ?? careerText(learningSummary.next_learning_task) ?? careerMissing("learning_summary.next_recommendation");
+  const learningProvider = careerText(learningSummary.learning_provider) ?? careerMissing("learning_summary.learning_provider");
+  const learningCourse = careerText(learningSummary.course) ?? careerMissing("learning_summary.course");
+  const secondaryLearningItems = careerArray(learningSummary, "secondary_learning_items").slice(0, 3).map((item) => {
+    const name = careerText(item.name) ?? careerMissing("learning_summary.secondary_learning_items[].name");
+    const progress = careerPercent(item.progress_percent);
+    const source = careerText(item.source) ?? careerText(item.provider) ?? careerMissing(`learning_summary.secondary_learning_items[].source for ${name}`);
+    return `${name} ${progress == null ? "Needs input" : `${Math.round(progress)}%`} · ${source}`;
+  });
+  const microsoftLearnStatus = careerNestedText(learningSummary, "provider_connections", "microsoft_learn") ?? careerNestedText(careerObject(learningSummary, "provider_connections"), "microsoft_learn", "status");
+  const currentHourlyPay = careerNumber(record, ["hourly_rate", "current_hourly_pay", "current_pay_rate", "pay_rate", "hourly_pay"]);
+  const estimatedAnnual = careerNumber(record, ["annual_salary", "estimated_annual_salary"]) ?? (currentHourlyPay == null ? null : currentHourlyPay * 2080);
   const targetSalary = careerNumber(record, ["target_salary", "salary_target", "target_annual_salary"]);
   const incomeGap = targetSalary == null || estimatedAnnual == null ? null : targetSalary - estimatedAnnual;
   const behindSchedule = careerValue(record, ["behind_schedule"]);
@@ -1294,38 +1317,68 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
   const portfolioStatus = careerValue(record, ["portfolio_status"]);
   const interviewReadiness = careerValue(record, ["interview_readiness"]);
   const applicationsSent = careerValue(record, ["applications_sent"]);
-  const studyTasks = careerList(record, ["study_plan", "todays_study_plan", "today_study_plan"]).length
-    ? careerList(record, ["study_plan", "todays_study_plan", "today_study_plan"])
+  const studyTasks = careerList(record, ["today_tasks", "study_plan", "todays_study_plan", "today_study_plan"]).length
+    ? careerList(record, ["today_tasks", "study_plan", "todays_study_plan", "today_study_plan"])
     : career.nextActions.length
     ? career.nextActions
     : career.priorities;
   const skillGaps = careerList(record, ["skill_gaps", "gaps"]);
-  const skillRows = CAREER_SKILL_AREAS.map((area) => {
-    const skill = skills.find((item) => careerSkillMatches(area, careerText(item.name) ?? careerText(item.label) ?? ""));
-    const current = careerPercent(skill?.current_proficiency_percent ?? skill?.current_level_percent ?? skill?.current_level);
-    const target = careerPercent(skill?.target_proficiency_percent ?? skill?.target_level_percent ?? skill?.target_level);
+  const skillRows = (careerArray(record, "skill_matrix").length ? careerArray(record, "skill_matrix") : skills).map((skill) => {
+    const area = careerText(skill.name) ?? careerText(skill.label) ?? careerMissing("skills[].name");
+    const current = careerPercent(skill.current_proficiency_percent ?? skill.current_level_percent ?? skill.current_level);
+    const target = careerPercent(skill.target_proficiency_percent ?? skill.target_level_percent ?? skill.target_level);
     return {
       area,
       current,
       target,
-      gap: current == null || target == null ? null : Math.max(0, target - current),
-      action: careerText(skill?.next_action) ?? careerMissing(`skills[].next_action for ${area}`),
+      evidence: careerList(skill, ["current_evidence", "evidence", "sources"]),
+      gap: careerPercent(skill.gap_percent) ?? (current == null || target == null ? null : Math.max(0, target - current)),
+      action: careerText(skill.next_task) ?? careerText(skill.next_action) ?? careerMissing(`skills[].next_task for ${area}`),
     };
   });
-  const riskItems = [
-    { label: "Behind schedule", value: behindSchedule ?? (currentCertProgress == null ? careerMissing("behind_schedule or certification progress") : currentCertProgress < 25 ? "Watch" : "On pace") },
-    { label: "Missing certification", value: currentCertName ? currentCertName : careerMissing("current_certification_priority") },
-    { label: "Weak interview prep", value: interviewReadiness ?? careerMissing("interview_readiness") },
-    { label: "No resume update", value: resumeStatus ?? careerMissing("resume_status") },
-    { label: "Low study consistency", value: careerValue(record, ["study_consistency", "weekly_study_consistency"]) ?? careerMissing("study_consistency") },
-  ];
+  const registryRisks = careerArray(record, "career_risks");
+  const riskItems = registryRisks.length
+    ? registryRisks.map((item) => ({ label: careerText(item.label) ?? "Risk", value: careerText(item.value) ?? careerText(item.message) ?? "Review source risk" }))
+    : [
+      { label: "Behind schedule", value: behindSchedule ?? (currentCertProgress == null ? careerMissing("behind_schedule or certification progress") : currentCertProgress < 25 ? "Watch" : "On pace") },
+      { label: "Weak interview prep", value: interviewReadiness ?? careerMissing("interview_readiness") },
+      { label: "No resume update", value: resumeStatus ?? careerMissing("resume_status") },
+      { label: "Low study consistency", value: careerValue(record, ["study_consistency", "weekly_study_consistency"]) ?? careerMissing("study_consistency") },
+    ];
+  const readinessSource = careerObject(record, "job_readiness");
   const readiness = [
-    { label: "Resume", value: resumeStatus ?? careerMissing("resume_status") },
-    { label: "LinkedIn", value: linkedInStatus ?? careerMissing("linkedin_status") },
-    { label: "Portfolio", value: portfolioStatus ?? careerMissing("portfolio_status") },
-    { label: "Interview", value: interviewReadiness ?? careerMissing("interview_readiness") },
-    { label: "Applications", value: applicationsSent ?? careerMissing("applications_sent") },
+    { label: "Resume", value: careerText(readinessSource.resume) ?? resumeStatus ?? careerMissing("resume_status") },
+    { label: "GitHub", value: careerText(readinessSource.github) ?? (careerArray(record, "portfolio_projects").length ? "connected/repositories found" : careerMissing("github_status")) },
+    { label: "LinkedIn", value: careerText(readinessSource.linkedin) ?? linkedInStatus ?? careerMissing("linkedin_status") },
+    { label: "Portfolio", value: careerText(readinessSource.portfolio) ?? portfolioStatus ?? careerMissing("portfolio_status") },
+    { label: "Interview", value: careerText(readinessSource.interview) ?? interviewReadiness ?? careerMissing("interview_readiness") },
+    { label: "Applications", value: careerText(readinessSource.applications) ?? applicationsSent ?? careerMissing("applications_sent") },
   ];
+  const employmentHistory = careerArray(record, "employment_history");
+  const careerTimeline = careerArray(record, "career_timeline");
+  const militaryService = careerArray(record, "military_service");
+  const leadershipExperience = careerArray(record, "leadership_experience");
+  const employmentItems = employmentHistory.map((job) => {
+    const role = careerText(job.role) ?? careerText(job.title) ?? careerMissing("employment_history[].role");
+    const company = careerText(job.company) ?? careerText(job.organization) ?? careerMissing("employment_history[].company");
+    const start = careerText(job.start_date) ?? careerMissing("employment_history[].start_date");
+    const end = careerText(job.end_date) ?? "Present";
+    return `${role} · ${company} · ${start}–${end}`;
+  });
+  const timelineItems = careerTimeline.map((item) => {
+    const title = careerText(item.title) ?? careerText(item.role) ?? careerMissing("career_timeline[].title");
+    const organization = careerText(item.organization) ?? careerText(item.company) ?? careerMissing("career_timeline[].organization");
+    const start = careerText(item.start_date) ?? careerMissing("career_timeline[].start_date");
+    const end = careerText(item.end_date) ?? "Present";
+    return `${start}–${end}: ${title} · ${organization}`;
+  });
+  const militaryItems = militaryService.map((service) => {
+    const rank = careerText(service.rank) ?? careerMissing("military_service[].rank");
+    const branch = careerText(service.branch) ?? careerMissing("military_service[].branch");
+    const unit = careerText(service.unit) ?? careerText(service.role) ?? careerMissing("military_service[].unit");
+    return `${rank} · ${branch} · ${unit}`;
+  });
+  const leadershipItems = leadershipExperience.map((item) => careerText(item.description) ?? careerText(item.type) ?? careerMissing("leadership_experience[].description"));
 
   return (
     <div className="space-y-3">
@@ -1334,21 +1387,33 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
           <MetricTile compact label="Current role" value={careerDisplay(record, ["current_role"], "current_role")} tone="good" detail={`Next action: update current position fields`} />
           <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
             <span>{careerDisplay(record, ["employer", "client", "employer_client"], "employer/client")}</span>
-            <span>{careerDisplay(record, ["contract_status", "employment_status", "status_type"], "contract/permanent status")}</span>
-            <span>{careerDisplay(record, ["pay_rate", "current_pay_rate", "current_hourly_pay"], "pay_rate")}</span>
+            <span>{careerDisplay(record, ["contract_to_perm_status", "contract_status", "employment_status", "status_type"], "contract_to_perm_status")}</span>
+            <span>{careerDisplay(record, ["hourly_rate", "pay_rate", "current_pay_rate", "current_hourly_pay"], "hourly_rate")}</span>
             <span>{careerDisplay(record, ["start_date"], "start_date")}</span>
           </div>
           <p className="text-[11px] text-cyan-100">Conversion target: {careerDisplay(record, ["conversion_target"], "conversion_target")}</p>
         </ExecutiveKpiCard>
         <ExecutiveKpiCard title="Target Role" tone="warn">
           <MetricTile compact label="Next target role" value={careerDisplay(record, ["target_role"], "target_role")} tone="warn" detail={`Next action: close top skill gap`} />
-          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300"><span>{careerDisplay(record, ["target_salary", "salary_target"], "target_salary")}</span><span>{careerDisplay(record, ["timeline", "target_timeline"], "timeline")}</span></div>
+          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300"><span>{careerDisplay(record, ["target_salary", "salary_target"], "target_salary")}</span><span>{careerDisplay(record, ["target_timeline", "timeline"], "target_timeline")}</span></div>
           <CompactFeed items={skillGaps.length ? skillGaps : [careerMissing("skill_gaps")]} emptyLabel="Needs input: skill_gaps" max={3} />
         </ExecutiveKpiCard>
         <ExecutiveKpiCard title="Certification Roadmap" tone={currentCertProgress == null ? "muted" : currentCertProgress >= 50 ? "good" : "warn"}>
-          <ProgressBar label={careerText(currentCert?.name) ?? currentCertName ?? careerMissing("current_certification_priority")} value={currentCertProgress} detail={`Exam: ${careerText(currentCert?.exam_date) ?? careerText(currentCert?.target_completion_date) ?? careerMissing("certifications[].exam_date")}`} tone={currentCertProgress == null ? "muted" : currentCertProgress >= 50 ? "good" : "warn"} />
-          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300"><span>{careerDisplay(record, ["study_hours_needed"], "study_hours_needed")}</span><span>{careerDisplay(record, ["daily_study_target"], "daily_study_target")}</span></div>
-          <p className="text-[11px] text-cyan-100">Next action: {careerText(currentCert?.next_action) ?? career.nextActions[0] ?? careerMissing("certifications[].next_action")}</p>
+          <ProgressBar label={careerText(currentCert?.name) ?? currentCertName ?? careerMissing("current_certification_priority")} value={currentCertProgress} detail={`Exam: ${careerText(currentCert?.exam_date) ?? careerText(currentCert?.target_completion_date) ?? careerMissing("certification_roadmap[].exam_date")}`} tone={currentCertProgress == null ? "muted" : currentCertProgress >= 50 ? "good" : "warn"} />
+          <CompactFeed items={roadmapItems.length ? roadmapItems : [careerMissing("certification_roadmap")]} emptyLabel="Needs input: certification_roadmap" max={6} />
+          <p className="text-[11px] text-cyan-100">Next action: {careerText(currentCert?.next_action) ?? career.nextActions[0] ?? careerMissing("certification_roadmap[].next_action")}</p>
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Learning Intelligence" tone={learningRisk.startsWith("Needs input") || learningRisk.includes("Needs") ? "warn" : "good"}>
+          <ProgressBar label={learningPrimaryCertification} value={learningProgress} detail={`${learningProvider} · ${learningCourse}`} tone={learningProgress == null ? "muted" : learningProgress >= 50 ? "good" : "warn"} />
+          <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
+            <span>Streak: {learningStreak} days</span>
+            <span>Weekly: {learningWeeklyHours}h</span>
+            <span>Risk: {learningRisk}</span>
+            <span>Microsoft Learn: {microsoftLearnStatus ?? "Not connected"}</span>
+          </div>
+          <CompactFeed items={secondaryLearningItems.length ? secondaryLearningItems : [careerMissing("learning_summary.secondary_learning_items")]} emptyLabel="Needs input: learning_summary.secondary_learning_items" max={3} />
+          <p className="text-[11px] text-cyan-100">Today’s study task: {learningTodayTask}</p>
+          <p className="text-[11px] text-cyan-100">Next recommendation: {learningNextRecommendation}</p>
         </ExecutiveKpiCard>
         <ExecutiveKpiCard title="Income Strategy" tone="good">
           <div className="grid grid-cols-2 gap-1.5">
@@ -1363,7 +1428,7 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
       <div className="grid gap-2 xl:grid-cols-[1.1fr_0.9fr]">
         <ExecutiveKpiCard title="Skill Matrix" tone="muted">
           <div className="grid gap-1.5 md:grid-cols-2">
-            {skillRows.map((row) => <div key={row.area} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="flex items-center justify-between gap-2 text-xs"><span className="font-semibold text-white">{row.area}</span><span className="text-slate-400">Gap {row.gap == null ? "Needs input" : `${Math.round(row.gap)}%`}</span></div><p className="mt-1 text-[11px] text-slate-300">Current: {careerLevel(row.current)} · Target: {careerLevel(row.target)}</p><p className="mt-1 text-[10px] text-cyan-100">Next action: {row.action}</p></div>)}
+            {skillRows.map((row) => <div key={row.area} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="flex items-center justify-between gap-2 text-xs"><span className="font-semibold text-white">{row.area}</span><span className="text-slate-400">Gap {row.gap == null ? "Needs input" : `${Math.round(row.gap)}%`}</span></div><p className="mt-1 text-[11px] text-slate-300">Current: {careerLevel(row.current)} · Target: {careerLevel(row.target)} · Evidence: {row.evidence.length ? row.evidence.join(", ") : "target role"}</p><p className="mt-1 text-[10px] text-cyan-100">Next action: {row.action}</p></div>)}
           </div>
         </ExecutiveKpiCard>
         <div className="space-y-2">
@@ -1371,6 +1436,20 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
           <ExecutiveKpiCard title="Career Risk" tone={career.blockers.length ? "bad" : "warn"}>{riskItems.map((item) => <div key={item.label} className="flex items-start justify-between gap-2 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[11px]"><span className="text-slate-400">{item.label}</span><span className="max-w-[60%] text-right text-white">{item.value}</span></div>)}<p className="text-[11px] text-cyan-100">Next action: clear the top red/yellow risk.</p></ExecutiveKpiCard>
           <ExecutiveKpiCard title="Job Readiness" tone="muted"><div className="grid grid-cols-2 gap-1.5">{readiness.map((item) => <MetricTile key={item.label} compact label={item.label} value={item.value} tone={item.value.startsWith("Needs input") ? "muted" : "good"} />)}</div><p className="text-[11px] text-cyan-100">Next action: update resume, LinkedIn, portfolio, interview prep, and applications.</p></ExecutiveKpiCard>
         </div>
+      </div>
+      <div className="grid gap-2 xl:grid-cols-2">
+        <ExecutiveKpiCard title="Employment History" tone={employmentItems.length ? "good" : "muted"}>
+          <CompactFeed items={employmentItems.length ? employmentItems : [careerMissing("employment_history")]} emptyLabel="Needs input: employment_history" max={6} />
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Career Timeline" tone={timelineItems.length ? "good" : "muted"}>
+          <CompactFeed items={timelineItems.length ? timelineItems : [careerMissing("career_timeline")]} emptyLabel="Needs input: career_timeline" max={7} />
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Military Service" tone={militaryItems.length ? "good" : "muted"}>
+          <CompactFeed items={militaryItems.length ? militaryItems : [careerMissing("military_service")]} emptyLabel="Needs input: military_service" max={3} />
+        </ExecutiveKpiCard>
+        <ExecutiveKpiCard title="Leadership Experience" tone={leadershipItems.length ? "good" : "muted"}>
+          <CompactFeed items={leadershipItems.length ? leadershipItems : [careerMissing("leadership_experience")]} emptyLabel="Needs input: leadership_experience" max={4} />
+        </ExecutiveKpiCard>
       </div>
     </div>
   );

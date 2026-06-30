@@ -212,19 +212,16 @@ def test_career_command_is_career_advancement_console_not_generic_progress_card(
         "Current Position",
         "Target Role",
         "Certification Roadmap",
+        "Learning Intelligence",
         "Skill Matrix",
         "Today’s Study Plan",
         "Career Risk",
         "Income Strategy",
         "Job Readiness",
-        "Microsoft 365 / Azure",
-        "Networking",
-        "Windows support",
-        "Linux",
-        "Cloud fundamentals",
-        "Security",
-        "Scripting / automation",
-        "Troubleshooting",
+        "Employment History",
+        "Career Timeline",
+        "Military Service",
+        "Leadership Experience",
     ]:
         assert label in text
     assert "<CareerCommandConsole career={dashboard.careerProgress} />" in career_panel
@@ -238,14 +235,23 @@ def test_career_command_surfaces_missing_inputs_and_next_actions() -> None:
     career_component = source()[source().index("function CareerCommandConsole"):source().index("const SYNC_PROGRESS_STEPS")]
     for missing_field in [
         "employer/client",
-        "contract/permanent status",
-        "pay_rate",
+        "contract_to_perm_status",
+        "hourly_rate",
         "start_date",
         "conversion_target",
         "target_salary",
-        "timeline",
-        "study_hours_needed",
-        "daily_study_target",
+        "target_timeline",
+        "certification_roadmap[].exam_date",
+        "certification_roadmap[].next_action",
+        "learning_summary.primary_certification",
+        "learning_summary.learning_provider",
+        "learning_summary.course",
+        "learning_summary.secondary_learning_items",
+        "learning_summary.study_streak_days",
+        "learning_summary.next_learning_task",
+        "learning_summary.weekly_study_hours",
+        "learning_summary.learning_risk",
+        "learning_summary.next_recommendation",
         "current_hourly_pay",
         "next_income_lever",
         "resume_status",
@@ -253,7 +259,21 @@ def test_career_command_surfaces_missing_inputs_and_next_actions() -> None:
         "portfolio_status",
         "interview_readiness",
         "applications_sent",
+        "employment_history",
+        "career_timeline",
+        "military_service",
+        "leadership_experience",
     ]:
         assert f'"{missing_field}"' in career_component
     assert career_component.count("Next action:") >= 8
     assert 'studyTasks.length ? studyTasks : [careerMissing("study_plan")]' in career_component
+
+
+def test_career_command_learning_intelligence_is_registry_backed_without_hardcoded_learning_values() -> None:
+    career_component = source()[source().index("function CareerCommandConsole"):source().index("const SYNC_PROGRESS_STEPS")]
+    assert "learning_summary" in career_component
+    assert "Learning Intelligence" in career_component
+    assert "Today’s study task" in career_component
+    assert "Next recommendation" in career_component
+    for forbidden in ["Complete VPC module", "AWS Solutions Architect Associate", "AZ-900", "15%", "Security+"]:
+        assert forbidden not in career_component

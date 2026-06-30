@@ -11924,8 +11924,8 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "finance", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
-        "journey", "memory-graph", "learning",
+        "gui", "desktop", "kanban", "journey", "learning", "login", "logout", "logs", "lsp", "mcp",
+        "memory", "memory-graph", "migrate", "moa",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12832,6 +12832,16 @@ def main():
         logging.getLogger(__name__).debug("finance CLI wiring failed: %s", _exc)
 
     # =========================================================================
+    # learning command — local Learning Registry + Career Registry projection
+    # =========================================================================
+    try:
+        from hermes_cli.learning_cli import register_cli as _register_learning_cli
+
+        _register_learning_cli(subparsers)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("learning CLI wiring failed: %s", _exc)
+
+    # =========================================================================
     # curator command — background skill maintenance
     # =========================================================================
     curator_parser = subparsers.add_parser(
@@ -12877,7 +12887,7 @@ def main():
     # =========================================================================
     journey_parser = subparsers.add_parser(
         "journey",
-        aliases=["learning", "memory-graph"],
+        aliases=["memory-graph"],
         help="Timeline of learned skills + memories over time",
         description=(
             "A terminal rendition of the desktop Star Map / Memory Graph: a "

@@ -168,8 +168,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   {
     path: "/reports",
-    labelKey: "reports",
-    label: "Reports",
+    label: "Dashboard",
     icon: ClipboardList,
   },
   {

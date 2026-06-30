@@ -460,7 +460,7 @@ def build_recommendations(registry: dict[str, Any], *, now: str) -> list[dict[st
     return recommendations[:5]
 
 
-def project_learning_summary(registry: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+def project_learning_summary(registry: dict[str, Any], *, now: str | None = None, active_certification: str | None = None) -> dict[str, Any]:
     timestamp = now or utc_now()
     raw_certs = registry.get("certifications")
     raw_courses = registry.get("courses")
@@ -475,24 +475,63 @@ def project_learning_summary(registry: dict[str, Any], *, now: str | None = None
     streak: dict[str, Any] = raw_streak if isinstance(raw_streak, dict) else {}
     sessions: list[dict[str, Any]] = [item for item in raw_sessions if isinstance(item, dict)] if isinstance(raw_sessions, list) else []
 
-    def priority(item: dict[str, Any]) -> tuple[int, int]:
+    def norm_name(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    def certification_matches(item: dict[str, Any], target: str | None) -> bool:
+        if not target:
+            return False
+        item_name = norm_name(item.get("name"))
+        target_name = norm_name(target)
+        aliases = {
+            "awssolutionsarchitectassociate": {"awssaa", "awscertifiedsolutionsarchitectassociate"},
+            "security": {"comptiasecurity", "securityplus", "sy0701"},
+            "linux": {"comptialinux", "linuxplus", "xk0006"},
+            "network": {"comptianetwork", "networkplus", "n10009"},
+        }
+        return item_name == target_name or item_name in aliases.get(target_name, set()) or target_name in aliases.get(item_name, set()) or item_name in target_name or target_name in item_name
+
+    def priority(item: dict[str, Any]) -> tuple[int, int, int]:
         progress = normalize_percent(item.get("progress_percent"))
         in_progress = str(item.get("status") or "").casefold() in {"in_progress", "studying", "active"}
-        return (1 if in_progress else 0, progress if progress is not None else -1)
+        active = certification_matches(item, active_certification)
+        return (1 if active else 0, 1 if in_progress else 0, progress if progress is not None else -1)
 
     primary = max(certs, key=priority) if certs else None
+    linked_course = None
+    if primary and primary.get("linked_course_id"):
+        linked_course = next((course for course in courses if course.get("id") == primary.get("linked_course_id")), None)
     weekly_hours = sum(float(item.get("weekly_hours") or item.get("hours") or 0) for item in sessions if isinstance(item, dict))
-    next_recommendation = recommendations[0] if recommendations else None
+    active_recommendation = next((item for item in recommendations if primary and item.get("related_record_id") == primary.get("id")), None)
+    next_recommendation = active_recommendation or (recommendations[0] if recommendations else None)
     next_task = (primary or {}).get("next_action") or (next_recommendation or {}).get("recommendation")
     risk = "Needs learning source standardization" if not certs and not courses and not modules else "On pace" if next_task else "Needs next action"
+    secondary_items = []
+    for item in [*certs, *courses]:
+        if primary and item.get("id") == primary.get("id"):
+            continue
+        name = item.get("name")
+        if name:
+            secondary_items.append({
+                "name": name,
+                "progress_percent": item.get("progress_percent"),
+                "provider": item.get("provider"),
+                "source": item.get("source"),
+                "status": item.get("status"),
+            })
     return {
         "primary_certification": (primary or {}).get("name"),
+        "primary_active_learning_target": (primary or {}).get("name"),
+        "learning_provider": (linked_course or {}).get("provider") or (primary or {}).get("source") or (primary or {}).get("provider"),
+        "course": (linked_course or {}).get("name"),
         "certification_progress": (primary or {}).get("progress_percent"),
+        "course_progress_percent": (linked_course or primary or {}).get("progress_percent"),
         "next_learning_task": next_task,
         "study_streak_days": streak.get("current_days") or 0,
         "last_studied": streak.get("last_studied"),
         "weekly_study_hours": weekly_hours,
         "learning_risk": risk,
+        "secondary_learning_items": secondary_items[:8],
         "next_recommendation": (next_recommendation or {}).get("recommendation"),
         "provider_connections": registry.get("sources", {}),
         "source": "learning_registry",
@@ -2059,7 +2098,8 @@ def update_career_registry_with_learning_summary(learning_registry: dict[str, An
     timestamp = now or utc_now()
     career_path = career_path or career_registry_path()
     career = load_json(career_path, {})
-    summary = project_learning_summary(learning_registry, now=timestamp)
+    active_certification = career.get("current_priority") or career.get("current_certification_priority")
+    summary = project_learning_summary(learning_registry, now=timestamp, active_certification=active_certification)
     career["learning_summary"] = summary
     career["learning_source"] = {
         "registry_path": str(learning_registry_path()),
@@ -2068,7 +2108,7 @@ def update_career_registry_with_learning_summary(learning_registry: dict[str, An
         "last_updated": timestamp,
         "evidence_path": summary.get("evidence_path"),
     }
-    if summary.get("primary_certification"):
+    if summary.get("primary_certification") and not (career.get("current_certification_priority") or career.get("current_priority")):
         career["current_certification_priority"] = summary["primary_certification"]
     if summary.get("next_learning_task"):
         raw_existing_tasks = career.get("today_tasks")

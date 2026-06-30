@@ -33,6 +33,7 @@ export function PageHeaderProvider({
     [pathname, t, pluginTabs],
   );
   const displayTitle = titleOverride ?? defaultTitle;
+  const hideHeader = titleOverride === "";
 
   const isChatRoute = pathname === "/chat" || pathname === "/chat/";
   /** Env jump-nav is wide — stack below title on small screens so KEYS stays readable. */
@@ -51,7 +52,7 @@ export function PageHeaderProvider({
   return (
     <PageHeaderContext.Provider value={value}>
       <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-hidden">
-        <header
+        {!hideHeader ? <header
           className={cn(
             "z-1 w-full shrink-0",
             "box-border border-b border-current/20",
@@ -119,7 +120,7 @@ export function PageHeaderProvider({
               </div>
             ) : null}
           </div>
-        </header>
+        </header> : null}
 
         <main
           className={cn(

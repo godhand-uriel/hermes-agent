@@ -1921,12 +1921,13 @@ export interface DashboardV2Response {
     metrics?: DashboardV2Metric[] | null;
     widgets?: DashboardV2Metric[] | null;
     finance_command_center?: Record<string, unknown> | null;
+    executive_dashboard?: Record<string, unknown> | null;
     trends?: Record<string, DashboardFinanceTrend> | null;
     ai_usage_cost_usd?: { estimated?: number | null; actual?: number | null } | null;
     revenue_usd?: number | null;
     burn_usd?: number | null;
     notes?: string[] | string | null;
-    source?: { type?: string | null; configured?: boolean | null; path?: string | null } | null;
+    source?: { type?: string | null; configured?: boolean | null; path?: string | null; model?: string | null } | null;
     setup_action?: { label?: string; method?: string; endpoint?: string } | null;
   } | null;
   weekly_reports?: {
@@ -1951,6 +1952,7 @@ export interface FinanceSyncHistoryRow {
   liabilities_count?: number | null;
   investments_count?: number | null;
   status?: string | null;
+  operator_message?: string | null;
   errors?: string[] | null;
 }
 

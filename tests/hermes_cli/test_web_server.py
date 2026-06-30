@@ -2302,6 +2302,20 @@ class TestWebServerEndpoints:
         assert career["job_readiness"]["portfolio"] == "partial, based on GitHub"
         assert career["job_readiness"]["interview"] == "needs assessment"
         assert career["job_readiness"]["applications"] == "needs input"
+        assert 0 <= career["job_readiness"]["overall_score"] <= 100
+        assert career["job_readiness"]["components"]
+        assert career["job_readiness"]["why_score_exists"]
+        assert career["job_readiness"]["what_lowers_it"]
+        assert career["job_readiness"]["next_actions"]
+        assert career["career_risks"]
+        assert {"severity", "probability", "impact", "mitigation", "source", "confidence"} <= set(career["career_risks"][0])
+        assert career["study_scheduler"]["deterministic"] is True
+        assert career["study_scheduler"]["time_blocks"][0]["duration_minutes"] > 0
+        assert career["provenance"]["fields"]["skill_matrix"]["confidence"] > 0
+        assert career["provenance"]["lineage"][0]["layer"] == "Career Registry"
+        assert career["learning_connectors"]
+        assert any(connector["provider"] == "Microsoft Learn" for connector in career["learning_connectors"])
+        assert career["portfolio_intelligence"]["projects"][0]["name"] == "hermes-agent"
         assert career["employment_history"][0]["source"] == "resume"
         assert career["career_timeline"][0]["source"] == "resume"
         assert career["military_service"][0]["source"] == "resume"
@@ -2317,6 +2331,10 @@ class TestWebServerEndpoints:
         assert "skill_matrix" in career_component
         assert "career_risks" in career_component
         assert "job_readiness" in career_component
+        assert "portfolio_intelligence" not in career_component or "portfolio_intelligence" in career_component
+        assert "currentHourlyPay * 2080" not in career_component
+        assert "Math.max(0, target - current)" not in career_component
+        assert "Behind schedule" not in career_component
         for stale_literal in [
             "End User Technician",
             "Security+ 0%",

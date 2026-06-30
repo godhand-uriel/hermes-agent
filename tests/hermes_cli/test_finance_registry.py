@@ -278,7 +278,7 @@ def test_finance_plaid_link_token_endpoint_returns_sandbox_token(monkeypatch, tm
 def test_finance_plaid_exchange_public_token_stores_encrypted_and_refreshes_dashboard(monkeypatch, tmp_path):
     from hermes_cli import web_server
     from hermes_cli.finance_registry import finish_finance_sync_run, finance_registry_path, start_finance_sync_run, upsert_plaid_registry_data
-    from hermes_cli.plaid_connector import store_access_token
+    from hermes_cli.plaid_connector import store_access_token, token_store_path
     from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
 
     db_path = tmp_path / "registry.db"
@@ -333,16 +333,9 @@ def test_finance_plaid_exchange_public_token_stores_encrypted_and_refreshes_dash
     assert calls == {"exchange": 1, "sync": 1}
     assert raw_access_token not in str(body)
 
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    try:
-        encrypted = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='sandbox:ins_1'").fetchone()[0]
-    finally:
-        conn.close()
-    assert encrypted
-    assert encrypted != raw_access_token
-    assert raw_access_token not in encrypted
+    token_payload = token_store_path("sandbox", registry_path=db_path).read_text(encoding="utf-8")
+    assert "encrypted_access_token" in token_payload
+    assert raw_access_token not in token_payload
 
 
 def test_finance_plaid_exchange_public_token_returns_friendly_failure(monkeypatch, tmp_path):
@@ -467,3 +460,46 @@ def test_finance_dashboard_source_has_no_legacy_or_mock_finance_dependencies():
     assert "exec.connected_institutions" in finance_source
     assert "exec.recent_activity" in finance_source
     assert "exec.trends" in finance_source
+
+
+def test_finance_sync_cli_sandbox_flag_forces_sandbox_environment(monkeypatch):
+    import argparse
+    import os
+
+    from hermes_cli.finance_cli import _handle_finance
+
+    seen = {}
+
+    class FakePlaidConnector:
+        def __init__(self):
+            seen["environment"] = os.environ.get("PLAID_ENV")
+
+        def sync_to_finance_registry(self):
+            return {"status": "success", "environment": seen["environment"]}
+
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.setattr("hermes_cli.plaid_connector.PlaidConnector", FakePlaidConnector)
+
+    rc = _handle_finance(argparse.Namespace(finance_action="sync", sandbox=True, production=False))
+
+    assert rc == 0
+    assert seen["environment"] == "sandbox"
+
+
+def test_finance_sync_cli_refuses_production_without_plaid_env(monkeypatch, capsys):
+    import argparse
+
+    from hermes_cli.finance_cli import _handle_finance
+
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+
+    rc = _handle_finance(argparse.Namespace(finance_action="sync", sandbox=False, production=True))
+
+    assert rc == 2
+    assert "PLAID_ENV=production" in capsys.readouterr().err
+
+
+def test_finance_registry_backup_path_is_gitignored():
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    assert "finance/backups/" in gitignore

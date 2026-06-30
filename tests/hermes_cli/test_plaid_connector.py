@@ -23,6 +23,7 @@ from hermes_cli.plaid_connector import (
     load_access_token,
     plaid_config_from_env,
     store_access_token,
+    token_store_path,
 )
 
 
@@ -112,13 +113,11 @@ def test_encrypted_token_storage_round_trip(monkeypatch, tmp_path):
     path = tmp_path / "registry.db"
     store_access_token(access_token=token, item_id="item_1", institution_id="ins_sandbox", path=path)
     assert load_access_token(institution_id="ins_sandbox", path=path) == token
-    conn = _conn(path)
-    try:
-        stored = conn.execute("SELECT encrypted_access_token FROM finance_institutions WHERE institution_id='sandbox:ins_sandbox'").fetchone()["encrypted_access_token"]
-        assert stored != token
-        assert token not in stored
-    finally:
-        conn.close()
+    token_path = token_store_path("sandbox", registry_path=path)
+    assert token_path == tmp_path / "sandbox" / "access_tokens.json"
+    stored_payload = token_path.read_text(encoding="utf-8")
+    assert token not in stored_payload
+    assert "ins_sandbox" in stored_payload
 
 
 def test_missing_token_handling(tmp_path):
@@ -130,17 +129,95 @@ def test_production_configuration_uses_production_url_without_code_changes(monke
     monkeypatch.setenv("PLAID_ENV", "production")
     monkeypatch.setenv("PLAID_CLIENT_ID", "client-prod")
     monkeypatch.setenv("PLAID_SECRET", "secret-prod")
+    monkeypatch.setenv("PLAID_PRODUCTS", "transactions,liabilities,investments")
+    monkeypatch.setenv("PLAID_COUNTRY_CODES", "US")
     cfg = plaid_config_from_env()
     assert cfg.environment == "production"
     assert cfg.base_url == "https://production.plaid.com"
+    assert cfg.products == ("transactions", "liabilities", "investments")
 
-    store_access_token(access_token="access-production-token", item_id="item_prod", institution_id="ins_prod", institution_name="Production Bank", environment="production", path=tmp_path / "registry.db")
-    store_access_token(access_token="access-sandbox-token", item_id="item_sandbox", institution_id="ins_prod", institution_name="Sandbox Bank", environment="sandbox", path=tmp_path / "registry.db")
-    prod_tokens = list_stored_access_tokens(environment="production", path=tmp_path / "registry.db")
-    sandbox_tokens = list_stored_access_tokens(environment="sandbox", path=tmp_path / "registry.db")
-    assert [row["institution_id"] for row in prod_tokens] == ["production:ins_prod"]
-    assert [row["institution_id"] for row in sandbox_tokens] == ["sandbox:ins_prod"]
-    assert load_access_token(institution_id="ins_prod", environment="production", path=tmp_path / "registry.db") == "access-production-token"
+    registry = tmp_path / "registry.db"
+    store_access_token(access_token="access-production-token", item_id="item_prod", institution_id="ins_prod", institution_name="Production Bank", environment="production", path=registry)
+    store_access_token(access_token="access-sandbox-token", item_id="item_sandbox", institution_id="ins_prod", institution_name="Sandbox Bank", environment="sandbox", path=registry)
+    conn = _conn(registry)
+    try:
+        ensure_schema(conn)
+    finally:
+        conn.close()
+    conn = _conn(registry)
+    try:
+        conn.execute(
+            "INSERT INTO finance_institutions (provider, institution_id, institution_name, item_id, encrypted_access_token, status, products, created_at, updated_at) VALUES ('plaid', 'legacy_ins', 'Legacy Sandbox Bank', 'item_legacy', ?, 'active', '[]', 1, 1)",
+            (encrypt_access_token("access-sandbox-legacy-token"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    prod_tokens = list_stored_access_tokens(environment="production", path=registry)
+    sandbox_tokens = list_stored_access_tokens(environment="sandbox", path=registry)
+    assert [row["institution_id"] for row in prod_tokens] == ["ins_prod"]
+    assert {row["institution_id"] for row in sandbox_tokens} == {"ins_prod", "legacy_ins"}
+    assert load_access_token(institution_id="ins_prod", environment="production", path=registry) == "access-production-token"
+    assert load_access_token(institution_id="ins_prod", environment="sandbox", path=registry) == "access-sandbox-token"
+    with pytest.raises(PlaidConfigurationError):
+        load_access_token(institution_id="legacy_ins", environment="production", path=registry)
+
+
+def test_sandbox_token_storage_is_not_overwritten_by_production_token(tmp_path):
+    registry = tmp_path / "registry.db"
+    store_access_token(access_token="sandbox-token", item_id="sandbox_item", institution_id="shared_ins", institution_name="Sandbox Bank", environment="sandbox", path=registry)
+    store_access_token(access_token="production-token", item_id="production_item", institution_id="shared_ins", institution_name="Production Bank", environment="production", path=registry)
+
+    assert load_access_token(institution_id="shared_ins", environment="sandbox", path=registry) == "sandbox-token"
+    assert load_access_token(institution_id="shared_ins", environment="production", path=registry) == "production-token"
+    assert {row["institution_id"] for row in list_stored_access_tokens(environment="sandbox", path=registry)} == {"shared_ins"}
+    assert {row["institution_id"] for row in list_stored_access_tokens(environment="production", path=registry)} == {"shared_ins"}
+    assert (tmp_path / "sandbox" / "access_tokens.json").exists()
+    assert (tmp_path / "production" / "access_tokens.json").exists()
+    assert "production-token" not in (tmp_path / "sandbox" / "access_tokens.json").read_text(encoding="utf-8")
+    assert "sandbox-token" not in (tmp_path / "production" / "access_tokens.json").read_text(encoding="utf-8")
+
+
+def test_plaid_sandbox_configuration_defaults_products_and_country_codes(monkeypatch):
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-sandbox")
+    monkeypatch.setenv("PLAID_SECRET", "secret-sandbox")
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    cfg = plaid_config_from_env()
+
+    assert cfg.environment == "sandbox"
+    assert cfg.base_url == "https://sandbox.plaid.com"
+    assert cfg.products == ("transactions", "liabilities", "investments")
+    assert cfg.country_codes == ("US",)
+
+
+def test_plaid_rejects_wrong_environment(monkeypatch):
+    monkeypatch.setenv("PLAID_ENV", "development")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client")
+    monkeypatch.setenv("PLAID_SECRET", "secret")
+
+    with pytest.raises(Exception, match="PLAID_ENV must be sandbox or production"):
+        plaid_config_from_env()
+
+
+def test_plaid_production_validation_requires_all_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-prod")
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    with pytest.raises(PlaidConfigurationError) as excinfo:
+        plaid_config_from_env()
+
+    message = str(excinfo.value)
+    assert "PLAID_SECRET" in message
+    assert "PLAID_PRODUCTS" in message
+    assert "PLAID_COUNTRY_CODES" in message
+    assert "client-prod" not in message
 
 
 def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_path):

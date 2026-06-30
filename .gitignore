@@ -16,6 +16,8 @@ __pycache__/
 *.key
 *.secret
 finance/secrets/
+finance/backups/
+finance/*/access_tokens.json
 .env.development
 .env.test
 .hermes-docker/

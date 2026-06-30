@@ -41,13 +41,38 @@ DEFAULT_COUNTRY_CODES = ("US",)
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
+def _load_hermes_secrets() -> None:
+    """Load profile-scoped Hermes Secrets into the process environment.
+
+    Hermes stores credential variables in the active profile `.env` or an
+    external secret backend wired through `load_hermes_dotenv()`. The connector
+    reads only environment variables after this load step; it never hardcodes,
+    prints, or commits credential material.
+    """
+    existing = {key: os.environ[key] for key in os.environ if key.startswith("PLAID_")}
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        # Keep tests and embedded callers deterministic: explicit process env
+        # remains authoritative if the full Hermes env loader is unavailable.
+        pass
+    finally:
+        # `load_hermes_dotenv()` intentionally lets profile secrets override
+        # stale shell exports for most Hermes entrypoints. The Plaid connector is
+        # also used in tests and embedded callers, so values explicitly present
+        # when this function was entered remain authoritative here.
+        os.environ.update(existing)
+
+
 def _load_plaid_env_file() -> None:
     """Load optional Plaid-only env file without overriding process env.
 
-    Set HERMES_PLAID_ENV_FILE to .env.sandbox or .env.production when running
-    locally. Existing process environment values win so deployments can inject
-    secrets through their normal secret manager. The file is parsed as simple
-    KEY=VALUE lines and is never exposed to the frontend.
+    Set HERMES_PLAID_ENV_FILE to a private env file when running locally.
+    Existing process environment values win so deployments can inject secrets
+    through Hermes Secrets or their normal secret manager. The file is parsed as
+    simple KEY=VALUE lines and is never exposed to the frontend.
     """
     env_file = os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()
     if not env_file:
@@ -94,17 +119,37 @@ class PlaidConfig:
 
 
 def plaid_config_from_env() -> PlaidConfig:
+    _load_hermes_secrets()
     _load_plaid_env_file()
     env = os.environ.get("PLAID_ENV", "sandbox").strip().lower() or "sandbox"
     if env not in PLAID_BASE_URLS:
         raise PlaidSecurityError("PLAID_ENV must be sandbox or production.")
+
     client_id = os.environ.get("PLAID_CLIENT_ID", "").strip()
     secret = os.environ.get("PLAID_SECRET", "").strip()
-    if not client_id or not secret:
-        raise PlaidConfigurationError("PLAID_CLIENT_ID and PLAID_SECRET are required in the environment.")
-    products = tuple(p.strip() for p in os.environ.get("PLAID_PRODUCTS", ",".join(DEFAULT_PRODUCTS)).split(",") if p.strip())
-    country_codes = tuple(c.strip() for c in os.environ.get("PLAID_COUNTRY_CODES", "US").split(",") if c.strip())
-    forbidden = {"transfer", "payment_initiation", "processor_payments"}
+    raw_products = os.environ.get("PLAID_PRODUCTS")
+    raw_country_codes = os.environ.get("PLAID_COUNTRY_CODES")
+    products = tuple(p.strip() for p in (raw_products if raw_products is not None else ",".join(DEFAULT_PRODUCTS)).split(",") if p.strip())
+    country_codes = tuple(c.strip().upper() for c in (raw_country_codes if raw_country_codes is not None else "US").split(",") if c.strip())
+
+    missing: list[str] = []
+    if not client_id:
+        missing.append("PLAID_CLIENT_ID")
+    if not secret:
+        missing.append("PLAID_SECRET")
+    if env == "production":
+        if raw_products is None or not products:
+            missing.append("PLAID_PRODUCTS")
+        if raw_country_codes is None or not country_codes:
+            missing.append("PLAID_COUNTRY_CODES")
+    if missing:
+        joined = ", ".join(missing)
+        raise PlaidConfigurationError(
+            f"Plaid {env} configuration is missing required Hermes Secret(s): {joined}. "
+            "Set them in the active Hermes profile secrets before running Plaid commands."
+        )
+
+    forbidden = {"transfer", "payment_initiation", "processor_payments", "auth", "signal"}
     if forbidden.intersection({p.lower() for p in products}):
         raise PlaidSecurityError("Money-movement Plaid products are forbidden for the Finance Registry integration.")
     return PlaidConfig(client_id=client_id, secret=secret, environment=env, products=products, country_codes=country_codes)
@@ -165,87 +210,220 @@ def _display_institution_id(registry_id: str) -> str:
     return registry_id
 
 
+def _validate_plaid_environment(environment: str) -> str:
+    env = (environment or "sandbox").strip().lower() or "sandbox"
+    if env not in PLAID_BASE_URLS:
+        raise PlaidSecurityError("PLAID_ENV must be sandbox or production.")
+    return env
+
+
+def token_namespace_dir(environment: str, *, registry_path: Path | None = None) -> Path:
+    """Return the environment-specific token namespace directory.
+
+    Default layout under the active Hermes profile:
+
+        $HERMES_HOME/finance/sandbox/access_tokens.json
+        $HERMES_HOME/finance/production/access_tokens.json
+
+    Tests may pass a registry path to keep token files beside a temporary
+    registry database without changing the registry schema.
+    """
+    env = _validate_plaid_environment(environment)
+    finance_root = registry_path.parent if registry_path is not None else get_hermes_home() / "finance"
+    path = finance_root / env
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def token_store_path(environment: str, *, registry_path: Path | None = None) -> Path:
+    return token_namespace_dir(environment, registry_path=registry_path) / "access_tokens.json"
+
+
+def _read_token_store(environment: str, *, registry_path: Path | None = None) -> list[dict[str, Any]]:
+    path = token_store_path(environment, registry_path=registry_path)
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PlaidSecurityError(f"Plaid token store is not valid JSON: {path}") from exc
+    if isinstance(raw, dict):
+        records = raw.get("tokens", [])
+    elif isinstance(raw, list):
+        records = raw
+    else:
+        records = []
+    if not isinstance(records, list):
+        raise PlaidSecurityError(f"Plaid token store has invalid format: {path}")
+    return [record for record in records if isinstance(record, dict)]
+
+
+def _write_token_store(environment: str, records: list[dict[str, Any]], *, registry_path: Path | None = None) -> None:
+    env = _validate_plaid_environment(environment)
+    path = token_store_path(env, registry_path=registry_path)
+    payload = {"environment": env, "updated_at": int(time.time()), "tokens": records}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _token_record_for_row(row: sqlite3.Row, environment: str) -> dict[str, Any]:
+    registry_id = str(row["institution_id"] or "")
+    return {
+        "environment": environment,
+        "institution_id": registry_id,
+        "display_institution_id": _display_institution_id(registry_id),
+        "institution_name": row["institution_name"],
+        "item_id": row["item_id"],
+        "products": json.loads(row["products"] or "[]"),
+        "access_token": decrypt_access_token(row["encrypted_access_token"]),
+        "storage": "legacy_registry",
+    }
+
+
 def store_access_token(*, access_token: str, item_id: str | None = None, institution_id: str = "sandbox", institution_name: str = "Plaid Sandbox", products: list[str] | None = None, environment: str = "sandbox", path: Path | None = None) -> None:
+    """Store an encrypted Plaid access token in the environment namespace.
+
+    Access tokens live outside the Finance Registry so Sandbox and Production
+    cannot overwrite each other and registry schemas remain unchanged.
+    """
+    env = _validate_plaid_environment(environment)
     encrypted = encrypt_access_token(access_token)
-    environment = (environment or "sandbox").strip().lower() or "sandbox"
-    registry_institution_id = _registry_institution_id(environment, institution_id)
+    display_id = _display_institution_id(institution_id or env)
     now = int(time.time())
+    records = _read_token_store(env, registry_path=path)
+    next_records: list[dict[str, Any]] = []
+    replaced = False
+    for record in records:
+        if str(record.get("institution_id") or "") == display_id:
+            created_at = int(record.get("created_at") or now)
+            next_records.append(
+                {
+                    "institution_id": display_id,
+                    "institution_name": institution_name,
+                    "item_id": item_id or record.get("item_id"),
+                    "encrypted_access_token": encrypted,
+                    "products": products or list(DEFAULT_PRODUCTS),
+                    "created_at": created_at,
+                    "updated_at": now,
+                }
+            )
+            replaced = True
+        else:
+            next_records.append(record)
+    if not replaced:
+        next_records.append(
+            {
+                "institution_id": display_id,
+                "institution_name": institution_name,
+                "item_id": item_id,
+                "encrypted_access_token": encrypted,
+                "products": products or list(DEFAULT_PRODUCTS),
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+    next_records.sort(key=lambda r: int(r.get("updated_at") or 0), reverse=True)
+    _write_token_store(env, next_records, registry_path=path)
+
+
+def _legacy_registry_token_rows(environment: str, *, institution_id: str | None = None, path: Path | None = None) -> list[sqlite3.Row]:
+    env = _validate_plaid_environment(environment)
     conn = _connect(path)
     try:
         ensure_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO finance_institutions (provider, institution_id, institution_name, item_id, encrypted_access_token, status, products, created_at, updated_at)
-            VALUES ('plaid', ?, ?, ?, ?, 'active', ?, ?, ?)
-            ON CONFLICT(provider, institution_id) DO UPDATE SET
-                institution_name=excluded.institution_name,
-                item_id=COALESCE(excluded.item_id, finance_institutions.item_id),
-                encrypted_access_token=excluded.encrypted_access_token,
-                status='active',
-                products=excluded.products,
-                updated_at=excluded.updated_at
-            """,
-            (registry_institution_id, institution_name, item_id, encrypted, json.dumps(products or list(DEFAULT_PRODUCTS)), now, now),
-        )
-        conn.commit()
+        if institution_id:
+            lookup = _registry_institution_id(env, institution_id)
+            candidates = [lookup]
+            if env == "sandbox":
+                candidates.append(institution_id)
+            placeholders = ", ".join("?" for _ in candidates)
+            return conn.execute(
+                f"SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND institution_id IN ({placeholders}) AND status='active' AND encrypted_access_token IS NOT NULL ORDER BY updated_at DESC",
+                candidates,
+            ).fetchall()
+        pattern = f"{env}:%"
+        if env == "sandbox":
+            return conn.execute(
+                "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND (institution_id LIKE ? OR institution_id NOT LIKE '%:%') ORDER BY updated_at DESC",
+                (pattern,),
+            ).fetchall()
+        return conn.execute(
+            "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND institution_id LIKE ? ORDER BY updated_at DESC",
+            (pattern,),
+        ).fetchall()
     finally:
         conn.close()
 
 
 def load_access_token(*, institution_id: str | None = None, environment: str | None = None, path: Path | None = None) -> str:
-    conn = _connect(path)
-    try:
-        ensure_schema(conn)
-        if institution_id:
-            lookup = _registry_institution_id(environment or os.environ.get("PLAID_ENV", "sandbox"), institution_id)
-            row = conn.execute(
-                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND institution_id IN (?, ?) AND status='active' ORDER BY updated_at DESC LIMIT 1",
-                (lookup, institution_id),
-            ).fetchone()
-        else:
-            prefix = f"{(environment or os.environ.get('PLAID_ENV', 'sandbox')).strip().lower()}:%" if environment else "%"
-            row = conn.execute(
-                "SELECT encrypted_access_token FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND institution_id LIKE ? ORDER BY updated_at DESC LIMIT 1",
-                (prefix,),
-            ).fetchone()
-        if not row or not row["encrypted_access_token"]:
-            raise PlaidConfigurationError("No encrypted Plaid access token is stored. Run hermes finance plaid exchange-token first.")
-        return decrypt_access_token(row["encrypted_access_token"])
-    finally:
-        conn.close()
+    env = _validate_plaid_environment(environment or os.environ.get("PLAID_ENV", "sandbox"))
+    records = _read_token_store(env, registry_path=path)
+    if institution_id:
+        display_id = _display_institution_id(institution_id)
+        records = [record for record in records if str(record.get("institution_id") or "") == display_id]
+    records.sort(key=lambda r: int(r.get("updated_at") or 0), reverse=True)
+    for record in records:
+        encrypted = str(record.get("encrypted_access_token") or "")
+        if encrypted:
+            return decrypt_access_token(encrypted)
 
+    legacy_rows = _legacy_registry_token_rows(env, institution_id=institution_id, path=path)
+    if legacy_rows:
+        return decrypt_access_token(legacy_rows[0]["encrypted_access_token"])
+    raise PlaidConfigurationError(f"No encrypted Plaid access token is stored for {env}. Run hermes finance plaid exchange-token first.")
 
 
 def list_stored_access_tokens(*, environment: str | None = None, path: Path | None = None) -> list[dict[str, Any]]:
-    conn = _connect(path)
-    try:
-        ensure_schema(conn)
-        if environment:
-            pattern = f"{environment.strip().lower()}:%"
-            rows = conn.execute(
-                "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL AND institution_id LIKE ? ORDER BY updated_at DESC",
-                (pattern,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT institution_id, institution_name, item_id, encrypted_access_token, products FROM finance_institutions WHERE provider='plaid' AND status='active' AND encrypted_access_token IS NOT NULL ORDER BY updated_at DESC"
-            ).fetchall()
-        return [
-            {
-                "institution_id": row["institution_id"],
-                "display_institution_id": _display_institution_id(str(row["institution_id"])),
-                "institution_name": row["institution_name"],
-                "item_id": row["item_id"],
-                "products": json.loads(row["products"] or "[]"),
-                "access_token": decrypt_access_token(row["encrypted_access_token"]),
-            }
-            for row in rows
-        ]
-    finally:
-        conn.close()
+    environments = [_validate_plaid_environment(environment)] if environment else sorted(PLAID_BASE_URLS)
+    result: list[dict[str, Any]] = []
+    for env in environments:
+        for record in _read_token_store(env, registry_path=path):
+            encrypted = str(record.get("encrypted_access_token") or "")
+            if not encrypted:
+                continue
+            institution_id = str(record.get("institution_id") or env)
+            result.append(
+                {
+                    "environment": env,
+                    "institution_id": institution_id,
+                    "display_institution_id": _display_institution_id(institution_id),
+                    "institution_name": record.get("institution_name"),
+                    "item_id": record.get("item_id"),
+                    "products": record.get("products") or [],
+                    "access_token": decrypt_access_token(encrypted),
+                    "storage": "file_namespace",
+                    "token_store": str(token_store_path(env, registry_path=path)),
+                }
+            )
+        # Legacy registry fallback keeps pre-namespace sandbox rows readable. It
+        # never lets production fall back to unprefixed sandbox rows.
+        result.extend(_token_record_for_row(row, env) for row in _legacy_registry_token_rows(env, path=path))
+    return result
 
 
 def remove_stored_access_tokens(*, institution_id: str | None = None, environment: str | None = None, path: Path | None = None) -> int:
+    env = _validate_plaid_environment(environment or os.environ.get("PLAID_ENV", "sandbox"))
+    display_id = _display_institution_id(institution_id) if institution_id else None
+    records = _read_token_store(env, registry_path=path)
+    kept = [record for record in records if display_id and str(record.get("institution_id") or "") != display_id]
+    removed = len(records) - len(kept)
+    if removed or records:
+        _write_token_store(env, kept, registry_path=path)
+
+    # Also clean legacy registry token references for backward compatibility.
     conn = _connect(path)
     try:
         ensure_schema(conn)
@@ -253,15 +431,16 @@ def remove_stored_access_tokens(*, institution_id: str | None = None, environmen
         where = "provider='plaid' AND encrypted_access_token IS NOT NULL"
         if institution_id:
             where += " AND institution_id=?"
-            params.append(_registry_institution_id(environment or os.environ.get("PLAID_ENV", "sandbox"), institution_id))
-        elif environment:
+            params.append(_registry_institution_id(env, institution_id))
+        else:
             where += " AND institution_id LIKE ?"
-            params.append(f"{environment.strip().lower()}:%")
+            params.append(f"{env}:%")
         cur = conn.execute(f"UPDATE finance_institutions SET encrypted_access_token=NULL, status='removed', updated_at=? WHERE {where}", params)
         conn.commit()
-        return int(cur.rowcount or 0)
+        removed += int(cur.rowcount or 0)
     finally:
         conn.close()
+    return removed
 
 
 class PlaidConnector:
@@ -461,4 +640,6 @@ __all__ = [
     "remove_stored_access_tokens",
     "store_access_token",
     "sync_to_finance_registry",
+    "token_namespace_dir",
+    "token_store_path",
 ]

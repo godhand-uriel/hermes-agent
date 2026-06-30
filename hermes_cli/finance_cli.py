@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -33,6 +34,11 @@ def _handle_finance(args: argparse.Namespace) -> int:
     if action == "sync":
         from hermes_cli.plaid_connector import PlaidConnector
 
+        if getattr(args, "sandbox", False):
+            os.environ["PLAID_ENV"] = "sandbox"
+        if getattr(args, "production", False) and os.environ.get("PLAID_ENV", "").strip().lower() != "production":
+            print("Refusing production finance sync unless PLAID_ENV=production is already set.", file=sys.stderr)
+            return 2
         _print_json(PlaidConnector().sync_to_finance_registry())
         return 0
     if action == "schedule":
@@ -76,7 +82,10 @@ def register_cli(subparsers: argparse._SubParsersAction) -> None:
     exchange = plaid_sub.add_parser("exchange-token", help="Exchange a Plaid public token server-side and store the encrypted access token")
     exchange.add_argument("public_token", help="Plaid public token from Link")
 
-    finance_sub.add_parser("sync", help="Sync configured Plaid Items into the Finance Registry")
+    sync = finance_sub.add_parser("sync", help="Sync configured Plaid Items into the Finance Registry")
+    sync_env = sync.add_mutually_exclusive_group()
+    sync_env.add_argument("--sandbox", action="store_true", help="Force a sandbox sync without changing stored production credentials")
+    sync_env.add_argument("--production", action="store_true", help="Allow production sync only when PLAID_ENV=production is already set")
 
     schedule = finance_sub.add_parser("schedule", help="Show or configure Finance Registry automatic sync cadence")
     schedule.add_argument("cadence", nargs="?", choices=["manual", "hourly", "every_6_hours", "every_12_hours", "daily"], help="Sync cadence; omit to show current schedule")

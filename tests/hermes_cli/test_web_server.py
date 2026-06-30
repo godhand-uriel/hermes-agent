@@ -2088,6 +2088,20 @@ class TestWebServerEndpoints:
                     "today_tasks": ["Study identity module"],
                     "study_streak_days": 4,
                     "study_progress_percent": 35,
+                    "learning_summary": {
+                        "primary_certification": "AZ-900",
+                        "certification_progress": 35,
+                        "next_learning_task": "Study identity module",
+                        "study_streak_days": 4,
+                        "last_studied": "2026-06-29",
+                        "weekly_study_hours": 3.5,
+                        "learning_risk": "On pace",
+                        "next_recommendation": "Complete identity module",
+                        "source": "learning_registry",
+                        "confidence": 0.95,
+                        "last_updated": "2026-06-30T00:00:00Z",
+                        "evidence_path": "Learning/Microsoft/AZ-900.md",
+                    },
                     "resume_status": "needs update",
                     "linkedin_status": "needs input",
                     "portfolio_status": "needs project",
@@ -2106,6 +2120,21 @@ class TestWebServerEndpoints:
                         {"field": "current_role", "source": "Career Development/First Job.md:21", "value": "Support Engineer"}
                     ],
                     "portfolio_projects": [{"name": "registry-project", "url": "https://github.com/example/registry-project"}],
+                    "employment_history": [
+                        {"company": "Resume Co", "role": "Historical Support Engineer", "start_date": "2020-01", "end_date": "2021-02", "source": "resume"}
+                    ],
+                    "career_timeline": [
+                        {"type": "employment", "organization": "Resume Co", "title": "Historical Support Engineer", "start_date": "2020-01", "end_date": "2021-02", "source": "resume"}
+                    ],
+                    "military_service": [
+                        {"branch": "Army", "rank": "E-5", "unit": "75th Ranger Regiment", "start_date": "2008-05", "end_date": "2014-07", "source": "resume"}
+                    ],
+                    "leadership_experience": [
+                        {"type": "team_management", "description": "Led small teams", "source": "resume"}
+                    ],
+                    "resume_imports": [
+                        {"source": "resume", "source_path": "/tmp/resume.pdf", "imported_at": "2026-06-29T23:10:21Z"}
+                    ],
                     "certifications": [
                         {
                             "name": "AZ-900",
@@ -2145,6 +2174,9 @@ class TestWebServerEndpoints:
         assert career["target_salary"] == 120000
         assert career["target_timeline"] == "12 months"
         assert career["today_tasks"] == ["Study identity module"]
+        assert career["learning_summary"]["primary_certification"] == "AZ-900"
+        assert career["learning_summary"]["weekly_study_hours"] == 3.5
+        assert career["learning_summary"]["source"] == "learning_registry"
         assert career["certifications"][0]["provider"] == "Microsoft"
         assert career["certifications"][0]["status"] == "studying"
         assert career["skills"][0]["next_task"] == "Build identity lab"
@@ -2154,9 +2186,146 @@ class TestWebServerEndpoints:
         assert career["source_connections"]["calendar"]["status"] == "Not connected"
         assert career["source_evidence"][0]["source"] == "Career Development/First Job.md:21"
         assert career["portfolio_projects"][0]["name"] == "registry-project"
+        assert career["employment_history"][0]["source"] == "resume"
+        assert career["employment_history"][0]["role"] == "Historical Support Engineer"
+        assert career["career_timeline"][0]["source"] == "resume"
+        assert career["military_service"][0]["rank"] == "E-5"
+        assert career["leadership_experience"][0]["description"] == "Led small teams"
+        assert career["resume_imports"][0]["source_path"] == "/tmp/resume.pdf"
         assert data["dashboard_sources"]["career_registry"] == career
         assert "career_progress" in data
         assert "career_registry" in data["dashboard_sources"]
+
+    def test_dashboard_v2_career_command_reconciles_cert_learning_skill_risk_readiness_sources(self, tmp_path, monkeypatch):
+        career_path = tmp_path / "career_registry.json"
+        learning_path = tmp_path / "learning_registry.json"
+        career_path.write_text(
+            json.dumps(
+                {
+                    "current_role": "Desktop Support Technician",
+                    "target_role": "Cloud Engineer",
+                    "current_priority": "AWS Solutions Architect Associate",
+                    "current_certification_priority": "Security+",
+                    "target_salary": None,
+                    "resume_status": "Imported from trusted resume source.",
+                    "interview_readiness": None,
+                    "applications_sent": None,
+                    "source_connections": {
+                        "resume": {"status": "Connected", "path": "/tmp/resume.pdf"},
+                        "github": {"status": "Connected", "profile": "https://github.com/godhand-uriel"},
+                        "linkedin": {"status": "Not connected"},
+                    },
+                    "portfolio_projects": [{"name": "hermes-agent", "primary_language": "Python"}],
+                    "technical_stack_evidence": ["Python", "PowerShell"],
+                    "certifications": [
+                        {"name": "AWS Solutions Architect Associate", "status": "in_progress", "progress_percent": 15},
+                        {"name": "Security+", "status": "completed", "provider": "CompTIA", "source": "resume", "source_path": "/tmp/resume.pdf", "progress_percent": 0},
+                        {"name": "Linux+", "status": "completed", "provider": "CompTIA", "source": "resume", "source_path": "/tmp/resume.pdf", "progress_percent": 0},
+                    ],
+                    "skills": [
+                        {"name": "AWS", "current_proficiency_percent": 20, "target_proficiency_percent": 80, "verified_by_resume": True},
+                        {"name": "Networking", "current_proficiency_percent": 30, "target_proficiency_percent": 75, "verified_by_resume": True},
+                        {"name": "Python", "current_proficiency_percent": 30, "target_proficiency_percent": 70, "verified_by_resume": True},
+                    ],
+                    "employment_history": [{"company": "Resume Co", "role": "Engineer", "source": "resume"}],
+                    "career_timeline": [{"organization": "Resume Co", "title": "Engineer", "source": "resume"}],
+                    "military_service": [{"branch": "Army", "rank": "E-5", "unit": "75th Ranger Regiment", "source": "resume"}],
+                    "leadership_experience": [{"description": "Led small teams", "source": "resume"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        learning_path.write_text(
+            json.dumps(
+                {
+                    "sources": {
+                        "udemy_browser": {"status": "Connected"},
+                        "microsoft_learn": {"status": "Not connected"},
+                    },
+                    "courses": [
+                        {"id": "aws-course", "name": "Ultimate AWS Certified Solutions Architect Associate 2026", "provider": "Udemy", "progress_percent": 93, "source": "udemy_browser"},
+                        {"id": "sec-course", "name": "CompTIA Security+ (SY0-701) Complete Course & Practice Exam", "provider": "Udemy", "progress_percent": 99, "source": "udemy_browser"},
+                        {"id": "linux-course", "name": "CompTIA Linux+ (XK0-006) Complete Course & Exam", "provider": "Udemy", "progress_percent": 0, "source": "udemy_browser"},
+                        {"id": "net-course", "name": "TOTAL: CompTIA Network+ (N10-009) + Practice Exam", "provider": "Udemy", "progress_percent": 19, "source": "udemy_browser"},
+                        {"id": "python-course", "name": "100 Days of Code™: The Complete Python Pro Bootcamp", "provider": "Udemy", "progress_percent": 7, "source": "udemy_browser"},
+                    ],
+                    "certifications": [
+                        {"id": "aws-cert", "name": "AWS Solutions Architect Associate", "linked_course_id": "aws-course", "progress_percent": 93, "status": "in_progress", "source": "udemy_browser", "confidence": 0.9},
+                        {"id": "sec-cert", "name": "Security+", "linked_course_id": "sec-course", "progress_percent": 99, "status": "in_progress", "source": "udemy_browser", "confidence": 0.9},
+                        {"id": "linux-cert", "name": "Linux+", "linked_course_id": "linux-course", "progress_percent": 0, "status": "not_started", "source": "udemy_browser", "confidence": 0.9},
+                        {"id": "net-cert", "name": "Network+", "linked_course_id": "net-course", "progress_percent": 19, "status": "in_progress", "source": "udemy_browser", "confidence": 0.9},
+                        {"id": "cysa-cert", "name": "CySA+", "progress_percent": 0, "status": "not_started", "source": "udemy_browser", "confidence": 0.9},
+                        {"id": "ccna-cert", "name": "CCNA", "progress_percent": 0, "status": "not_started", "source": "udemy_browser", "confidence": 0.9},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_CAREER_REGISTRY_PATH", str(career_path))
+        monkeypatch.setenv("HERMES_LEARNING_REGISTRY_PATH", str(learning_path))
+        monkeypatch.setenv("HERMES_DASHBOARD_OBSIDIAN_VAULT", str(tmp_path / "missing-vault"))
+
+        career = self.client.get("/api/dashboard/v2").json()["career_progress"]
+
+        roadmap = {item["name"]: item for item in career["certification_roadmap"]}
+        assert roadmap["AWS Solutions Architect Associate"]["course_progress_percent"] == 93
+        assert roadmap["AWS Solutions Architect Associate"]["status"] == "in_progress"
+        assert roadmap["AWS Solutions Architect Associate"]["learning_provider"] == "Udemy"
+        assert roadmap["Security+"]["certification_status"] == "verified"
+        assert roadmap["Security+"]["course_progress_percent"] == 99
+        assert roadmap["Linux+"]["certification_status"] == "verified"
+        assert roadmap["Linux+"]["course_progress_percent"] == 0
+        assert roadmap["Network+"]["course_progress_percent"] == 19
+        assert roadmap["CySA+"]["progress_percent"] == 0
+        assert roadmap["CCNA"]["progress_percent"] == 0
+        assert career["learning_summary"]["primary_certification"] == "AWS Solutions Architect Associate"
+        assert career["learning_summary"]["course"] == "Ultimate AWS Certified Solutions Architect Associate 2026"
+        assert career["learning_summary"]["certification_progress"] == 93
+        secondary_names = {item["name"]: item for item in career["learning_summary"]["secondary_learning_items"]}
+        assert secondary_names["Security+"]["progress_percent"] == 99
+        assert secondary_names["Network+"]["progress_percent"] == 19
+        assert secondary_names["100 Days of Code™: The Complete Python Pro Bootcamp"]["progress_percent"] == 7
+        assert career["today_tasks"][:3] == [
+            "Finish AWS SAA remaining Udemy content/review.",
+            "Complete AWS SAA practice questions.",
+            "Update Obsidian AWS SAA note after study.",
+        ]
+        assert "Missing certification" not in json.dumps(career["career_risks"])
+        assert "Security+" not in json.dumps(career["career_risks"])
+        skill_names = {item["name"] for item in career["skill_matrix"]}
+        assert {"AWS", "Linux", "Networking", "Security", "Windows/Desktop Support", "Microsoft 365", "Python", "PowerShell", "SQL", "Git", "Terraform", "Docker", "Kubernetes"} <= skill_names
+        assert any("resume" in item.get("current_evidence", []) for item in career["skill_matrix"] if item["name"] == "AWS")
+        assert any("github" in item.get("current_evidence", []) for item in career["skill_matrix"] if item["name"] == "Python")
+        assert career["job_readiness"]["resume"] == "Imported from trusted resume source."
+        assert career["job_readiness"]["github"] == "connected/repositories found"
+        assert career["job_readiness"]["linkedin"] == "not connected"
+        assert career["job_readiness"]["portfolio"] == "partial, based on GitHub"
+        assert career["job_readiness"]["interview"] == "needs assessment"
+        assert career["job_readiness"]["applications"] == "needs input"
+        assert career["employment_history"][0]["source"] == "resume"
+        assert career["career_timeline"][0]["source"] == "resume"
+        assert career["military_service"][0]["source"] == "resume"
+        assert career["leadership_experience"][0]["source"] == "resume"
+
+    def test_career_command_frontend_uses_api_projection_not_stale_hardcoded_values(self):
+        frontend_path = Path(__file__).resolve().parents[2] / "web" / "src" / "pages" / "ReportsPage.tsx"
+        source = frontend_path.read_text(encoding="utf-8")
+        career_component = source[source.index("function CareerCommandConsole"): source.index("function loadPlaidLinkScript")]
+
+        assert "certification_roadmap" in career_component
+        assert "learning_summary" in career_component
+        assert "skill_matrix" in career_component
+        assert "career_risks" in career_component
+        assert "job_readiness" in career_component
+        for stale_literal in [
+            "End User Technician",
+            "Security+ 0%",
+            "AWS Solutions Architect Associate — 15%",
+            "Missing certification: Security+",
+            "Generated study plan",
+            "generic gaps",
+        ]:
+            assert stale_literal not in career_component
 
     def test_dashboard_v2_career_registry_missing_fields_serialize_as_null_not_fabricated(self, tmp_path, monkeypatch):
         registry_path = tmp_path / "career_registry.json"
@@ -6959,6 +7128,9 @@ class TestPtyWebSocket:
         monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
         ws.app.state.pty_active_session_files = {}
         self.token = ws._SESSION_TOKEN
+        import asyncio
+        ws.app.state.event_channels = {}
+        ws.app.state.event_lock = asyncio.Lock()
         self.client = TestClient(ws.app)
 
     def _url(self, token: str | None = None, **params: str) -> str:

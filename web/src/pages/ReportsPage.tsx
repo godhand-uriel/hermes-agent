@@ -1308,10 +1308,10 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
   });
   const microsoftLearnStatus = careerNestedText(learningSummary, "provider_connections", "microsoft_learn") ?? careerNestedText(careerObject(learningSummary, "provider_connections"), "microsoft_learn", "status");
   const currentHourlyPay = careerNumber(record, ["hourly_rate", "current_hourly_pay", "current_pay_rate", "pay_rate", "hourly_pay"]);
-  const estimatedAnnual = careerNumber(record, ["annual_salary", "estimated_annual_salary"]) ?? (currentHourlyPay == null ? null : currentHourlyPay * 2080);
-  const targetSalary = careerNumber(record, ["target_salary", "salary_target", "target_annual_salary"]);
-  const incomeGap = targetSalary == null || estimatedAnnual == null ? null : targetSalary - estimatedAnnual;
-  const behindSchedule = careerValue(record, ["behind_schedule"]);
+  const incomeStrategy = careerObject(record, "income_strategy");
+  const estimatedAnnual = careerNumber(incomeStrategy, ["estimated_annual_salary", "annual_salary"]) ?? careerNumber(record, ["annual_salary", "estimated_annual_salary"]);
+  const targetSalary = careerNumber(incomeStrategy, ["target_salary", "salary_target"]) ?? careerNumber(record, ["target_salary", "salary_target", "target_annual_salary"]);
+  const incomeGap = careerNumber(incomeStrategy, ["income_gap", "gap_to_target"]);
   const resumeStatus = careerValue(record, ["resume_status"]);
   const linkedInStatus = careerValue(record, ["linkedin_status", "linked_in_status"]);
   const portfolioStatus = careerValue(record, ["portfolio_status"]);
@@ -1332,19 +1332,14 @@ function CareerCommandConsole({ career }: { career: OperatingNoteViewModel }) {
       current,
       target,
       evidence: careerList(skill, ["current_evidence", "evidence", "sources"]),
-      gap: careerPercent(skill.gap_percent) ?? (current == null || target == null ? null : Math.max(0, target - current)),
+      gap: careerPercent(skill.gap_percent ?? skill.gap),
       action: careerText(skill.next_task) ?? careerText(skill.next_action) ?? careerMissing(`skills[].next_task for ${area}`),
     };
   });
   const registryRisks = careerArray(record, "career_risks");
   const riskItems = registryRisks.length
-    ? registryRisks.map((item) => ({ label: careerText(item.label) ?? "Risk", value: careerText(item.value) ?? careerText(item.message) ?? "Review source risk" }))
-    : [
-      { label: "Behind schedule", value: behindSchedule ?? (currentCertProgress == null ? careerMissing("behind_schedule or certification progress") : currentCertProgress < 25 ? "Watch" : "On pace") },
-      { label: "Weak interview prep", value: interviewReadiness ?? careerMissing("interview_readiness") },
-      { label: "No resume update", value: resumeStatus ?? careerMissing("resume_status") },
-      { label: "Low study consistency", value: careerValue(record, ["study_consistency", "weekly_study_consistency"]) ?? careerMissing("study_consistency") },
-    ];
+    ? registryRisks.map((item) => ({ label: careerText(item.label) ?? "Risk", value: careerText(item.value) ?? careerText(item.mitigation) ?? "Review source risk" }))
+    : [{ label: "Needs input: career_risks", value: "Dashboard API did not provide computed career risks." }];
   const readinessSource = careerObject(record, "job_readiness");
   const readiness = [
     { label: "Resume", value: careerText(readinessSource.resume) ?? resumeStatus ?? careerMissing("resume_status") },

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -36,11 +37,12 @@ PLAID_BASE_URLS = {
     "sandbox": "https://sandbox.plaid.com",
     "production": "https://production.plaid.com",
 }
-DEFAULT_PRODUCTS = ("transactions", "liabilities", "investments")
+DEFAULT_PRODUCTS: tuple[str, ...] = ()
 DEFAULT_COUNTRY_CODES = ("US",)
-READ_ONLY_PRODUCTS = frozenset({"transactions", "auth", "identity", "liabilities", "investments"})
 FORBIDDEN_PRODUCTS = frozenset({"transfer", "payment_initiation", "processor_payments", "signal"})
+NOT_LINK_PRODUCTS = frozenset({"balance"})
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
+_log = logging.getLogger(__name__)
 
 
 def _load_hermes_secrets() -> None:
@@ -100,6 +102,77 @@ def _plaid_env_source_path() -> Path | None:
     return None
 
 
+def _is_production_env_source(path: Path | None) -> bool:
+    return bool(path and path.name == ".env.production")
+
+
+def _production_plaid_requested(env_source: Path | None = None) -> bool:
+    values = [os.environ.get(key, "").strip().lower() for key in ("HERMES_PLAID_REQUESTED_ENV", "HERMES_PLAID_DASHBOARD_ENV", "PLAID_ENV")]
+    return "production" in values or _is_production_env_source(env_source or _plaid_env_source_path())
+
+
+def _safe_link_token_request_shape(cfg: "PlaidConfig", *, user_id: str = "hermes-finance") -> dict[str, Any]:
+    """Return the exact Link token request shape without credentials.
+
+    Plaid credentials are added by ``_post`` immediately before transport. This
+    helper intentionally shows only the operator-controlled Link token fields so
+    production diagnostics can reveal malformed product arrays without exposing
+    client_id, secret, public tokens, access tokens, or generated Link tokens.
+    """
+    return {
+        "method": "POST",
+        "endpoint": "/link/token/create",
+        "base_url": cfg.base_url,
+        "body": {
+            "client_name": "Hermes Finance Registry",
+            "country_codes": list(cfg.country_codes),
+            "language": "en",
+            "user": {"client_user_id": user_id},
+            "products": list(cfg.products),
+        },
+        "excluded_secret_fields": ["client_id", "secret"],
+    }
+
+
+def _plaid_product_diagnostics(products: tuple[str, ...]) -> dict[str, Any]:
+    normalized = [product.strip().lower() for product in products if product.strip()]
+    return {
+        "minimum_products_present": bool(normalized),
+        "invalid_link_products": [product for product in normalized if product in NOT_LINK_PRODUCTS],
+        "forbidden_products": [product for product in normalized if product in FORBIDDEN_PRODUCTS],
+        "asset_report_flow_requested": "assets" in normalized,
+        "notes": {
+            "assets": "assets is a Link product for obtaining consent/access_tokens for Asset Reports; Asset data still requires the /asset_report/create flow after Link.",
+            "balance": "balance should not be included in /link/token/create products; request another product such as transactions or auth, then call /accounts/balance/get when authorized.",
+        },
+    }
+
+
+def _safe_plaid_diagnostics(cfg: "PlaidConfig", *, env_source: Path | None, path: Path | None = None, user_id: str = "hermes-finance") -> dict[str, Any]:
+    token_store = token_store_path(cfg.environment, registry_path=path)
+    production_requested = _production_plaid_requested(env_source)
+    return {
+        "requested_environment": _requested_plaid_env() or None,
+        "resolved_environment": cfg.environment,
+        "environment": cfg.environment,
+        "production_requested": production_requested,
+        "dashboard_mode": "production" if production_requested else cfg.environment,
+        "env_source_path": str(env_source) if env_source else None,
+        "plaid_base_url": cfg.base_url,
+        "products": list(cfg.products),
+        "product_diagnostics": _plaid_product_diagnostics(cfg.products),
+        "country_codes": list(cfg.country_codes),
+        "link_token_request": _safe_link_token_request_shape(cfg, user_id=user_id),
+        "institution_oauth_enabled": bool(os.environ.get("PLAID_REDIRECT_URI") or os.environ.get("PLAID_OAUTH_REDIRECT_URI")),
+        "token_namespace": {
+            "path": str(token_store.parent),
+            "exists": token_store.parent.exists(),
+            "token_records": len(_read_token_store(cfg.environment, registry_path=path)),
+            "legacy_registry_token_rows": len(_legacy_registry_token_rows(cfg.environment, path=path)),
+        },
+    }
+
+
 def _load_plaid_env_file() -> Path | None:
     """Load optional Plaid-only env file and return the source path.
 
@@ -136,6 +209,65 @@ class PlaidSecurityError(RuntimeError):
     pass
 
 
+SAFE_PLAID_ERROR_FIELDS = ("http_status", "error_type", "error_code", "error_message", "request_id", "documentation_url")
+
+
+def _redact_sensitive_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    redacted = value
+    for key in ("PLAID_CLIENT_ID", "PLAID_SECRET"):
+        secret = os.environ.get(key, "")
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def _safe_plaid_error_from_exception(exc: BaseException) -> dict[str, Any]:
+    """Extract Plaid error diagnostics without credentials, tokens, or payloads.
+
+    Supports urllib HTTPError and Plaid SDK-style ApiException objects. The
+    returned object is intentionally allowlisted to Plaid's public error fields.
+    """
+    raw_body = ""
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(exc, error.HTTPError):
+        status = exc.code
+        raw_body = exc.read().decode("utf-8", errors="replace")
+    else:
+        body = getattr(exc, "body", None) or getattr(exc, "data", None)
+        if isinstance(body, bytes):
+            raw_body = body.decode("utf-8", errors="replace")
+        elif body is not None:
+            raw_body = str(body)
+
+    parsed: dict[str, Any]
+    try:
+        decoded = json.loads(raw_body) if raw_body else {}
+        parsed = decoded if isinstance(decoded, dict) else {}
+    except json.JSONDecodeError:
+        parsed = {"error_message": raw_body}
+
+    safe = {
+        "http_status": status,
+        "error_type": parsed.get("error_type"),
+        "error_code": parsed.get("error_code"),
+        "error_message": parsed.get("error_message") or parsed.get("display_message") or raw_body or str(exc),
+        "request_id": parsed.get("request_id"),
+        "documentation_url": parsed.get("documentation_url"),
+    }
+    return {key: _redact_sensitive_text(safe.get(key)) for key in SAFE_PLAID_ERROR_FIELDS if safe.get(key) not in (None, "")}
+
+
+class PlaidAPIError(RuntimeError):
+    def __init__(self, endpoint: str, safe_error: dict[str, Any], diagnostics: dict[str, Any] | None = None):
+        self.endpoint = endpoint
+        self.safe_error = {key: safe_error[key] for key in SAFE_PLAID_ERROR_FIELDS if key in safe_error}
+        self.diagnostics = diagnostics or {}
+        message = self.safe_error.get("error_message") or "Plaid API request failed."
+        super().__init__(f"Plaid request failed for {endpoint}: {message}")
+
+
 @dataclass(frozen=True)
 class PlaidConfig:
     client_id: str
@@ -154,16 +286,18 @@ class PlaidConfig:
 
 def plaid_config_from_env() -> PlaidConfig:
     _load_hermes_secrets()
-    _load_plaid_env_file()
+    env_source = _load_plaid_env_file()
     env = os.environ.get("PLAID_ENV", "sandbox").strip().lower() or "sandbox"
     if env not in PLAID_BASE_URLS:
         raise PlaidSecurityError("PLAID_ENV must be sandbox or production.")
+    if _production_plaid_requested(env_source) and env != "production":
+        raise PlaidSecurityError("production_environment_mismatch: production Plaid was requested but resolved PLAID_ENV is sandbox.")
 
     client_id = os.environ.get("PLAID_CLIENT_ID", "").strip()
     secret = os.environ.get("PLAID_SECRET", "").strip()
     raw_products = os.environ.get("PLAID_PRODUCTS")
     raw_country_codes = os.environ.get("PLAID_COUNTRY_CODES")
-    products = tuple(p.strip() for p in (raw_products if raw_products is not None else ",".join(DEFAULT_PRODUCTS)).split(",") if p.strip())
+    products = tuple(p.strip() for p in (raw_products if raw_products is not None else "").split(",") if p.strip())
     country_codes = tuple(c.strip().upper() for c in (raw_country_codes if raw_country_codes is not None else "US").split(",") if c.strip())
 
     missing: list[str] = []
@@ -171,11 +305,10 @@ def plaid_config_from_env() -> PlaidConfig:
         missing.append("PLAID_CLIENT_ID")
     if not secret:
         missing.append("PLAID_SECRET")
-    if env == "production":
-        if raw_products is None or not products:
-            missing.append("PLAID_PRODUCTS")
-        if raw_country_codes is None or not country_codes:
-            missing.append("PLAID_COUNTRY_CODES")
+    if raw_products is None or not products:
+        missing.append("PLAID_PRODUCTS")
+    if env == "production" and (raw_country_codes is None or not country_codes):
+        missing.append("PLAID_COUNTRY_CODES")
     if missing:
         joined = ", ".join(missing)
         raise PlaidConfigurationError(
@@ -186,10 +319,6 @@ def plaid_config_from_env() -> PlaidConfig:
     normalized_products = {p.lower() for p in products}
     if FORBIDDEN_PRODUCTS.intersection(normalized_products):
         raise PlaidSecurityError("Money-movement Plaid products are forbidden for the Finance Registry integration.")
-    invalid_products = normalized_products.difference(READ_ONLY_PRODUCTS)
-    if invalid_products:
-        invalid = ", ".join(sorted(invalid_products))
-        raise PlaidSecurityError(f"Unsupported Plaid product(s) for Finance Registry: {invalid}.")
     if not country_codes:
         raise PlaidConfigurationError("PLAID_COUNTRY_CODES must include at least one country code.")
     return PlaidConfig(client_id=client_id, secret=secret, environment=env, products=products, country_codes=country_codes)
@@ -250,7 +379,7 @@ def validate_production_config(*, env_file: Path | None = None, path: Path | Non
             result["environment"] = cfg.environment
             result["credentials_loaded"] = bool(cfg.client_id and cfg.secret and cfg.environment == "production")
             result["products"] = list(cfg.products)
-            result["products_valid"] = all(p.lower() in READ_ONLY_PRODUCTS for p in cfg.products)
+            result["products_valid"] = not bool(FORBIDDEN_PRODUCTS.intersection({p.lower() for p in cfg.products}))
             result["country_codes"] = list(cfg.country_codes)
             result["country_codes_valid"] = bool(cfg.country_codes)
         except (PlaidConfigurationError, PlaidSecurityError) as exc:
@@ -287,19 +416,8 @@ def plaid_runtime_status(*, path: Path | None = None) -> dict[str, Any]:
     _load_hermes_secrets()
     env_source = _load_plaid_env_file()
     cfg = plaid_config_from_env()
-    token_store = token_store_path(cfg.environment, registry_path=path)
     return {
-        "environment": cfg.environment,
-        "env_source_path": str(env_source) if env_source else None,
-        "products": list(cfg.products),
-        "country_codes": list(cfg.country_codes),
-        "token_namespace": {
-            "path": str(token_store.parent),
-            "token_store_path": str(token_store),
-            "exists": token_store.parent.exists(),
-            "token_records": len(_read_token_store(cfg.environment, registry_path=path)),
-            "legacy_registry_token_rows": len(_legacy_registry_token_rows(cfg.environment, path=path)),
-        },
+        **_safe_plaid_diagnostics(cfg, env_source=env_source, path=path),
         "keys": {key: _safe_key_status(key) for key in ("PLAID_ENV", "PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_PRODUCTS", "PLAID_COUNTRY_CODES")},
     }
 
@@ -464,7 +582,7 @@ def store_access_token(*, access_token: str, item_id: str | None = None, institu
                     "institution_name": institution_name,
                     "item_id": item_id or record.get("item_id"),
                     "encrypted_access_token": encrypted,
-                    "products": products or list(DEFAULT_PRODUCTS),
+                    "products": products or [],
                     "created_at": created_at,
                     "updated_at": now,
                 }
@@ -479,7 +597,7 @@ def store_access_token(*, access_token: str, item_id: str | None = None, institu
                 "institution_name": institution_name,
                 "item_id": item_id,
                 "encrypted_access_token": encrypted,
-                "products": products or list(DEFAULT_PRODUCTS),
+                "products": products or [],
                 "created_at": now,
                 "updated_at": now,
             }
@@ -596,6 +714,10 @@ class PlaidConnector:
     def __init__(self, config: PlaidConfig | None = None, *, transport: Transport | None = None):
         self.config = config or plaid_config_from_env()
         self.transport = transport
+        self.env_source_path = _plaid_env_source_path()
+
+    def safe_diagnostics(self, *, registry_path: Path | None = None, user_id: str = "hermes-finance") -> dict[str, Any]:
+        return _safe_plaid_diagnostics(self.config, env_source=self.env_source_path, path=registry_path, user_id=user_id)
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {"client_id": self.config.client_id, "secret": self.config.secret, **payload}
@@ -612,25 +734,51 @@ class PlaidConnector:
             with request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            try:
-                detail = json.loads(raw)
-            except json.JSONDecodeError:
-                detail = {"error_message": raw}
-            msg = str(detail.get("error_message") or detail.get("display_message") or raw)
-            raise RuntimeError(f"Plaid request failed for {endpoint}: {msg}") from exc
+            raise PlaidAPIError(endpoint, _safe_plaid_error_from_exception(exc)) from exc
+        except Exception as exc:
+            if exc.__class__.__name__ == "ApiException" or (hasattr(exc, "body") and (hasattr(exc, "status") or hasattr(exc, "status_code"))):
+                raise PlaidAPIError(endpoint, _safe_plaid_error_from_exception(exc)) from exc
+            raise
 
     def create_link_token(self, *, user_id: str = "hermes-finance") -> dict[str, Any]:
-        return self._post(
-            "/link/token/create",
-            {
-                "client_name": "Hermes Finance Registry",
-                "country_codes": list(self.config.country_codes),
-                "language": "en",
-                "user": {"client_user_id": user_id},
-                "products": list(self.config.products),
-            },
+        diagnostics = self.safe_diagnostics(user_id=user_id)
+        _log.info(
+            "Plaid Link token create diagnostics: requested_environment=%s resolved_environment=%s env_source_path=%s plaid_base_url=%s products=%s country_codes=%s token_namespace_path=%s production_dashboard=%s dashboard_mode=%s institution_oauth_enabled=%s",
+            diagnostics.get("requested_environment"),
+            diagnostics.get("resolved_environment"),
+            diagnostics.get("env_source_path"),
+            diagnostics.get("plaid_base_url"),
+            diagnostics.get("products"),
+            diagnostics.get("country_codes"),
+            (diagnostics.get("token_namespace") or {}).get("path"),
+            diagnostics.get("production_requested"),
+            diagnostics.get("dashboard_mode"),
+            diagnostics.get("institution_oauth_enabled"),
         )
+        try:
+            return self._post(
+                "/link/token/create",
+                {
+                    "client_name": "Hermes Finance Registry",
+                    "country_codes": list(self.config.country_codes),
+                    "language": "en",
+                    "user": {"client_user_id": user_id},
+                    "products": list(self.config.products),
+                },
+            )
+        except PlaidAPIError as exc:
+            exc.diagnostics = diagnostics
+            _log.warning(
+                "Plaid Link token create failed safely: requested_environment=%s resolved_environment=%s plaid_base_url=%s error_type=%s error_code=%s http_status=%s request_id=%s",
+                diagnostics.get("requested_environment"),
+                diagnostics.get("resolved_environment"),
+                diagnostics.get("plaid_base_url"),
+                exc.safe_error.get("error_type"),
+                exc.safe_error.get("error_code"),
+                exc.safe_error.get("http_status"),
+                exc.safe_error.get("request_id"),
+            )
+            raise
 
     def exchange_public_token(self, public_token: str, *, store: bool = True, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         if not public_token or not public_token.strip():
@@ -682,13 +830,14 @@ class PlaidConnector:
     def _fetch_registry_payload(self, token: str, *, institution_hint: dict[str, Any] | None = None) -> dict[str, Any]:
         import datetime as dt
 
+        normalized_products = {product.lower() for product in self.config.products}
         accounts_payload = self.fetch_accounts(token)
-        balances_payload = self.fetch_balances(token)
+        balances_payload = self.fetch_balances(token) if normalized_products.intersection({"balance", "auth", "transactions"}) else {}
         end_date = dt.date.today()
         start_date = end_date - dt.timedelta(days=90)
-        tx_payload = self.fetch_transactions(token, start_date=start_date.isoformat(), end_date=end_date.isoformat())
-        liabilities_payload = self.fetch_liabilities(token) if "liabilities" in self.config.products else {}
-        investments_payload = self.fetch_investments(token) if "investments" in self.config.products else {}
+        tx_payload = self.fetch_transactions(token, start_date=start_date.isoformat(), end_date=end_date.isoformat()) if "transactions" in normalized_products else {}
+        liabilities_payload = self.fetch_liabilities(token) if "liabilities" in normalized_products else {}
+        investments_payload = self.fetch_investments(token) if "investments" in normalized_products else {}
         accounts = balances_payload.get("accounts") or accounts_payload.get("accounts") or []
         item = accounts_payload.get("item") or balances_payload.get("item") or {}
         hint = institution_hint or {}
@@ -771,6 +920,7 @@ def sync_to_finance_registry(**kwargs: Any) -> dict[str, Any]:
 __all__ = [
     "PlaidConfig",
     "PlaidConnector",
+    "PlaidAPIError",
     "PlaidConfigurationError",
     "PlaidSecurityError",
     "create_link_token",

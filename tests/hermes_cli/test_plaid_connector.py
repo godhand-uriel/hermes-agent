@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 from pathlib import Path
@@ -129,12 +130,12 @@ def test_production_configuration_uses_production_url_without_code_changes(monke
     monkeypatch.setenv("PLAID_ENV", "production")
     monkeypatch.setenv("PLAID_CLIENT_ID", "client-prod")
     monkeypatch.setenv("PLAID_SECRET", "secret-prod")
-    monkeypatch.setenv("PLAID_PRODUCTS", "transactions,liabilities,investments")
+    monkeypatch.setenv("PLAID_PRODUCTS", "assets,balance")
     monkeypatch.setenv("PLAID_COUNTRY_CODES", "US")
     cfg = plaid_config_from_env()
     assert cfg.environment == "production"
     assert cfg.base_url == "https://production.plaid.com"
-    assert cfg.products == ("transactions", "liabilities", "investments")
+    assert cfg.products == ("assets", "balance")
 
     registry = tmp_path / "registry.db"
     store_access_token(access_token="access-production-token", item_id="item_prod", institution_id="ins_prod", institution_name="Production Bank", environment="production", path=registry)
@@ -178,18 +179,18 @@ def test_sandbox_token_storage_is_not_overwritten_by_production_token(tmp_path):
     assert "sandbox-token" not in (tmp_path / "production" / "access_tokens.json").read_text(encoding="utf-8")
 
 
-def test_plaid_sandbox_configuration_defaults_products_and_country_codes(monkeypatch):
+def test_plaid_sandbox_configuration_uses_explicit_products_and_default_country_codes(monkeypatch):
     monkeypatch.setenv("PLAID_ENV", "sandbox")
     monkeypatch.setenv("PLAID_CLIENT_ID", "client-sandbox")
     monkeypatch.setenv("PLAID_SECRET", "secret-sandbox")
-    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.setenv("PLAID_PRODUCTS", "assets,balance")
     monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
 
     cfg = plaid_config_from_env()
 
     assert cfg.environment == "sandbox"
     assert cfg.base_url == "https://sandbox.plaid.com"
-    assert cfg.products == ("transactions", "liabilities", "investments")
+    assert cfg.products == ("assets", "balance")
     assert cfg.country_codes == ("US",)
 
 
@@ -222,7 +223,7 @@ def test_plaid_production_validation_requires_all_secrets(monkeypatch, tmp_path)
 
 def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_path):
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=assets,balance\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.delenv("PLAID_ENV", raising=False)
     monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
@@ -231,12 +232,12 @@ def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_pat
     cfg = plaid_config_from_env()
     assert cfg.environment == "production"
     assert cfg.client_id == "file-client"
-    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+    assert cfg.products == ("assets", "balance")
 
 
 def test_plaid_auto_loads_private_production_env_from_hermes_home(monkeypatch, tmp_path):
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=assets,balance\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLAID_ENV", "production")
@@ -250,12 +251,12 @@ def test_plaid_auto_loads_private_production_env_from_hermes_home(monkeypatch, t
 
     assert cfg.environment == "production"
     assert cfg.client_id == "file-client"
-    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+    assert cfg.products == ("assets", "balance")
 
 
 def test_plaid_requested_production_env_overrides_stale_sandbox_process_env(monkeypatch, tmp_path):
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=assets,balance\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_PLAID_REQUESTED_ENV", "production")
@@ -269,14 +270,45 @@ def test_plaid_requested_production_env_overrides_stale_sandbox_process_env(monk
 
     assert cfg.environment == "production"
     assert cfg.client_id == "file-client"
-    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+    assert cfg.products == ("assets", "balance")
+
+
+def test_plaid_production_requested_sandbox_resolved_raises_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PLAID_REQUESTED_ENV", "production")
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "stale-sandbox-client")
+    monkeypatch.setenv("PLAID_SECRET", "stale-sandbox-secret")
+    monkeypatch.setenv("PLAID_PRODUCTS", "transactions")
+    monkeypatch.setenv("PLAID_COUNTRY_CODES", "US")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+
+    with pytest.raises(Exception, match="production_environment_mismatch"):
+        plaid_config_from_env()
+
+
+def test_plaid_link_token_uses_sandbox_when_explicitly_sandbox(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def transport(endpoint, payload):
+        calls.append((endpoint, payload))
+        return {"link_token": "link-sandbox", "request_id": "req-sandbox"}
+
+    connector = PlaidConnector(PlaidConfig(client_id="client", secret="secret", environment="sandbox", products=("assets", "balance")), transport=transport)
+    result = connector.create_link_token()
+
+    assert result["link_token"] == "link-sandbox"
+    assert calls[0][0] == "/link/token/create"
+    assert calls[0][1]["products"] == ["assets", "balance"]
+    assert connector.safe_diagnostics()["plaid_base_url"] == "https://sandbox.plaid.com"
 
 
 def test_plaid_runtime_status_is_safe_and_reports_namespace(monkeypatch, tmp_path):
     from hermes_cli.plaid_connector import plaid_runtime_status
 
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=assets,balance\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLAID_ENV", "production")
@@ -291,15 +323,59 @@ def test_plaid_runtime_status_is_safe_and_reports_namespace(monkeypatch, tmp_pat
     assert status["environment"] == "production"
     assert status["env_source_path"] == str(env_file)
     assert status["token_namespace"]["path"].endswith("production")
-    assert status["products"] == ["transactions", "auth", "identity", "liabilities", "investments"]
+    assert status["products"] == ["assets", "balance"]
+    assert status["product_diagnostics"]["invalid_link_products"] == ["balance"]
+    assert status["product_diagnostics"]["asset_report_flow_requested"] is True
+    assert status["link_token_request"] == {
+        "method": "POST",
+        "endpoint": "/link/token/create",
+        "base_url": "https://production.plaid.com",
+        "body": {
+            "client_name": "Hermes Finance Registry",
+            "country_codes": ["US"],
+            "language": "en",
+            "user": {"client_user_id": "hermes-finance"},
+            "products": ["assets", "balance"],
+        },
+        "excluded_secret_fields": ["client_id", "secret"],
+    }
     assert "file-secret" not in str(status)
+
+
+def test_plaid_link_token_failure_diagnostics_include_exact_safe_request_shape(monkeypatch, tmp_path):
+    from hermes_cli.plaid_connector import PlaidAPIError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def transport(endpoint, payload):
+        raise PlaidAPIError(endpoint, {"http_status": 400, "error_code": "INVALID_PRODUCT", "error_message": "bad product"})
+
+    connector = PlaidConnector(PlaidConfig(client_id="client", secret="secret", environment="production", products=("assets", "balance")), transport=transport)
+
+    with pytest.raises(PlaidAPIError) as err:
+        connector.create_link_token(user_id="diagnostic-user")
+
+    diagnostics = err.value.diagnostics
+    assert diagnostics["link_token_request"]["body"] == {
+        "client_name": "Hermes Finance Registry",
+        "country_codes": ["US"],
+        "language": "en",
+        "user": {"client_user_id": "diagnostic-user"},
+        "products": ["assets", "balance"],
+    }
+    assert diagnostics["link_token_request"]["excluded_secret_fields"] == ["client_id", "secret"]
+    assert diagnostics["product_diagnostics"]["invalid_link_products"] == ["balance"]
+    assert "client_id" in diagnostics["link_token_request"]["excluded_secret_fields"]
+    assert "secret" in diagnostics["link_token_request"]["excluded_secret_fields"]
+    assert "client=client" not in str(diagnostics)
+    assert "secret=secret" not in str(diagnostics)
 
 
 def test_plaid_production_config_dry_run_reports_safe_status(monkeypatch, tmp_path):
     from hermes_cli.plaid_connector import validate_production_config
 
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=assets,balance\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
@@ -318,6 +394,58 @@ def test_plaid_production_config_dry_run_reports_safe_status(monkeypatch, tmp_pa
     assert result["production_token_namespace_empty"] is True
     assert result["production_access_token_exists"] is False
     assert "file-secret" not in str(result)
+
+
+def test_plaid_api_exception_parsing_filters_to_safe_fields(monkeypatch):
+    from hermes_cli.plaid_connector import _safe_plaid_error_from_exception
+
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-secret-value")
+    monkeypatch.setenv("PLAID_SECRET", "plaid-secret-value")
+
+    class ApiException(Exception):
+        status = 400
+        body = '{"error_type":"INVALID_REQUEST","error_code":"INVALID_FIELD","error_message":"bad client-secret-value plaid-secret-value","request_id":"req-safe","documentation_url":"https://plaid.com/docs/errors/","access_token":"access-leak","public_token":"public-leak","link_token":"link-leak"}'
+
+    safe = _safe_plaid_error_from_exception(ApiException("boom"))
+
+    assert safe == {
+        "http_status": 400,
+        "error_type": "INVALID_REQUEST",
+        "error_code": "INVALID_FIELD",
+        "error_message": "bad [REDACTED] [REDACTED]",
+        "request_id": "req-safe",
+        "documentation_url": "https://plaid.com/docs/errors/",
+    }
+    assert "access-leak" not in str(safe)
+    assert "public-leak" not in str(safe)
+    assert "link-leak" not in str(safe)
+
+
+def test_plaid_http_error_becomes_safe_plaid_api_error(monkeypatch):
+    from urllib.error import HTTPError
+
+    from hermes_cli.plaid_connector import PlaidAPIError
+
+    def transport_error(req, timeout=30):
+        body = b'{"error_type":"API_ERROR","error_code":"PRODUCT_NOT_ENABLED","error_message":"Product is not enabled","request_id":"req-http"}'
+        raise HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("hermes_cli.plaid_connector.request.urlopen", transport_error)
+    connector = PlaidConnector(PlaidConfig(client_id="client", secret="secret", environment="production"))
+
+    with pytest.raises(PlaidAPIError) as err:
+        connector.create_link_token()
+
+    assert err.value.safe_error == {
+        "http_status": 400,
+        "error_type": "API_ERROR",
+        "error_code": "PRODUCT_NOT_ENABLED",
+        "error_message": "Product is not enabled",
+        "request_id": "req-http",
+    }
+    assert err.value.diagnostics["plaid_base_url"] == "https://production.plaid.com"
+    assert "client" not in str(err.value.safe_error)
+    assert "secret" not in str(err.value.safe_error)
 
 
 def test_plaid_sandbox_sync_with_mock_transport(monkeypatch, tmp_path):
@@ -340,11 +468,12 @@ def test_plaid_sandbox_sync_with_mock_transport(monkeypatch, tmp_path):
             return {"holdings": [], "securities": []}
         raise AssertionError(endpoint)
 
-    connector = PlaidConnector(PlaidConfig(client_id="client", secret="secret"), transport=transport)
+    connector = PlaidConnector(PlaidConfig(client_id="client", secret="secret", products=("balance",)), transport=transport)
     result = connector.sync_to_finance_registry(access_token="access-sandbox", path=tmp_path / "registry.db")
     assert result["status"] == "success"
     assert result["counts"]["accounts"] == 1
-    assert "/transactions/get" in calls
+    assert "/accounts/balance/get" in calls
+    assert "/transactions/get" not in calls
 
     contract = finance_command_center_contract(path=tmp_path / "registry.db")
     assert contract["source"]["model"] == "normalized"

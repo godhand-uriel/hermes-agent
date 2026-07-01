@@ -38,6 +38,8 @@ PLAID_BASE_URLS = {
 }
 DEFAULT_PRODUCTS = ("transactions", "liabilities", "investments")
 DEFAULT_COUNTRY_CODES = ("US",)
+READ_ONLY_PRODUCTS = frozenset({"transactions", "auth", "identity", "liabilities", "investments"})
+FORBIDDEN_PRODUCTS = frozenset({"transfer", "payment_initiation", "processor_payments", "signal"})
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
@@ -75,9 +77,17 @@ def _load_plaid_env_file() -> None:
     simple KEY=VALUE lines and is never exposed to the frontend.
     """
     env_file = os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()
+    override_existing = bool(env_file)
+    if not env_file and os.environ.get("PLAID_ENV", "").strip().lower() == "production":
+        candidate = get_hermes_home() / ".env.production"
+        if candidate.exists():
+            env_file = str(candidate)
+            override_existing = True
     if not env_file:
         return
     path = Path(env_file).expanduser()
+    if path == get_hermes_home() / ".env.production":
+        override_existing = True
     if not path.exists():
         raise PlaidConfigurationError(f"Plaid env file does not exist: {path}")
     mode = path.stat().st_mode & 0o777
@@ -90,7 +100,7 @@ def _load_plaid_env_file() -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('\"').strip("'")
-        if key.startswith("PLAID_") and key not in os.environ:
+        if key.startswith("PLAID_") and (override_existing or key not in os.environ):
             os.environ[key] = value
 
 
@@ -149,10 +159,99 @@ def plaid_config_from_env() -> PlaidConfig:
             "Set them in the active Hermes profile secrets before running Plaid commands."
         )
 
-    forbidden = {"transfer", "payment_initiation", "processor_payments", "auth", "signal"}
-    if forbidden.intersection({p.lower() for p in products}):
+    normalized_products = {p.lower() for p in products}
+    if FORBIDDEN_PRODUCTS.intersection(normalized_products):
         raise PlaidSecurityError("Money-movement Plaid products are forbidden for the Finance Registry integration.")
+    invalid_products = normalized_products.difference(READ_ONLY_PRODUCTS)
+    if invalid_products:
+        invalid = ", ".join(sorted(invalid_products))
+        raise PlaidSecurityError(f"Unsupported Plaid product(s) for Finance Registry: {invalid}.")
+    if not country_codes:
+        raise PlaidConfigurationError("PLAID_COUNTRY_CODES must include at least one country code.")
     return PlaidConfig(client_id=client_id, secret=secret, environment=env, products=products, country_codes=country_codes)
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    raw = (value or "").strip()
+    lowered = raw.lower()
+    return not raw or "<" in raw or ">" in raw or "placeholder" in lowered or "your_" in lowered or lowered.startswith("changeme")
+
+
+def _safe_key_status(key: str) -> dict[str, Any]:
+    value = os.environ.get(key, "")
+    return {"present": bool(value), "length": len(value), "placeholder": _is_placeholder_secret(value)}
+
+
+def validate_production_config(*, env_file: Path | None = None, path: Path | None = None) -> dict[str, Any]:
+    """Validate production Plaid configuration without contacting Plaid.
+
+    The returned payload is safe to print: it reports key presence, lengths,
+    validation booleans, and namespace state, but never credential values or
+    access-token values.
+    """
+    selected_env_file = (env_file or (get_hermes_home() / ".env.production")).expanduser()
+    original_env = dict(os.environ)
+    result: dict[str, Any] = {
+        "credential_source_path": str(selected_env_file),
+        "credential_source_exists": selected_env_file.exists(),
+        "credential_source_mode": None,
+        "credential_source_private": False,
+        "environment": "production",
+        "keys": {},
+        "credentials_loaded": False,
+        "products": [],
+        "products_valid": False,
+        "country_codes": [],
+        "country_codes_valid": False,
+        "production_token_namespace": {},
+        "sandbox_token_namespace": {},
+        "sandbox_tokens_remain_separate": False,
+        "production_token_namespace_empty": False,
+        "production_access_token_exists": False,
+        "registry_backup_exists": False,
+        "sandbox_baseline_exists": False,
+        "errors": [],
+    }
+    if selected_env_file.exists():
+        mode = selected_env_file.stat().st_mode & 0o777
+        result["credential_source_mode"] = f"{mode:04o}"
+        result["credential_source_private"] = not bool(mode & 0o077)
+    try:
+        os.environ["PLAID_ENV"] = "production"
+        os.environ["HERMES_PLAID_ENV_FILE"] = str(selected_env_file)
+        for key in ("PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_PRODUCTS", "PLAID_COUNTRY_CODES"):
+            os.environ.pop(key, None)
+        try:
+            cfg = plaid_config_from_env()
+            result["environment"] = cfg.environment
+            result["credentials_loaded"] = bool(cfg.client_id and cfg.secret and cfg.environment == "production")
+            result["products"] = list(cfg.products)
+            result["products_valid"] = all(p.lower() in READ_ONLY_PRODUCTS for p in cfg.products)
+            result["country_codes"] = list(cfg.country_codes)
+            result["country_codes_valid"] = bool(cfg.country_codes)
+        except (PlaidConfigurationError, PlaidSecurityError) as exc:
+            result["errors"].append(str(exc))
+        result["keys"] = {key: _safe_key_status(key) for key in ("PLAID_ENV", "PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_PRODUCTS", "PLAID_COUNTRY_CODES")}
+
+        prod_store = token_store_path("production", registry_path=path)
+        sandbox_store = token_store_path("sandbox", registry_path=path)
+        prod_records = _read_token_store("production", registry_path=path)
+        sandbox_records = _read_token_store("sandbox", registry_path=path)
+        prod_legacy_count = len(_legacy_registry_token_rows("production", path=path))
+        result["production_token_namespace"] = {"path": str(prod_store.parent), "token_store_path": str(prod_store), "exists": prod_store.parent.exists(), "token_records": len(prod_records), "legacy_registry_token_rows": prod_legacy_count}
+        result["sandbox_token_namespace"] = {"path": str(sandbox_store.parent), "token_store_path": str(sandbox_store), "exists": sandbox_store.parent.exists(), "token_records": len(sandbox_records), "legacy_compatible": True}
+        result["sandbox_tokens_remain_separate"] = prod_store != sandbox_store and prod_store.parent != sandbox_store.parent
+        result["production_token_namespace_empty"] = len(prod_records) == 0 and prod_legacy_count == 0
+        result["production_access_token_exists"] = not bool(result["production_token_namespace_empty"])
+
+        registry = path or finance_registry_path()
+        backup_dir = registry.parent / "backups"
+        result["registry_backup_exists"] = backup_dir.exists() and any(backup_dir.glob("registry_sandbox_before_production_*.db"))
+        result["sandbox_baseline_exists"] = (Path.cwd() / "docs" / "plaid_sandbox_baseline_before_production.md").exists()
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+    return result
 
 
 def _finance_secret_dir() -> Path:
@@ -642,4 +741,5 @@ __all__ = [
     "sync_to_finance_registry",
     "token_namespace_dir",
     "token_store_path",
+    "validate_production_config",
 ]

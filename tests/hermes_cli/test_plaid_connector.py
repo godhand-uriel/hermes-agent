@@ -222,7 +222,7 @@ def test_plaid_production_validation_requires_all_secrets(monkeypatch, tmp_path)
 
 def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_path):
     env_file = tmp_path / ".env.production"
-    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\n", encoding="utf-8")
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
     env_file.chmod(0o600)
     monkeypatch.delenv("PLAID_ENV", raising=False)
     monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
@@ -231,6 +231,51 @@ def test_plaid_env_file_loader_requires_private_permissions(monkeypatch, tmp_pat
     cfg = plaid_config_from_env()
     assert cfg.environment == "production"
     assert cfg.client_id == "file-client"
+    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+
+
+def test_plaid_auto_loads_private_production_env_from_hermes_home(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+    monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    cfg = plaid_config_from_env()
+
+    assert cfg.environment == "production"
+    assert cfg.client_id == "file-client"
+    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+
+
+def test_plaid_production_config_dry_run_reports_safe_status(monkeypatch, tmp_path):
+    from hermes_cli.plaid_connector import validate_production_config
+
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    result = validate_production_config(env_file=env_file, path=tmp_path / "registry.db")
+
+    assert result["environment"] == "production"
+    assert result["credentials_loaded"] is True
+    assert result["keys"]["PLAID_SECRET"] == {"present": True, "length": len("file-secret"), "placeholder": False}
+    assert result["products_valid"] is True
+    assert result["country_codes_valid"] is True
+    assert result["sandbox_tokens_remain_separate"] is True
+    assert result["production_token_namespace_empty"] is True
+    assert result["production_access_token_exists"] is False
+    assert "file-secret" not in str(result)
 
 
 def test_plaid_sandbox_sync_with_mock_transport(monkeypatch, tmp_path):

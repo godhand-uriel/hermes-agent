@@ -17,6 +17,11 @@ def _handle_finance(args: argparse.Namespace) -> int:
     action = getattr(args, "finance_action", None)
     if action == "plaid":
         plaid_action = getattr(args, "plaid_action", None)
+        if plaid_action == "validate-production-config":
+            from hermes_cli.plaid_connector import validate_production_config
+
+            _print_json(validate_production_config())
+            return 0
         from hermes_cli.plaid_connector import PlaidConnector
 
         connector = PlaidConnector()
@@ -78,6 +83,7 @@ def register_cli(subparsers: argparse._SubParsersAction) -> None:
     plaid_parser = finance_sub.add_parser("plaid", help="Plaid Link setup commands")
     plaid_sub = plaid_parser.add_subparsers(dest="plaid_action")
     plaid_sub.add_parser("link-token", help="Create a Plaid Link token for the configured PLAID_ENV")
+    plaid_sub.add_parser("validate-production-config", help="Validate production Plaid config without contacting Plaid or creating tokens")
     plaid_sub.add_parser("reconnect-token", help="Create a Plaid Link token for reconnect/update mode")
     exchange = plaid_sub.add_parser("exchange-token", help="Exchange a Plaid public token server-side and store the encrypted access token")
     exchange.add_argument("public_token", help="Plaid public token from Link")

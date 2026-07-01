@@ -515,6 +515,10 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
+_pre_dotenv_plaid_env = os.environ.get("PLAID_ENV", "").strip().lower()
+if _pre_dotenv_plaid_env:
+    os.environ.setdefault("HERMES_PLAID_REQUESTED_ENV", _pre_dotenv_plaid_env)
+
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env

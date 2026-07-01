@@ -249,18 +249,21 @@ def test_finance_plaid_link_token_endpoint_returns_sandbox_token(monkeypatch, tm
     from hermes_cli import web_server
     from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(tmp_path / "registry.db"))
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-sandbox")
+    monkeypatch.setenv("PLAID_SECRET", "secret-sandbox")
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+    monkeypatch.delenv("HERMES_PLAID_REQUESTED_ENV", raising=False)
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
 
-    class FakeConfig:
-        environment = "sandbox"
+    def fake_create_link_token(self):
+        assert self.config.environment == "sandbox"
+        return {"link_token": "link-sandbox-test", "expiration": "2099-01-01T00:00:00Z", "request_id": "req_1"}
 
-    class FakePlaidConnector:
-        config = FakeConfig()
-
-        def create_link_token(self):
-            return {"link_token": "link-sandbox-test", "expiration": "2099-01-01T00:00:00Z", "request_id": "req_1"}
-
-    monkeypatch.setattr("hermes_cli.plaid_connector.PlaidConnector", FakePlaidConnector)
+    monkeypatch.setattr("hermes_cli.plaid_connector.PlaidConnector.create_link_token", fake_create_link_token)
     client = TestClient(web_server.app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
@@ -271,9 +274,128 @@ def test_finance_plaid_link_token_endpoint_returns_sandbox_token(monkeypatch, tm
     assert body["success"] is True
     assert body["link_token"] == "link-sandbox-test"
     assert body["environment"] == "Sandbox"
+    assert body["plaid_config"]["environment"] == "sandbox"
     assert "secret" not in str(body).lower()
     assert "access_token" not in str(body)
 
+
+def test_finance_plaid_link_token_endpoint_uses_production_env_file(monkeypatch, tmp_path):
+    from hermes_cli import web_server
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(tmp_path / "registry.db"))
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "stale-sandbox-client")
+    monkeypatch.setenv("PLAID_SECRET", "stale-sandbox-secret")
+    monkeypatch.setenv("PLAID_PRODUCTS", "transactions")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+
+    def fake_create_link_token(self):
+        assert self.config.environment == "production"
+        assert self.config.products == ("transactions", "auth", "identity", "liabilities", "investments")
+        return {"link_token": "link-production-test", "expiration": "2099-01-01T00:00:00Z", "request_id": "req_prod"}
+
+    monkeypatch.setattr("hermes_cli.plaid_connector.PlaidConnector.create_link_token", fake_create_link_token)
+    client = TestClient(web_server.app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    resp = client.post("/api/finance/plaid/link-token")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["environment"] == "Production"
+    assert body["plaid_config"]["environment"] == "production"
+    assert body["plaid_config"]["products"] == ["transactions", "auth", "identity", "liabilities", "investments"]
+    assert "file-secret" not in str(body)
+
+
+def test_finance_plaid_config_endpoint_matches_production_validation(monkeypatch, tmp_path):
+    from hermes_cli import web_server
+    from hermes_cli.plaid_connector import validate_production_config
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    registry = tmp_path / "registry.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(registry))
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+    monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    expected = validate_production_config(env_file=env_file, path=registry)
+    client = TestClient(web_server.app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    resp = client.get("/api/finance/plaid/config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["environment"] == expected["environment"] == "production"
+    assert body["env_source_path"] == expected["credential_source_path"] == str(env_file)
+    assert body["products"] == expected["products"]
+    assert body["country_codes"] == expected["country_codes"]
+    assert body["token_namespace"]["path"].endswith("finance/production")
+    assert "file-secret" not in str(body)
+
+
+def test_finance_plaid_config_endpoint_defaults_to_sandbox_without_production_request(monkeypatch, tmp_path):
+    from hermes_cli import web_server
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(tmp_path / "registry.db"))
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-sandbox")
+    monkeypatch.setenv("PLAID_SECRET", "secret-sandbox")
+    monkeypatch.delenv("PLAID_ENV", raising=False)
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+    monkeypatch.delenv("HERMES_PLAID_REQUESTED_ENV", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+    client = TestClient(web_server.app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    resp = client.get("/api/finance/plaid/config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["environment"] == "sandbox"
+    assert body["env_source_path"] is None
+    assert body["token_namespace"]["path"].endswith("finance/sandbox")
+    assert "secret-sandbox" not in str(body)
+
+
+def test_finance_plaid_config_endpoint_honors_preserved_requested_production_env(monkeypatch, tmp_path):
+    from hermes_cli import web_server
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_FINANCE_REGISTRY_PATH", str(tmp_path / "registry.db"))
+    monkeypatch.setenv("HERMES_PLAID_REQUESTED_ENV", "production")
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "stale-sandbox-client")
+    monkeypatch.setenv("PLAID_SECRET", "stale-sandbox-secret")
+    client = TestClient(web_server.app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    resp = client.get("/api/finance/plaid/config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["environment"] == "production"
+    assert body["env_source_path"] == str(env_file)
+    assert body["token_namespace"]["path"].endswith("finance/production")
 
 def test_finance_plaid_exchange_public_token_stores_encrypted_and_refreshes_dashboard(monkeypatch, tmp_path):
     from hermes_cli import web_server

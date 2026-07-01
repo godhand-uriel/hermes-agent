@@ -253,6 +253,48 @@ def test_plaid_auto_loads_private_production_env_from_hermes_home(monkeypatch, t
     assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
 
 
+def test_plaid_requested_production_env_overrides_stale_sandbox_process_env(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PLAID_REQUESTED_ENV", "production")
+    monkeypatch.setenv("PLAID_ENV", "sandbox")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "stale-sandbox-client")
+    monkeypatch.setenv("PLAID_SECRET", "stale-sandbox-secret")
+    monkeypatch.setenv("PLAID_PRODUCTS", "transactions")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+
+    cfg = plaid_config_from_env()
+
+    assert cfg.environment == "production"
+    assert cfg.client_id == "file-client"
+    assert cfg.products == ("transactions", "auth", "identity", "liabilities", "investments")
+
+
+def test_plaid_runtime_status_is_safe_and_reports_namespace(monkeypatch, tmp_path):
+    from hermes_cli.plaid_connector import plaid_runtime_status
+
+    env_file = tmp_path / ".env.production"
+    env_file.write_text("PLAID_ENV=production\nPLAID_CLIENT_ID=file-client\nPLAID_SECRET=file-secret\nPLAID_PRODUCTS=transactions,auth,identity,liabilities,investments\nPLAID_COUNTRY_CODES=US\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("PLAID_ENV", "production")
+    monkeypatch.delenv("HERMES_PLAID_ENV_FILE", raising=False)
+    monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PLAID_SECRET", raising=False)
+    monkeypatch.delenv("PLAID_PRODUCTS", raising=False)
+    monkeypatch.delenv("PLAID_COUNTRY_CODES", raising=False)
+
+    status = plaid_runtime_status(path=tmp_path / "registry.db")
+
+    assert status["environment"] == "production"
+    assert status["env_source_path"] == str(env_file)
+    assert status["token_namespace"]["path"].endswith("production")
+    assert status["products"] == ["transactions", "auth", "identity", "liabilities", "investments"]
+    assert "file-secret" not in str(status)
+
+
 def test_plaid_production_config_dry_run_reports_safe_status(monkeypatch, tmp_path):
     from hermes_cli.plaid_connector import validate_production_config
 

@@ -14649,6 +14649,19 @@ def _friendly_finance_sync_error(exc: Exception) -> tuple[int, str, str]:
     return 500, "sync_failed", "Sync Failed"
 
 
+@app.get("/api/finance/plaid/config")
+async def get_finance_plaid_config():
+    """Return safe Plaid config diagnostics for the Finance Command Center."""
+    try:
+        from hermes_cli.plaid_connector import plaid_runtime_status
+
+        return {"success": True, **plaid_runtime_status()}
+    except Exception as exc:
+        status_code, code, message = _friendly_finance_sync_error(exc)
+        _log.debug("Plaid config diagnostic failed: %s", exc)
+        raise HTTPException(status_code=status_code, detail={"code": code, "message": message}) from exc
+
+
 @app.post("/api/finance/plaid/link-token")
 async def create_finance_plaid_link_token():
     """Create a Plaid Link token for the Finance Command Center.
@@ -14660,13 +14673,19 @@ async def create_finance_plaid_link_token():
         from hermes_cli.plaid_connector import PlaidConnector
 
         connector = PlaidConnector()
+        status = connector.config.environment
         result = connector.create_link_token()
         return {
             "success": True,
             "link_token": result.get("link_token"),
             "expiration": result.get("expiration"),
             "request_id": result.get("request_id"),
-            "environment": connector.config.environment.capitalize(),
+            "environment": status.capitalize(),
+            "plaid_config": {
+                "environment": connector.config.environment,
+                "products": list(connector.config.products),
+                "country_codes": list(connector.config.country_codes),
+            },
         }
     except Exception as exc:
         status_code, code, message = _friendly_finance_sync_error(exc)

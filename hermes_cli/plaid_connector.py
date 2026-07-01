@@ -68,26 +68,49 @@ def _load_hermes_secrets() -> None:
         os.environ.update(existing)
 
 
-def _load_plaid_env_file() -> None:
-    """Load optional Plaid-only env file without overriding process env.
+def _requested_plaid_env() -> str:
+    """Return the operator-requested Plaid environment, if any.
 
-    Set HERMES_PLAID_ENV_FILE to a private env file when running locally.
-    Existing process environment values win so deployments can inject secrets
-    through Hermes Secrets or their normal secret manager. The file is parsed as
-    simple KEY=VALUE lines and is never exposed to the frontend.
+    `load_hermes_dotenv()` may overwrite `PLAID_ENV` from profile `.env` during
+    process startup. Entrypoints that see a shell-provided value first preserve it
+    in `HERMES_PLAID_REQUESTED_ENV` so dashboard/API calls do not silently fall
+    back from production to sandbox.
     """
-    env_file = os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()
-    override_existing = bool(env_file)
-    if not env_file and os.environ.get("PLAID_ENV", "").strip().lower() == "production":
-        candidate = get_hermes_home() / ".env.production"
+    values = [os.environ.get(key, "").strip().lower() for key in ("HERMES_PLAID_REQUESTED_ENV", "HERMES_PLAID_DASHBOARD_ENV", "PLAID_ENV")]
+    if "production" in values:
+        return "production"
+    for value in values:
+        if value:
+            return value
+    return ""
+
+
+def _profile_production_env_file() -> Path:
+    return get_hermes_home() / ".env.production"
+
+
+def _plaid_env_source_path() -> Path | None:
+    explicit = os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if _requested_plaid_env() == "production":
+        candidate = _profile_production_env_file()
         if candidate.exists():
-            env_file = str(candidate)
-            override_existing = True
-    if not env_file:
-        return
-    path = Path(env_file).expanduser()
-    if path == get_hermes_home() / ".env.production":
-        override_existing = True
+            return candidate
+    return None
+
+
+def _load_plaid_env_file() -> Path | None:
+    """Load optional Plaid-only env file and return the source path.
+
+    Explicit `HERMES_PLAID_ENV_FILE` wins. When production is requested, the
+    profile-local `$HERMES_HOME/.env.production` file is loaded and overrides
+    stale sandbox values already present in the process.
+    """
+    path = _plaid_env_source_path()
+    if path is None:
+        return None
+    override_existing = bool(os.environ.get("HERMES_PLAID_ENV_FILE", "").strip()) or path == _profile_production_env_file()
     if not path.exists():
         raise PlaidConfigurationError(f"Plaid env file does not exist: {path}")
     mode = path.stat().st_mode & 0o777
@@ -102,6 +125,7 @@ def _load_plaid_env_file() -> None:
         value = value.strip().strip('\"').strip("'")
         if key.startswith("PLAID_") and (override_existing or key not in os.environ):
             os.environ[key] = value
+    return path
 
 
 class PlaidConfigurationError(RuntimeError):
@@ -252,6 +276,32 @@ def validate_production_config(*, env_file: Path | None = None, path: Path | Non
         os.environ.clear()
         os.environ.update(original_env)
     return result
+
+
+def plaid_runtime_status(*, path: Path | None = None) -> dict[str, Any]:
+    """Return safe Plaid runtime diagnostics for CLI/dashboard.
+
+    This may validate local configuration, but it never contacts Plaid and never
+    returns credential or access-token values.
+    """
+    _load_hermes_secrets()
+    env_source = _load_plaid_env_file()
+    cfg = plaid_config_from_env()
+    token_store = token_store_path(cfg.environment, registry_path=path)
+    return {
+        "environment": cfg.environment,
+        "env_source_path": str(env_source) if env_source else None,
+        "products": list(cfg.products),
+        "country_codes": list(cfg.country_codes),
+        "token_namespace": {
+            "path": str(token_store.parent),
+            "token_store_path": str(token_store),
+            "exists": token_store.parent.exists(),
+            "token_records": len(_read_token_store(cfg.environment, registry_path=path)),
+            "legacy_registry_token_rows": len(_legacy_registry_token_rows(cfg.environment, path=path)),
+        },
+        "keys": {key: _safe_key_status(key) for key in ("PLAID_ENV", "PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_PRODUCTS", "PLAID_COUNTRY_CODES")},
+    }
 
 
 def _finance_secret_dir() -> Path:
@@ -736,6 +786,7 @@ __all__ = [
     "list_stored_access_tokens",
     "load_access_token",
     "plaid_config_from_env",
+    "plaid_runtime_status",
     "remove_stored_access_tokens",
     "store_access_token",
     "sync_to_finance_registry",
